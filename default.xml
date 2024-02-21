@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+    <include name="base.xml" />
+
+    <project path="squared"         name="anpham6/squared.git"         revision="master" />
+    <project path="squared-express" name="anpham6/squared-express.git" revision="master" />
+    <project path="e-mc"            name="anpham6/e-mc.git"            revision="master" />
+    <project path="pi-r"            name="anpham6/pi-r.git"            revision="master" />
+    <project path="android-docs"    name="anpham6/android-docs.git"    revision="master" />
+    <project path="chrome-docs"     name="anpham6/chrome-docs.git"     revision="master" />
+</manifest>
