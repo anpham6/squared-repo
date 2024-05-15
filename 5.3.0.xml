@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+    <include name="base.xml" />
+
+    <project path="squared"         name="anpham6/squared.git"         clone-depth="1" revision="refs/heads/5.3.0" />
+    <project path="squared-express" name="anpham6/squared-express.git" clone-depth="1" revision="refs/heads/3.3.0" />
+    <project path="e-mc"            name="anpham6/e-mc.git"            clone-depth="1" revision="refs/heads/0.10.0" />
+    <project path="pi-r"            name="anpham6/pi-r.git"            clone-depth="1" revision="refs/heads/0.8.0" />
+    <project path="android-docs"    name="anpham6/android-docs.git"    clone-depth="1" revision="master" />
+    <project path="chrome-docs"     name="anpham6/chrome-docs.git"     clone-depth="1" revision="master" />
+</manifest>
