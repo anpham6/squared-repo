@@ -10,7 +10,7 @@
 mkdir workspace
 cd workspace
 
-repo init -u https://github.com/anpham6/squared-repo -m 5.4.0.xml
+repo init -u https://github.com/anpham6/squared-repo -m 5.4.0.xml // prod.xml (patches)
 repo sync
 
 cd squared
@@ -21,6 +21,7 @@ cd squared
 | Date     | squared | Express |    E-mc |   Pi-r |
 | :------: | ------: | ------: | ------: | -----: |
 | 12-07-24 |   5.4.0 |   3.4.0 |  0.11.0 |  0.9.0 |
+| 08-24-24 |   5.3.2 |   3.3.1 |  0.10.1 |  0.8.1 |
 | 08-06-24 |   5.3.0 |   3.3.0 |  0.10.0 |  0.8.0 |
 | 07-24-24 |   5.2.5 |   3.2.1 |   0.9.6 |  0.7.3 |
 | 06-30-24 |   5.2.4 |   3.2.0 |   0.9.4 |  0.7.2 |
