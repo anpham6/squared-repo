@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <manifest>
-    <include name="base.xml" />
+    <include name="staging.xml" />
 
     <project path="squared"         name="anpham6/squared.git"         revision="refs/heads/5.3.0" />
     <project path="squared-express" name="anpham6/squared-express.git" revision="refs/heads/3.3.0" />
