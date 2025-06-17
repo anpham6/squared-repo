@@ -10,7 +10,7 @@
 mkdir workspace
 cd workspace
 
-repo init -u https://github.com/anpham6/squared-repo -m nightly.xml // prod.xml (patches)
+repo init -u https://github.com/anpham6/squared-repo -m nightly.xml # prod.xml (patches)
 repo sync
 
 cd squared
