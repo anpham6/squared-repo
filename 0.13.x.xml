@@ -2,11 +2,7 @@
 <manifest>
     <include name="staging.xml" />
 
-    <project path="squared"         name="anpham6/squared.git"         revision="refs/heads/5.6.0" />
     <project path="squared-express" name="anpham6/squared-express.git" revision="refs/heads/4.0.0" />
     <project path="e-mc"            name="anpham6/e-mc.git"            revision="refs/heads/0.13.0" />
     <project path="pi-r"            name="anpham6/pi-r.git"            revision="refs/heads/0.11.0" />
-    <project path="pi-r2"           name="anpham6/pi-r2.git"           revision="refs/heads/0.3.0" />
-    <project path="android-docs"    name="anpham6/android-docs.git"    revision="master" />
-    <project path="chrome-docs"     name="anpham6/chrome-docs.git"     revision="master" />
 </manifest>
