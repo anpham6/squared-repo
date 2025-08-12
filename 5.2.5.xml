@@ -2,10 +2,10 @@
 <manifest>
     <include name="base.xml" />
 
-    <project path="squared"         name="anpham6/squared.git"         clone-depth="1" revision="refs/tags/v5.2.5" />
-    <project path="squared-express" name="anpham6/squared-express.git" clone-depth="1" revision="refs/tags/v3.2.1" />
-    <project path="e-mc"            name="anpham6/e-mc.git"            clone-depth="1" revision="refs/tags/v0.9.6" />
-    <project path="pi-r"            name="anpham6/pi-r.git"            clone-depth="1" revision="refs/tags/v0.7.3" />
-    <project path="android-docs"    name="anpham6/android-docs.git"    clone-depth="1" revision="refs/tags/v0.1.5" />
-    <project path="chrome-docs"     name="anpham6/chrome-docs.git"     clone-depth="1" revision="refs/tags/v0.3.3" />
+    <project path="squared"         name="anpham6/squared.git"         clone-depth="1" revision="refs/tags/v5.2.5" groups="base,prod" />
+    <project path="squared-express" name="anpham6/squared-express.git" clone-depth="1" revision="refs/tags/v3.2.1" groups="base,prod" />
+    <project path="e-mc"            name="anpham6/e-mc.git"            clone-depth="1" revision="refs/tags/v0.9.6" groups="base" />
+    <project path="pi-r"            name="anpham6/pi-r.git"            clone-depth="1" revision="refs/tags/v0.7.3" groups="base" />
+    <project path="android-docs"    name="anpham6/android-docs.git"    clone-depth="1" revision="refs/tags/v0.1.5" groups="prod,docs" />
+    <project path="chrome-docs"     name="anpham6/chrome-docs.git"     clone-depth="1" revision="refs/tags/v0.3.3" groups="prod,docs" />
 </manifest>

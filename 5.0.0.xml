@@ -2,8 +2,8 @@
 <manifest>
     <include name="base.xml" />
 
-    <project path="squared"         name="anpham6/squared.git"         clone-depth="1" revision="refs/tags/v5.0.0" />
-    <project path="squared-express" name="anpham6/squared-express.git" clone-depth="1" revision="refs/tags/v3.0.0" />
-    <project path="e-mc"            name="anpham6/e-mc.git"            clone-depth="1" revision="refs/tags/v0.5.2" />
-    <project path="pi-r"            name="anpham6/pi-r.git"            clone-depth="1" revision="refs/tags/v0.2.1" />
+    <project path="squared"         name="anpham6/squared.git"         clone-depth="1" revision="refs/tags/v5.0.0" groups="base,prod" />
+    <project path="squared-express" name="anpham6/squared-express.git" clone-depth="1" revision="refs/tags/v3.0.0" groups="base,prod" />
+    <project path="e-mc"            name="anpham6/e-mc.git"            clone-depth="1" revision="refs/tags/v0.5.2" groups="base" />
+    <project path="pi-r"            name="anpham6/pi-r.git"            clone-depth="1" revision="refs/tags/v0.2.1" groups="base" />
 </manifest>
