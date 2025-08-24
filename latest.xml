@@ -2,9 +2,9 @@
 <manifest>
     <include name="staging.xml" />
 
-    <project path="squared"         name="anpham6/squared.git"         revision="refs/tags/v5.6.0" groups="base,prod" />
-    <project path="squared-express" name="anpham6/squared-express.git" revision="refs/tags/v4.0.0" groups="base,prod" />
-    <project path="e-mc"            name="anpham6/e-mc.git"            revision="refs/tags/v0.12.5" groups="base" />
+    <project path="squared"         name="anpham6/squared.git"         revision="refs/tags/v5.6.3" groups="base,prod" />
+    <project path="squared-express" name="anpham6/squared-express.git" revision="refs/tags/v4.0.1" groups="base,prod" />
+    <project path="e-mc"            name="anpham6/e-mc.git"            revision="refs/tags/v0.12.6" groups="base" />
     <project path="pi-r"            name="anpham6/pi-r.git"            revision="refs/tags/v0.10.2" groups="base" />
     <project path="pi-r2"           name="anpham6/pi-r2.git"           revision="refs/tags/v0.2.1" groups="base" />
     <project path="android-docs"    name="anpham6/android-docs.git"    revision="refs/tags/v0.5.0" groups="prod,docs" />
