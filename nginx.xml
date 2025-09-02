@@ -2,8 +2,8 @@
 <manifest>
     <include name="base.xml" />
 
-    <project path="squared"         name="anpham6/squared.git"         clone-depth="1" revision="refs/tags/v5.6.3" />
+    <project path="squared"         name="anpham6/squared.git"         clone-depth="1" revision="refs/tags/v5.6.4" />
     <project path="squared-express" name="anpham6/squared-express.git" clone-depth="1" revision="refs/tags/v4.0.1" />
-    <project path="android-docs"    name="anpham6/android-docs.git"    clone-depth="1" revision="refs/tags/v0.5.0" />
+    <project path="android-docs"    name="anpham6/android-docs.git"    clone-depth="1" revision="refs/tags/v0.5.1" />
     <project path="chrome-docs"     name="anpham6/chrome-docs.git"     clone-depth="1" revision="refs/tags/v0.6.3" />
 </manifest>
