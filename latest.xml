@@ -2,7 +2,7 @@
 <manifest>
     <include name="staging.xml" />
 
-    <project path="squared"         name="anpham6/squared.git"         revision="refs/tags/v5.6.4" groups="base,prod" />
+    <project path="squared"         name="anpham6/squared.git"         revision="refs/tags/v5.6.5" groups="base,prod" />
     <project path="squared-express" name="anpham6/squared-express.git" revision="refs/tags/v4.0.3" groups="base,prod" />
     <project path="e-mc"            name="anpham6/e-mc.git"            revision="refs/tags/v0.12.7" groups="base" />
     <project path="pi-r"            name="anpham6/pi-r.git"            revision="refs/tags/v0.10.3" groups="base" />
