@@ -8,10 +8,9 @@ require 'shellwords'
 require 'time'
 require 'forwardable'
 require 'json'
-require 'date'
 
 module Squared
-  VERSION = '0.5.21'
+  VERSION = '0.6.9'
 
   module Common
     PATH = {}
@@ -26,9 +25,10 @@ module Squared
       CHOICE: 25,
       QUOTE: "'",
       SPACE: ' => ',
-      GRAPH: ['|', '-', '|', '\\', '-'].freeze,
-      BORDER: ['|', '-', '-', '-', '-', '-', '|', '|', '-', '-'].freeze,
+      GRAPH: %w[| - | \\ -].freeze,
+      BORDER: %w[| - - - - - | | - -].freeze,
       VIEW: 'view',
+      BACKTRACE: $DEBUG || !$VERBOSE.nil?,
       LEVEL: ENV.fetch('LOG_LEVEL', 0).to_i,
       COLOR: ENV.fetch('NO_COLOR', '').empty?
     }
@@ -110,28 +110,6 @@ module Squared
       VAR.freeze
     end
 
-    module_function
-
-    def as_a(obj, *meth, flat: nil, compact: false, &blk)
-      return [] if obj.nil?
-
-      unless obj.is_a?(::Array)
-        obj = if obj.respond_to?(:to_ary)
-                obj.to_ary
-              elsif obj.respond_to?(:to_a) && !obj.is_a?(::Hash) && (val = obj.to_a).is_a?(::Array)
-                val
-              else
-                [obj]
-              end
-      end
-      obj = flat.is_a?(::Numeric) ? obj.flatten(flat) : obj.flatten if flat
-      obj = obj.compact if compact
-      obj = obj.map(&meth.shift) until meth.empty?
-      return obj unless block_given?
-
-      obj.select(&blk)
-    end
-
     module Format
       include Common
 
@@ -153,8 +131,8 @@ module Squared
         bright_cyan!: '106',
         bright_white!: '107'
       }.freeze
-      BOX_GRAPH = ['│', '─', '├', '└', '┬'].freeze
-      BOX_BORDER = ['│', '─', '┌', '┐', '┘', '└', '├', '┤', '┬', '┴'].tap do |val|
+      BOX_GRAPH = %w[│ ─ ├ └ ┬].freeze
+      BOX_BORDER = %w[│ ─ ┌ ┐ ┘ └ ├ ┤ ┬ ┴].tap do |val|
         if ENV['TERM']&.end_with?('256color')
           val.slice!(2, 4)
           val.insert(2, '╭', '╮', '╯', '╰')
@@ -163,6 +141,10 @@ module Squared
       end
       TEXT_STYLE = [:bold, :dim, :italic, :underline, :blinking, nil, :inverse, :hidden, :strikethrough].freeze
       private_constant :AIX_TERM, :BOX_GRAPH, :BOX_BORDER, :TEXT_STYLE
+
+      String.define_method(:stripstyle) { gsub(/\x1B\[(?:\d+;?)+m/, '') }
+      String.define_method(:stripext) { File.basename(self, '.*') }
+      String.define_method(:subhint) { |s| s.nil? || (s.is_a?(::String) && s.empty?) ? self : "#{self} (#{s})" }
 
       def enable_aixterm
         unless (colors = __get__(:colors)).frozen?
@@ -182,26 +164,25 @@ module Squared
       def sub_style(val, *args, styles: nil, pat: nil, index: 1)
         return val unless ARG[:COLOR]
 
-        if pat && index != 0
-          return val unless (data = pat.match(val))
+        ret = if pat && index != 0
+                return val unless (data = pat.match(val))
 
-          ret = index == -1 ? data.to_a.drop(1) : data[index]
-        else
-          ret = val
-          index = 0
-        end
+                index == -1 ? data.to_a.drop(1) : data[index]
+              else
+                index = 0
+                val
+              end
         wrap = ->(s, n) { "\x1B[#{n.join(';')}m#{s}\x1B[0m" }
         code = []
         args.clear if args.size == 1 && args.first.nil?
         args.concat(Array(styles)).flatten.each_with_index do |type, i|
           next unless type
 
-          if index == -1
-            s = ret[i]
-            next ret[i] = '' if s.nil?
-          else
-            s = ret
-          end
+          s = if index == -1
+                ret[i] || (next ret[i] = '')
+              else
+                ret
+              end
           if type.is_a?(::Numeric)
             f, b = type.to_s.split('.')
             s = wrap.call(s, ['38', '5', f]) if f[0] != '-' && f.to_i <= 255
@@ -211,7 +192,7 @@ module Squared
             end
           else
             t = type.to_sym
-            if (c = __get__(:colors)[t])
+            if (c = __get__(:colors)[t] || __get__(:colors)[t.to_s.sub('bright_', '').to_sym])
               if index == -1
                 s = wrap.call(s, [c])
               else
@@ -220,7 +201,7 @@ module Squared
             else
               next unless (n = TEXT_STYLE.index(t))
 
-              s = "\x1B[#{n + 1}m#{s}\x1B[#{n == 0 ? 22 : n + 21}m"
+              s = "\x1B[#{n.succ}m#{s}\x1B[#{n == 0 ? 22 : n + 21}m"
             end
           end
           if index == -1
@@ -247,13 +228,17 @@ module Squared
         out
       end
 
+      def sub_style!(val, *args, **kwargs)
+        val.replace(sub_style(val, *args, **kwargs))
+      end
+
       def check_style(args, empty: true)
         ret = []
         colors = __get__(:colors)
         Array(args).flatten.compact.each do |val|
           if !val.is_a?(::Numeric)
-            val = val.to_sym
-            ret << val if colors.key?(val) || TEXT_STYLE.include?(val)
+            k = val.to_sym
+            ret << k if colors.key?(k) || colors.key?(k.to_s.sub('bright_', '').to_sym) || TEXT_STYLE.include?(k)
           elsif val.between?(0, 256)
             ret << val
           elsif val < 0 && (b = val.to_s.split('.')[1])
@@ -275,6 +260,10 @@ module Squared
         else
           set.call(key, args)
         end
+      end
+
+      def opt_style(styles, pat = nil, index = 1)
+        { styles: styles, pat: pat, index: index }
       end
 
       def log_sym(level)
@@ -303,6 +292,10 @@ module Squared
       end
 
       def log_message(level, *args, subject: nil, hint: nil, append: true, pass: false, color: ARG[:COLOR])
+        if args.empty?
+          args.concat(Array(level))
+          level = Logger::INFO
+        end
         args = args.map(&:to_s)
         if level.is_a?(::Numeric)
           if append && respond_to?(:log)
@@ -313,8 +306,12 @@ module Squared
         end
         if hint.nil? ? args.size > 1 : !hint
           title = log_title(level, color: false)
-          sub = [pat: /\A(#{Regexp.escape(title)})(.*)\z/m, styles: __get__(:theme)[:logger][log_sym(level)]] if color
-          emphasize(args, title: title + (subject ? " #{subject}" : ''), sub: sub, pipe: -1)
+          emphasize(args,
+                    title: title + (subject ? " #{subject}" : ''),
+                    pipe: -1,
+                    sub: if color
+                           opt_style(__get__(:theme)[:logger][log_sym(level)], /\A(#{Regexp.escape(title)})(.*)\z/m)
+                         end)
         else
           msg = [log_title(level, color: color)]
           if subject
@@ -325,6 +322,10 @@ module Squared
         end
       end
 
+      def log_warn(*args, **kwargs)
+        log_message(Logger::WARN, *args, **kwargs)
+      end
+
       def log_console(*args, pipe: 1)
         return if args.first == false && args.size == 1
 
@@ -332,7 +333,7 @@ module Squared
           begin
             File.open(pipe, 'a') do |f|
               br = File::SEPARATOR == '\\' ? "\r\n" : "\n"
-              args.flatten.each { |val| f.write(strip_style(val.chomp) + br) }
+              args.flatten.each { |val| f.write(val.chomp.stripstyle + br) }
             end
             return
           rescue StandardError
@@ -342,13 +343,12 @@ module Squared
         (pipe == 2 ? $stderr : $stdout).puts(*args)
       end
 
-      alias puts_oe log_console
-
       module_function
 
       def message(*args, hint: nil, empty: false, space: ARG[:SPACE])
         (empty ? args.reject { |val| val.nil? || (val.respond_to?(:empty?) && val.empty?) } : args)
-          .join(space) + (hint ? " (#{hint})" : '')
+          .join(space)
+          .subhint(hint)
       end
 
       def emphasize(val, title: nil, footer: nil, right: false, cols: nil, sub: nil, pipe: nil,
@@ -364,7 +364,9 @@ module Squared
           lines = val.to_s.lines(chomp: true)
           lines[0] = "#{val.class}: #{lines.first}" if (err = val.is_a?(::StandardError))
         end
-        n = cols || max.call(lines)
+        return if lines.empty?
+
+        n = (cols.is_a?(::Array) ? cols.map(&:size).max : cols) || max.call(lines)
         if $stdout.tty?
           require 'io/console'
           (n = [n, $stdout.winsize[1] - 4].min) rescue nil
@@ -373,23 +375,25 @@ module Squared
         out = []
         draw = lambda do |a, b|
           ret = a + (b1 * (n + 2)) + b
-          ret = sub_style(ret, styles: border) if border
-          ret
+          return ret unless border
+
+          sub_style ret, border
         end
         sub = sub.is_a?(::Hash) ? [sub] : Array(sub)
         pr = lambda do |line|
           s = line.ljust(n)
-          sub.each { |h| s = sub_style(s, **h) }
-          s = "#{b0} #{s} #{b0}"
+          sub.each { |h| sub_style!(s, **h) }
+          s = +"#{b0} #{s} #{b0}"
           if border
-            s = sub_style(s, pat: /\A(#{Regexp.escape(b0)})(.+)\z/om, styles: border)
-            s = sub_style(s, pat: /\A(.+)(#{Regexp.escape(b0)})\z/om, styles: border, index: 2)
+            [[/\A(#{Regexp.escape(b0)})(.+)\z/om], [/\A(.+)(#{Regexp.escape(b0)})\z/om, 2]].each do |args|
+              sub_style!(s, **opt_style(border, *args))
+            end
           end
           s
         end
         out << draw.call(b2, b3)
         if title
-          out.concat(title.map { |t| pr.call(t) })
+          out.concat(title.map! { |t| pr.call(t) })
           out << draw.call(b6, b7)
         end
         lines.each { |line| out << pr.call(line) }
@@ -398,7 +402,7 @@ module Squared
           unless sub.empty? && !right
             footer.map! do |s|
               s = s.rjust(n + 4) if right
-              sub.each { |h| s = sub_style(s, **h) }
+              sub.each { |h| sub_style!(s, **h) }
               s
             end
           end
@@ -407,40 +411,35 @@ module Squared
         if block_given?
           yield out
         elsif pipe
+          return out if pipe == -1
+
           case pipe
-          when -1
-            return out
           when 0
-            pipe = $stdin
+            $stdin
           when 2
-            pipe = $stderr
+            $stderr
           else
-            pipe = $stdout unless pipe.respond_to?(:puts)
-          end
-          pipe.puts(out)
+            pipe.respond_to?(:puts) ? pipe : $stdout
+          end.puts(out)
         else
           err ? warn(out) : puts(out)
         end
       end
 
-      def strip_style(val)
-        val.gsub(/\x1B\[(\d+;?)+m/, '')
-      end
-
-      def stripext(val)
-        File.basename(val, '.*')
-      end
-
-      def raise_error(*args, hint: nil, kind: ArgumentError)
-        raise kind, message(*args, hint: hint, empty: true), caller_locations(1).map(&:to_s)
+      def raise_error(*args, hint: nil, kind: RuntimeError, start: 0)
+        kind = args.shift if args.first.is_a?(::Class) && args.first < ::Exception
+        raise kind, message(*args, hint: hint, empty: true), if ARG[:BACKTRACE]
+                                                               caller(start.succ)
+                                                             else
+                                                               caller_locations(start.succ, 1).first&.base_label
+                                                             end
       end
     end
 
     module Prompt
       module_function
 
-      def confirm(msg, default = nil, agree: 'Y', cancel: 'N', attempts: 5, timeout: 30)
-        require 'readline'
+      def confirm(msg, default = nil, agree: 'Y', cancel: 'N', force: false, attempts: 3, timeout: 60)
         require 'timeout'
         if agree == 'Y' && cancel == 'N' && !msg.match?(%r{\[(?:Yn|nY|Y/n|y/N)\]})
           case default
@@ -459,6 +458,7 @@ module Squared
             when agree
               return true
             when cancel
+              exit 1 if force
               return false
             end
             attempts -= 1
@@ -468,13 +468,13 @@ module Squared
           puts
           exit 0
         else
+          exit 1 if force
           false
         end
       end
 
-      def choice(msg, list = nil, min: 1, max: 1, multiple: false, force: true, grep: nil, auto: true,
-                 attempts: 5, timeout: 0)
-        require 'readline'
+      def choice(msg, list = nil, min: 1, max: 1, multiple: false, index: false, grep: nil, border: nil, auto: true,
+                 force: true, attempts: 3, timeout: 0)
         require 'timeout'
         if list
           grep &&= Array(grep).map { |val| Regexp.new(val) }
@@ -486,40 +486,52 @@ module Squared
             puts '%2d. %s' % [items.size, val]
           end
           max = items.size
-          raise_error 'empty selection list' if max == 0
+          raise ArgumentError, 'empty selection list' if max == 0
+
           min = grep ? 1 : [min, max].min
           if auto
-            msg = "#{msg}: [#{min}-#{max}#{if multiple
-                                             "|,#{multiple.is_a?(::Numeric) ? "{#{multiple}}" : ''}"
-                                           end}] "
+            auto.times { puts } if auto.is_a?(::Numeric)
+            if border == true
+              puts print_footer
+            elsif border
+              puts print_footer(border: border)
+            end
+            msg = "#{msg + (force ? ':' : '?')} [#{min}-#{max}#{if (n = multiple)
+                                                                  "|,#{n.is_a?(::Numeric) ? "{#{n}}" : '*'}"
+                                                                end}] "
           end
         end
-        valid = ->(s) { s.match?(/^\d+$/) && s.to_i.between?(min, max) }
+        between = ->(s) { s.match?(/^\d+$/) && s.to_i.between?(min, max) }
         Timeout.timeout(timeout) do
           while (ch = Readline.readline(msg))
             unless (ch = ch.strip).empty?
               if multiple
-                a = ch.split(',')
-                b = a.map do |s|
-                  s.strip!
-                  if s =~ /^(\d+)-(\d+)$/
-                    next unless valid.call($1) && valid.call($2)
+                k = if ch == '*'
+                      (min..max).to_a
+                    else
+                      ch.split(',').map! do |s|
+                        s.strip!
+                        if s =~ /^(\d+)-(\d+)$/
+                          next unless between.call($1) && between.call($2)
 
-                    c = $1.to_i
-                    d = $2.to_i
-                    next (c..d).to_a if c < d
-                  elsif valid.call(s)
-                    s.to_i
+                          i = $1.to_i
+                          j = $2.to_i
+                          next (i..j).to_a if i < j
+                        elsif between.call(s)
+                          s.to_i
+                        end
+                      end
+                    end
+                unless k.include?(nil)
+                  k.flatten!
+                  k.uniq!
+                  k.sort!
+                  unless multiple.is_a?(::Numeric) && multiple != k.size
+                    return index || !items ? k : k.map! { |i| items[i.pred] }
                   end
                 end
-                unless b.include?(nil)
-                  b.flatten!
-                  b.uniq!
-                  b.sort!
-                  return items ? b.map! { |i| items[i - 1] } : b unless multiple.is_a?(::Numeric) && multiple != b.size
-                end
-              elsif valid.call(ch)
-                return items ? items[ch.to_i - 1] : ch.to_i
+              elsif between.call(ch)
+                return index || !items ? ch.to_i : items[ch.to_i.pred]
               end
             end
             attempts -= 1
@@ -532,16 +544,15 @@ module Squared
           puts
           exit 0
         else
-          multiple ? [] : nil
+          [] if multiple
         end
       end
 
       def readline(msg, history = false, force: nil, multiline: nil, &blk)
-        require 'readline'
         multiline = if multiline && Readline.respond_to?(:readmultiline)
                       multiline.is_a?(::Enumerable) || block_given? ? multiline : [multiline.to_s]
                     end
-        prompt = lambda do
+        read = lambda do
           if !multiline
             Readline.readline(msg, history)
           elsif block_given?
@@ -556,17 +567,17 @@ module Squared
         end
         case force
         when ::TrueClass, ::FalseClass
-          msg = "#{msg} %s " % if multiline
-                                 multiline.is_a?(::Enumerable) ? "{#{multiline.to_a.join('|')}}" : multiline
-                               else
-                                 "(#{force ? 'required' : 'optional'}):"
-                               end
-          ret = (prompt.call || '').strip
+          msg = "#{msg}%s%s " % if multiline
+                                  [' ', multiline.is_a?(::Enumerable) ? "{#{multiline.to_a.join('|')}}" : multiline]
+                                else
+                                  [force ? ':' : '?', '']
+                                end
+          ret = (read.call || '').strip
           multiline.each { |val| break if ret.delete_suffix!(val.to_s) } if multiline.is_a?(::Enumerable)
           exit 1 if force && ret.empty?
           ret
         else
-          prompt.call
+          read.call
         end
       end
     end
@@ -575,9 +586,12 @@ module Squared
       QUOTE_VALUE = /\A(["'])(.*)\1\z/m.freeze
       private_constant :QUOTE_VALUE
 
+      String.define_method(:stripquote) { sub(QUOTE_VALUE, '\2') }
+      Array.define_method(:quote!) { |**kwargs| map! { |s| Shell.shell_quote(s, **kwargs) } }
+
       module_function
 
-      def shell_escape(val, quote: false, force: false, double: false, option: false, override: false)
+      def shell_escape(val, quote: false, option: false, force: false, double: false, override: false)
         if (r = /\A(--?)([^=\s]+)((=|\s+)(["'])?(?(5)(.*)\5|(.*)))?\z/m.match(val = val.to_s))
           if (data = r[2].match(QUOTE_VALUE))
             double = data[1] == '"'
@@ -635,8 +649,8 @@ module Squared
         end
       end
 
-      def shell_option(flag, val = nil, escape: true, quote: true, option: true, force: true, double: false,
-                       merge: false, override: false)
+      def shell_option(flag, val = nil, sep: '=', escape: true, quote: true, force: true, double: false, merge: false,
+                       override: false)
         flag = flag.to_s
         if flag =~ QUOTE_VALUE
           double = $1 == '"'
@@ -647,7 +661,7 @@ module Squared
         sep = unless flag.empty?
                 if flag[0] == '-'
                   if flag[1] == '-'
-                    '='
+                    sep
                   else
                     merge ? '' : ' '
                   end
@@ -656,14 +670,14 @@ module Squared
                   merge ? '' : ' '
                 else
                   pre = '--'
-                  '='
+                  sep
                 end
               end
         "#{pre}#{flag}#{unless val.nil?
                           "#{sep}#{if escape
                                      shell_escape(val, quote: quote, double: double, override: override)
                                    elsif quote
-                                     shell_quote(val, option: option, force: force, double: double, override: override)
+                                     shell_quote(val, option: false, force: force, double: double, override: override)
                                    else
                                      val
                                    end}"
@@ -671,10 +685,45 @@ module Squared
       end
 
       def shell_split(val, join: nil, **kwargs)
-        ret = val.shellsplit.map! { |opt| shell_escape(opt, double: true, option: true, **kwargs) }
+        ret = val.shellsplit.map! { |opt| shell_escape(opt, option: true, double: true, **kwargs) }
         return ret unless join
 
         ret.join(join.is_a?(::String) ? join : ' ')
+      end
+
+      def shell_parse(val, escape: false, force: true, **kwargs)
+        a = []
+        b = []
+        c = []
+        d = []
+        e = [a, b]
+        j = -1
+        val.shellsplit.each_with_index do |opt, i|
+          if opt == '--'
+            e = [c, d]
+          elsif opt =~ /\A--?[^=]+(=|\z)/
+            j = $1 == '=' ? -1 : i
+            e[0] << [opt]
+          elsif j >= 0
+            e[0][j] << opt
+          else
+            e[1] << shell_quote(opt, option: false, force: force)
+          end
+        end
+        ret = [[a, b], [], [c, d]].flat_map do |e, f|
+          next '--' unless e
+
+          e.flat_map do |item|
+            if item.size == 1
+              fill_option(item.first)
+            else
+              flag = item.shift
+              item.map! { |s| shell_option(flag, s, escape: escape, force: force, **kwargs) }
+            end
+          end.concat(f)
+        end
+        ret.pop if ret.last == '--'
+        ret
       end
 
       def shell_bin(name, env: true)
@@ -706,6 +755,25 @@ module Squared
     end
 
     module System
+      class << self
+        private
+
+        def parse_link(val)
+          case val
+          when ::TrueClass, 's'
+            1
+          when 'r'
+            2
+          when 'h'
+            3
+          else
+            raise ArgumentError, "unrecognized 'link' flag: #{val}" if val
+
+            0
+          end
+        end
+      end
+
       module_function
 
       def shell(*args, name: :system, **kwargs)
@@ -729,11 +797,11 @@ module Squared
         raise $?.to_s
       end
 
-      def copy_dir(src, dest, glob = ['**/*'], create: false, link: nil, force: false, pass: nil, hidden: false,
-                   verbose: true)
+      def copy_dir(src, dest, glob = ['**/*'], create: false, link: nil, preserve: nil, force: false, verbose: true,
+                   pass: nil, hidden: false)
         base = Pathname.new(src)
         target = Pathname.new(dest)
-        raise "#{target.cleanpath} (not found)" if !create && !target.parent.exist?
+        raise Errno::ENOENT, dest.cleanpath.to_s unless create || target.parent.exist?
 
         subdir = {}
         target.mkpath if create
@@ -757,74 +825,111 @@ module Squared
         end
         count = 0
         soft = 0
+        type = System.send :parse_link, link
         subdir.each do |dir, files|
-          if link
-            files.dup.tap do |items|
-              files.clear
-              items.each do |file|
-                if file.exist?
-                  if !file.symlink?
-                    files << file
-                  elsif !force
-                    next
-                  end
+          unless type == 0
+            items = files.dup
+            files.clear
+            items.each do |file|
+              if file.exist?
+                if !file.symlink?
+                  files << file
+                elsif !force
+                  next
                 end
-                if link == 'hard'
-                  FileUtils.ln(file, dir, force: force, verbose: false)
-                else
-                  FileUtils.ln_s(file, dir, force: force, verbose: false)
-                end
-                soft += 1
               end
+              case type
+              when 1
+                FileUtils.ln_s(file, dir, force: force, verbose: false)
+              when 2
+                FileUtils.ln_s(file.relative_path_from(dir), dir, force: force, verbose: false)
+              else
+                FileUtils.ln(file, dir, force: force, verbose: false)
+              end
+              soft += 1
             end
           end
           next if files.empty?
 
-          out = FileUtils.cp(files, dir, verbose: false)
+          out = FileUtils.cp(files, dir, preserve: preserve, verbose: false)
           count += out.size
         end
         puts [target.realpath, subdir.size, soft > 0 ? "#{count}+#{soft}" : count].join(' => ') if verbose
       end
 
-      def copy_guard(src, dest, link: nil, force: false, verbose: true)
-        unless force
-          target = Pathname.new(dest)
-          if target.directory?
-            src = Array(src).reject { |val| target.join(File.basename(val)).exist? }
-            return if src.empty?
-          elsif target.exist?
-            return
+      def copy_guard(*src, dest, base: '.', create: false, link: nil, preserve: nil, force: false, verbose: true)
+        src = src.compact.flatten
+        dest = Pathname.new(dest).realdirpath
+        base = Pathname.new(base).realpath
+        dir = if dest.directory?
+                true
+              elsif src.size > 1
+                raise Errno::ENOENT, dest.cleanpath.to_s unless create && !dest.exist?
+
+                dest.mkpath
+                true
+              end
+        targets = src.map! { |file| [base + file, dir ? dest + File.basename(file) : dest] }
+        return if !force && (targets = targets.reject { |to| to[1].exist? }).empty?
+
+        type = System.send :parse_link, link
+        targets.each do |file, to|
+          case type
+          when 0
+            FileUtils.cp(file, to, preserve: preserve, verbose: verbose)
+          when 1
+            FileUtils.ln_s(file, to, force: force, verbose: verbose)
+          when 2
+            FileUtils.ln_s(file.relative_path_from(dir ? to.dirname : to), to, force: force, verbose: verbose)
+          else
+            FileUtils.ln(file, to, force: force, verbose: verbose)
           end
         end
-        case link
-        when 'hard', 1
-          FileUtils.ln(src, dest, force: force, verbose: verbose)
-        when ::TrueClass, 'soft', 0
-          FileUtils.ln_s(src, dest, force: force, verbose: verbose)
-        else
-          FileUtils.cp(src, dest, verbose: verbose)
-        end
+        nil
       end
     end
 
     module Utils
       module_function
 
-      def split_escape(val, char: ',')
-        val.split(/\s*(?<!\\)#{char}\s*/)
+      def as_a(obj, *meth, flat: nil, compact: false, &blk)
+        return [] if obj.nil?
+
+        unless obj.is_a?(::Array)
+          obj = if obj.respond_to?(:to_ary)
+                  obj.to_ary
+                elsif obj.respond_to?(:to_a) && !obj.is_a?(::Hash) && (val = obj.to_a).is_a?(::Array)
+                  val
+                else
+                  [obj]
+                end
+        end
+        obj = flat.is_a?(::Numeric) ? obj.flatten(flat) : obj.flatten if flat
+        obj = obj.compact if compact
+        obj = obj.map(&meth.shift) until meth.empty?
+        return obj unless block_given?
+
+        obj.select(&blk)
+      end
+
+      def split_escape(val, char: ',', &blk)
+        ret = val.split(/\s*(?<!\\)#{char}\s*/)
+        return ret unless block_given?
+
+        ret.each(&blk)
       end
 
       def split_option(val)
         val = val.strip
         return [val, '', ''] unless (i = val.index('='))
 
-        last = val[(i + 1)..-1].strip
+        last = val[i.succ..-1].strip
         quote = ''
         if last =~ /\A(["'])(.+)\1\z/
           last = $2
           quote = $1
         end
-        [val[0..(i - 1)], last, quote]
+        [val[0..i.pred], last, quote]
       end
 
       def task_invoke(*cmd, args: [], exception: true, warning: true)
@@ -906,9 +1011,9 @@ module Squared
         end
       end
 
-      def env(key, default = nil, suffix: nil, strict: false, equals: nil, ignore: nil)
+      def env(key, default = nil, suffix: nil, strict: false, equals: nil, ignore: nil, **)
         ret = env_value(key, suffix: suffix, strict: strict)
-        return ret == equals.to_s unless equals.nil?
+        return Array(equals).any? { |val| val.to_s == ret } unless equals.nil?
 
         ret.empty? || (ignore && Array(ignore).any? { |val| val.to_s == ret }) ? default : ret
       end
@@ -987,7 +1092,13 @@ module Squared
 
   module Workspace
     module Support
-      class << self
+      RunData = Struct.new('RunData', :run, :block)
+      ChainData = Struct.new('ChainData', :action, :step, :with, :before, :after, :sync)
+      BannerData = Struct.new('BannerData', :command, :order, :styles, :border)
+
+      module Variables
+        private
+
         def hashobj
           Hash.new { |data, key| data[key] = {} }
         end
@@ -996,42 +1107,46 @@ module Squared
           Hash.new { |data, key| data[key] = [] }
         end
 
-        def hashdup(data, pass: {})
-          ret = {}
+        def hashdup(data, compact: false, freeze: false, target: {}, pass: {})
           data.each do |key, val|
-            ret[key] = case val
-                       when Hash
-                         pass[val] ||= hashdup(val, pass: pass)
-                       when Proc, Method
-                         val
-                       else
-                         val.dup
-                       end
+            next if val.nil? && compact
+
+            target[key] = case val
+                          when Hash
+                            if pass.key?(val)
+                              pass[val]
+                            else
+                              hashdup(val, compact: compact, freeze: freeze, target: pass[val] = {}, pass: pass)
+                            end
+                          when Enumerable
+                            compact ? val.compact : val.dup
+                          when Proc, Method
+                            val
+                          else
+                            val.dup
+                          end
+            target[key].freeze if freeze && val.frozen?
           end
-          ret
+          target
         end
       end
 
-      RunData = Struct.new('RunData', :run, :block)
-      ChainData = Struct.new('ChainData', :action, :step, :with, :before, :after, :sync)
-      BannerData = Struct.new('BannerData', :command, :order, :styles, :border)
+      class << Support
+        include Variables
+
+        public(*Variables.private_instance_methods(false))
+      end
     end
 
     class Application
+      include Enumerable
       include Common::Format
       include Utils
+      include Support::Variables
       include Rake::DSL
 
-      SCRIPT_OBJ = {
-        run: nil,
-        script: nil,
-        dev: nil,
-        prod: nil,
-        global: false,
-        env: false
-      }.freeze
       TASK_METADATA = Rake::TaskManager.record_task_metadata
-      private_constant :SCRIPT_OBJ, :TASK_METADATA
+      private_constant :TASK_METADATA
 
       class << self
         def implement(*objs, base: false)
@@ -1045,7 +1160,7 @@ module Squared
               impl_series.base_set(obj)
             else
               kind_project.unshift(obj)
-              obj.tasks&.each { |task| impl_series.add(task, obj) }
+              impl_series.extend_set(obj)
             end
             if (args = obj.batchargs)
               impl_series.batch(*args)
@@ -1071,8 +1186,29 @@ module Squared
           @task_exclude.merge(args.map!(&:to_sym))
         end
 
-        def series_wrap(app)
+        def register(app)
+          @session << app
           impl_series.new(app, exclude: @task_exclude.to_a)
+        end
+
+        def load_ref(path, gem: nil)
+          if gem
+            unless @gemsdir
+              IO.popen('bundle env').each do |val|
+                next unless val =~ /^\s+Gem Home\s+(.+)$/
+
+                @gemsdir = File.join($1, 'gems')
+                break
+              end
+            end
+            dir = if gem.match?(/-\d+(?:\.|$)/)
+                    gem
+                  else
+                    Dir.glob("#{gem}-*", base: @gemsdir).pop
+                  end
+            path = File.join(@gemsdir, dir, path) if dir
+          end
+          @load_project.unshift(path.cleanpath.to_s) if (path = Pathname.new(path)).absolute? && path.exist?
         end
 
         def baseref
@@ -1083,14 +1219,19 @@ module Squared
           super[/[^:]+\z/, 0]
         end
 
-        attr_reader :kind_project
+        alias series_wrap register
+
+        attr_reader :kind_project, :load_project, :session
         attr_accessor :impl_series, :impl_project, :attr_banner
       end
 
       @kind_project = []
+      @load_project = [File.expand_path('project', __dir__)]
+      @session = []
       @task_exclude = Set.new
 
-      attr_reader :root, :home, :main, :prefix, :exception, :warning, :pipe, :verbose, :theme, :series, :closed
+      attr_reader :root, :home, :main, :prefix, :theme, :series, :closed
+      attr_accessor :exception, :pipe, :verbose, :warning
 
       def initialize(home = (ARG[:HOME] && ENV[ARG[:HOME]]) || Dir.pwd, *, main: nil, prefix: nil,
                      verbose: ARG[:VERBOSE], common: ARG[:COMMON], pipe: ARG[:PIPE], exception: ARG[:FAIL], **)
@@ -1105,42 +1246,42 @@ module Squared
         @home.mkpath rescue nil
         @root = @home.parent
         @prefix = prefix
-        @series = Application.series_wrap(self)
+        @series = Application.register(self)
         @project = {}
-        @kind = Support.hashlist
+        @kind = hashlist
         @extensions = []
         @envname = env_key(@main).freeze
-        @pipe = $DEBUG ? 2 : env_pipe(pipe, (ARG[:OUT] && env(ARG[:OUT])) || 1, root: @home)
-        @exception = env_bool exception
-        @verbose = if $VERBOSE.nil?
-                     false
-                   elsif verbose.nil?
-                     @pipe != 0
-                   else
-                     env_bool(verbose, verbose.is_a?(String) ? @pipe != 0 : verbose, index: true)
-                   end
-        @warning = @verbose != false
+        self.exception = env_bool exception
+        self.pipe = $DEBUG ? 2 : env_pipe(pipe, (ARG[:OUT] && env(ARG[:OUT])) || 1, root: @home)
+        self.verbose = if $VERBOSE.nil?
+                         false
+                       elsif verbose.nil?
+                         @pipe != 0
+                       else
+                         env_bool(verbose, verbose.is_a?(String) ? @pipe != 0 : verbose, index: true)
+                       end
+        self.warning = @verbose != false
         @closed = false
-        if common
-          @theme = __get__(:theme)[:workspace]
-          ARG[:COLOR] = false if @pipe == 0 || @pipe.is_a?(Pathname)
-        else
-          @theme = {}
-        end
-        @chain = Support.hashlist
+        @theme = if common
+                   ARG[:COLOR] = false if @pipe == 0 || @pipe.is_a?(Pathname)
+                   __get__(:theme)[:workspace]
+                 else
+                   {}
+                 end
+        @chain = hashlist
         @script = {
-          group: Support.hashobj,
-          ref: Support.hashobj,
+          group: hashobj,
+          ref: hashobj,
           group!: {},
           ref!: {}
         }.freeze
         @events = {
-          group: Support.hashobj,
-          ref: Support.hashobj
+          group: hashobj,
+          ref: hashobj
         }.freeze
         @pass = {
-          group: Support.hashobj,
-          ref: Support.hashobj,
+          group: hashobj,
+          ref: hashobj,
           global: {},
           pattern: []
         }.freeze
@@ -1159,6 +1300,12 @@ module Squared
         puts bord, msg, bord
       end
 
+      def each(&blk)
+        return to_enum(:each) unless block_given?
+
+        @project.each_value(&blk)
+      end
+
       def build(parallel: [], pass: nil, **kwargs)
         return self unless enabled? && !@closed
 
@@ -1169,7 +1316,8 @@ module Squared
                               parallel.reject { |val| kwargs[:pattern] << val if val.is_a?(Regexp) }.map!(&:to_s)
                             end
         @pass[:pattern].concat(pass.map { |val| val.is_a?(Regexp) ? val : val.to_s }) if pass
-        @project.each_value do |proj|
+        series.reset
+        each do |proj|
           if proj.enabled?
             proj.populate(series.keys.dup, **kwargs)
           elsif proj.enabled?(base: false)
@@ -1179,26 +1327,42 @@ module Squared
           end
           series.populate(proj, **kwargs)
         end
-
         Application.kind_project.each { |obj| obj.populate(self, **kwargs) }
         @extensions.uniq.each { |ext| __send__(ext, **kwargs) }
-
         series.build(**kwargs)
         __build__(**kwargs)
-
         yield self if block_given?
-
         __chain__(**kwargs)
         @closed = true
         self
       end
 
-      def with(*val, pass: false, group: nil, **kwargs, &blk)
-        return self if pass == true || (pass && as_a(pass, :to_s).any? { |s| respond_to?(s) && __send__(s) rescue nil })
+      def with(*val, hide: nil, group: nil, **kwargs, &blk)
+        if hide.nil? && kwargs.key?(:pass)
+          pass = kwargs[:pass]
+          case pass
+          when true, false
+            hide = pass
+            kwargs.delete(:pass)
+          else
+            hide, pass = Array(pass).partition { |s| respond_to?(s) || s.to_s.end_with?('?') }
+            if pass.empty?
+              kwargs.delete(:pass)
+            elsif hide.empty?
+              hide = nil
+            else
+              kwargs[:pass] = pass
+            end
+          end
+        end
+        return self if hide == true || (hide && Array(hide).any? { |s| respond_to?(s) && __send__(s) rescue nil })
 
         @group = nil
         @ref = nil
-        @withargs = kwargs.empty? ? nil : kwargs
+        @withargs = unless kwargs.empty?
+                      kwargs.delete(:parent)
+                      kwargs
+                    end
         val = as_a(group || kwargs[:ref], flat: true, compact: true) if val.empty?
         kind = val.first
         val = kind if val.size == 1
@@ -1208,7 +1372,7 @@ module Squared
         when Symbol
           @ref = val
         else
-          raise_error 'missing group or ref' if block_given?
+          raise_error ArgumentError, 'missing group or ref' if block_given?
         end
         if block_given?
           instance_eval(&blk)
@@ -1225,18 +1389,16 @@ module Squared
 
       def chain(task, *action, project: nil, step: 0, with: nil, before: nil, after: nil, sync: false,
                 group: @group, ref: @ref)
-        keys = if project
-                 action.map! { |val| task_join(project.name, val) }
-                 nil
-               elsif (target = group || ref)
-                 action.map! { |val| task_name(task_join(val, target)) }
-                 nil
-               else
-                 action.map! { |val| task_name(val) }
-                 prefix ? nil : @project.keys
-               end
+        if project
+          action.map! { |val| task_join(project.name, val) }
+        elsif (target = group || ref)
+          action.map! { |val| task_name(task_join(val, target)) }
+        else
+          action.map! { |val| task_name(val) }
+          keys = @project.keys unless prefix
+        end
         ns = lambda do |val|
-          next if (ret = as_a(val, :to_s, flat: true)).empty?
+          return if (ret = as_a(val, :to_s, flat: true)).empty?
 
           ret.map! do |arg|
             if arg.include?(':') || (keys && !keys.include?(arg))
@@ -1325,22 +1487,21 @@ module Squared
           end
           data.order << meth
         end
-        if group
-          label = :group
-          items = Array(group)
-        else
-          label = :ref
-          items = Array(ref || :_)
-        end
-        items.each { |val| @banner[label][val.to_sym] = data }
+        Array(if group
+                label = :group
+                group
+              else
+                label = :ref
+                ref || :_
+              end).each { |val| @banner[label][val.to_sym] = data }
         self
       end
 
       def add(path, project = nil, **kwargs, &blk)
-        kwargs = Support.hashdup(@withargs).update(kwargs) if @withargs
+        kwargs = hashdup(@withargs).update(kwargs) if @withargs
         ref = kwargs.key?(:ref) ? kwargs.delete(:ref) : @ref
         kwargs[:group] = @group if @group && !kwargs.key?(:group)
-        path = root + path
+        path = rootpath path
         project = (project || path.basename).to_s
         name = task_name project
         index = 0
@@ -1349,11 +1510,12 @@ module Squared
           name = task_name "#{project}-#{index}"
         end
         proj = ((if !ref.is_a?(Class)
+                   require_project ref
                    Application.find(ref, path: path)
                  elsif ref < Application.impl_project
                    ref
                  end) || @kind[name]&.last || Application.impl_project).new(self, path, name, **kwargs)
-        proj.__send__(:index_set, @project.size)
+        proj.__send__(:index_set, size)
         @project[name] = proj
         __get__(:project)[name] = proj unless kwargs[:private]
         proj.instance_eval(&blk) if block_given?
@@ -1367,11 +1529,11 @@ module Squared
           basename = dir.basename.to_s
           [dir, basename, override[basename.to_sym]]
         end
-          .each do |dir, basename, opts|
-            args = kwargs.dup
-            args.update(opts) if opts
-            add(dir, basename, group: val, **args, &blk)
-          end
+        .each do |dir, basename, opts|
+          args = kwargs.dup
+          args.update(opts) if opts
+          add(dir, basename, group: val, **args, &blk)
+        end
         self
       end
 
@@ -1397,11 +1559,10 @@ module Squared
           end
         end
         if obj.is_a?(String)
-          begin
-            obj = JSON.parse(homepath(obj).read, { symbolize_names: true })
+          obj = begin
+            JSON.parse(homepath(obj).read, { symbolize_names: true })
           rescue StandardError => e
             warn log_message(Logger::ERROR, e)
-            obj = nil
           end
         end
         apply_style(data || theme, obj, args, empty: empty) if obj && (!target || data)
@@ -1419,25 +1580,28 @@ module Squared
           if key.start_with?(/(\\A|\^)/) || key.match?(/(\\z|\$)\z/)
             @describe[:replace] << [Regexp.new(key), val]
           else
-            @describe[val.is_a?(Regexp) ? :pattern : :alias][key.to_s] = val
+            @describe[val.is_a?(Regexp) ? :pattern : :alias][key] = val
           end
         end
         self
       end
 
       def find(path = nil, name: nil, group: nil, ref: nil, &blk)
-        ret = group ? @project.select { |_, item| item.group == group }.map(&:last) : []
+        return @project.values.find(&blk) if block_given? && !path && !name && !group && !ref
+
+        ret = group ? select { |item| item.group == group } : []
         if path.is_a?(Symbol)
           ref ||= path
           path = nil
         end
         if ret.empty?
-          ret = @project.select { |_, item| item.ref?(ref) }.map(&:last) if ref
+          ret = select { |item| item.ref?(ref) } if ref
           if ret.empty? && (path || name)
             path &&= rootpath path
             name &&= name.to_s
-            proj = @project.find { |_, item| (path && item.path == path) || (name && item.name == name) }&.last
-            ret << proj if proj
+            if (proj = find { |item| item.path == path || item.name == name })
+              ret << proj
+            end
           end
         end
         return (group || ref ? ret : ret.first) unless block_given?
@@ -1463,7 +1627,7 @@ module Squared
       end
 
       def task_localname(val)
-        prefix && val.is_a?(String) ? val.sub(/\A#{Regexp.escape(prefix)}:/, '') : val.to_s
+        prefix && val.is_a?(String) ? val.sub(/^#{Regexp.escape(prefix)}:/, '') : val.to_s
       end
 
       def task_desc(*args, **kwargs)
@@ -1473,7 +1637,7 @@ module Squared
         if @describe
           val = name || task_join(*args)
           found = false
-          replace = lambda do |data, out|
+          sub = lambda do |data, out|
             index = data.size
             data.to_a.reverse_each { |group| out.sub!("%#{index -= 1}", group) }
             out
@@ -1481,7 +1645,7 @@ module Squared
           @describe[:replace].each do |pat, tmpl|
             next unless val =~ pat
 
-            val = replace.call($~, tmpl.dup)
+            val = sub.call($~, tmpl.dup)
             found = true
           end
           if (out = @describe[:alias][val])
@@ -1491,7 +1655,7 @@ module Squared
             @describe[:pattern].each do |key, pat|
               next unless val =~ pat
 
-              val = replace.call($~, key.dup)
+              val = sub.call($~, key.dup)
               found = true
               break
             end
@@ -1575,11 +1739,11 @@ module Squared
 
       def script_find(*args)
         args.reverse_each do |val|
-          next unless val && (ret = val.is_a?(Symbol) ? @script[:ref!][val] : @script[:group!][val.to_sym])
-
-          return ret
+          if val && (ret = val.is_a?(Symbol) ? @script[:ref!][val] : @script[:group!][val.to_sym])
+            return ret
+          end
         end
-        @script[:ref!][:''] || SCRIPT_OBJ
+        @script[:ref!][:''] ||= scriptobj
       end
 
       def script_get(*args, group: nil, ref: nil)
@@ -1599,7 +1763,7 @@ module Squared
       end
 
       def enabled?
-        !@extensions.empty? || @project.values.any? { |proj| proj.enabled?(base: false) }
+        !@extensions.empty? || any? { |proj| proj.enabled?(base: false) }
       end
 
       def task_base?(key)
@@ -1611,7 +1775,7 @@ module Squared
       end
 
       def task_include?(obj, key, ref = nil)
-        return false if @series.exclude?(key)
+        return false if series.exclude?(key)
 
         task_base?(key) ? obj.has?(key, ref || baseref) : task_extend?(obj, key)
       end
@@ -1746,7 +1910,7 @@ module Squared
                   a = data.after
                   b = data.before
                   level.each_with_index do |tasks, k|
-                    with = lambda do |n|
+                    ac = lambda do |n|
                       tasks.insert(n, *data.action)
                       sync << tasks
                       data.action.clear
@@ -1755,33 +1919,33 @@ module Squared
                       index = k if w && has.call(w, v1)
                       if a && has.call(a, v1)
                         if index
-                          with.call(l + 1)
+                          ac.call(l.succ)
                           throw :found
                         else
-                          index = k + 1
+                          index = k.succ
                         end
                       elsif b && has.call(b, v1)
                         if index
-                          with.call(l)
+                          ac.call(l)
                           throw :found
                         else
-                          index = k - 1
+                          index = k.pred
                         end
                       elsif index
                         if a || b
                           tasks.each_with_index do |v2, m|
                             if a && has.call(a, v2)
-                              with.call(m + 1)
+                              ac.call(m.succ)
                               throw :found
                             elsif b && has.call(b, v2)
-                              with.call(m)
+                              ac.call(m)
                               throw :found
                             end
                           end
                           if !pass
                             pass = [i, data]
                           elsif pass.include?(data)
-                            if i == pass.first + 1
+                            if i == pass.first.succ
                               pass.delete(data)
                               pass = nil if pass.size == 1
                             end
@@ -1793,7 +1957,7 @@ module Squared
                       else
                         next
                       end
-                      step = index == -1 ? -1 : index + 1
+                      step = index == -1 ? -1 : index.succ
                       throw :found
                     end
                   end
@@ -1821,18 +1985,15 @@ module Squared
           format_desc key
           task key do
             unless failed.empty? && group.empty?
-              puts(log_message(Logger::ERROR, *(failed + group.map { |val| val.action }.flatten),
-                               subject: 'failed placement', hint: false), pipe: 2)
+              group.each { |val| failed += val.action }
+              puts log_message(Logger::ERROR, *failed, subject: 'failed placement', hint: false), pipe: 2
             end
-            cols = level.flatten(1).map(&:size).max
-            level.each_with_index do |grp, n|
-              title = "Step #{n.succ}#{if !sync.include?(grp) || (grp.size == 1 && series.parallel.include?(grp.first))
-                                         ''
-                                       else
+            level.each_with_index do |grp, i|
+              title = "Step #{i.succ}#{if sync.include?(grp) && !(grp.size == 1 && series.parallel.include?(grp.first))
                                          ' (sync)'
                                        end}"
-              emphasize(grp, title: title, cols: [cols, title.size].max, border: theme[:border],
-                             sub: [pat: /\A(Step \d+)(.*)\z/, styles: theme[:header]])
+              emphasize(grp, title: title, cols: level.flatten(1).push(title), border: theme[:border],
+                             sub: opt_style(theme[:header], /\A(Step \d+)(.*)\z/))
             end
           end
         end
@@ -1850,12 +2011,11 @@ module Squared
         end
         if group
           label = :group
-          items = as_a(group, :to_sym)
+          as_a group, :to_sym
         else
           label = :ref
-          items = as_a(ref, :to_sym)
-        end
-        items.each do |name|
+          as_a ref, :to_sym
+        end.each do |name|
           @script[label][name][task] = val
           @events[label][name][task] = on if on.is_a?(Hash)
         end
@@ -1889,31 +2049,51 @@ module Squared
         end
       end
 
+      def require_project(ref)
+        return unless ref.is_a?(Symbol) && Application.kind_project.none? { |proj| proj.ref == ref }
+
+        name = ref.to_s
+        Application.load_project.each do |val|
+          next unless File.exist?("#{rb = File.join(val, name)}.rb")
+
+          require_relative rb
+          break
+        end
+      end
+
       def root?(path, pass: [])
         return false unless path.directory?
 
         path.each_child do |c|
           name = c.basename.to_s
-          next if c.to_s == __FILE__ || (@main == name && c.directory? && c.empty?) || pass.any? { |val| val == name }
-
-          return false
+          unless c.to_s == __FILE__ || (@main == name && c.directory? && c.empty?) || pass.any? { |val| val == name }
+            return false
+          end
         end
         true
       end
 
-      def script?(state, target: nil, pat: nil, group: nil, ref: baseref, global: false)
+      def script?(state, target: nil, pat: nil, group: nil, ref: baseref, global: false, script: true)
         data = script_find ref, group
+        type = script ? :script : :run
         if global
-          target = data[:script] || data[:run] if target.nil?
+          target = data[type] if target.nil?
           pat = data[state] if pat.nil?
         end
-        return false if state == :prod && data[:dev] == true && data[:global]
+        return false if state == :prod && data[:dev] == true && data[:global][type]
 
         target && pat.is_a?(Regexp) ? Array(target).any?(pat) : pat == true
       end
 
       def scriptobj
-        SCRIPT_OBJ.dup
+        {
+          run: nil,
+          script: nil,
+          dev: nil,
+          prod: nil,
+          global: {},
+          env: {}
+        }
       end
     end
 
@@ -1924,10 +2104,11 @@ module Squared
       TASK_BASE = []
       TASK_BATCH = {}
       TASK_EXTEND = Support.hashlist
+      TASK_METHODS = {}
       TASK_KEYS = []
       TASK_ALIAS = Support.hashobj
       TASK_NAME = {}
-      private_constant :TASK_BASE, :TASK_BATCH, :TASK_EXTEND, :TASK_KEYS, :TASK_ALIAS, :TASK_NAME
+      private_constant :TASK_BASE, :TASK_BATCH, :TASK_EXTEND, :TASK_METHODS, :TASK_KEYS, :TASK_ALIAS, :TASK_NAME
 
       class << self
         def add(task, obj)
@@ -1969,6 +2150,11 @@ module Squared
           TASK_BASE.concat(obj.tasks.reject { |val| TASK_KEYS.include?(val) })
         end
 
+        def extend_set(obj)
+          obj.tasks&.each { |task| add(task, obj) }
+          TASK_METHODS[obj] = obj.instance_methods(false)
+        end
+
         private
 
         def key_set(val)
@@ -1981,7 +2167,8 @@ module Squared
 
       attr_reader :sync, :multiple, :parallel
 
-      def_delegators :@data, :[], :each, :each_key, :keys, :key?, :fetch, :update, :merge!, :to_a, :to_s, :inspect
+      def_delegators :@data, :[], :each, :each_key, :keys, :key?, :include?, :fetch, :update, :merge!, :any?, :none?,
+                     :delete, :delete_if, :find, :find_all, :to_a, :to_s, :inspect
       def_delegators :@workspace, :task_desc, :task_name, :task_namespace, :task_join, :format_desc
 
       def initialize(workspace, exclude: [])
@@ -1996,14 +2183,12 @@ module Squared
           parent: Support.hashlist,
           id: []
         }
-        @data = {}
-        (TASK_BASE + TASK_KEYS).each { |key| @data[key] = [] }
       end
 
       def populate(proj, **)
         group, parent, id = @session.values
         ws = proj.workspace
-        @data.each do |key, items|
+        each do |key, items|
           next if exclude?(key) || (tasks = ws.task_resolve(proj, key)).empty?
 
           if (g = proj.group)
@@ -2025,9 +2210,9 @@ module Squared
 
       def build(parallel: [], pattern: [], **)
         subcheck = ->(val) { (ns = task_namespace(val)) && parallel.include?(ns) }
-        @data.update(@session[:parent]) if @session[:id].uniq.size > 1
-        @data.update(@session[:group])
-        @data.each do |key, items|
+        update @session[:parent] if @session[:id].uniq.size > 1
+        update @session[:group]
+        each do |key, items|
           next if exclude?(key, true) || @workspace.task_exclude?(t = name_get(key))
 
           key = task_name t
@@ -2073,6 +2258,12 @@ module Squared
         task key => prereqs
       end
 
+      def reset
+        @data = {}
+        (TASK_BASE + TASK_KEYS).each { |key| @data[key] = [] }
+        @data
+      end
+
       def name_get(key)
         (TASK_NAME[key] || key).to_s
       end
@@ -2088,7 +2279,7 @@ module Squared
       end
 
       def some?(key)
-        return @data.key?(key) && !@data[key].empty? unless (batch = batch_get(key))
+        return key?(key) && !self[key].empty? unless (batch = batch_get(key))
 
         batch.each_value do |items|
           return true if items.all? { |val| some?(val) || alias_get(val)&.any? { |_, alt| some?(alt) } }
@@ -2103,12 +2294,12 @@ module Squared
       def extend?(obj, key)
         return false unless TASK_EXTEND.key?(key)
 
-        meth = :"#{key}?"
         ret = false
         TASK_EXTEND[key].each do |kind|
           next unless obj.is_a?(kind)
 
-          if kind.method_defined?(meth)
+          meth = :"#{key}?"
+          if TASK_METHODS[kind].include?(meth)
             out = obj.__send__(meth)
             return true if out == 1
             return out if obj.ref?(kind.ref)
@@ -2149,7 +2340,7 @@ module Squared
       end
 
       def exclude?(key, empty = false)
-        @exclude.include?(key) || (empty && (!@data.key?(key) || @data[key].empty?))
+        @exclude.include?(key) || (empty && (!key?(key) || self[key].empty?))
       end
 
       private
@@ -2161,9 +2352,11 @@ module Squared
       end
 
       def already_invoked?(list, val)
-        return Rake::Task.tasks.any? { |obj| obj.already_invoked && list.include?(obj.name) } unless val
-
-        list.include?(val) && !invoked_get(val).nil?
+        if val
+          list.include?(val) && !invoked_get(val).nil?
+        else
+          Rake::Task.tasks.any? { |obj| obj.already_invoked && list.include?(obj.name) }
+        end
       end
     end
 
@@ -2186,13 +2379,29 @@ module Squared
             include Prompt
 
             def append(target, *args, delim: false, escape: false, quote: true, strip: nil, force: true, double: false,
-                       **)
+                       filter: nil, **)
               return if (ret = args.flatten).empty?
 
               target << '--' if delim && !target.include?('--')
               if strip
                 pat, s = Array(strip)
                 ret.map! { |val| val.is_a?(String) ? val.gsub(pat, s || '') : val }
+              end
+              ret, err = ret.partition { |val| filter.match?(val.to_s) } if filter
+              if block_given?
+                out = []
+                err ||= []
+                ret.each do |val|
+                  case (s = yield val)
+                  when String
+                    out << s
+                  when NilClass, FalseClass
+                    err << val
+                  else
+                    out << val
+                  end
+                end
+                ret = out
               end
               ret.map! do |val|
                 next val if opt?(val)
@@ -2210,17 +2419,17 @@ module Squared
               else
                 target.concat(ret)
               end
-              ret
+              err || ret
             end
 
             def clear(target, opts, pass: true, styles: nil, **kwargs)
               return if opts.empty?
 
-              kwargs[:subject] ||= stripext target.first
+              kwargs[:subject] ||= target.first.stripext
               kwargs[:hint] ||= 'unrecognized'
               append(target, opts, delim: true) if kwargs.delete(:append)
-              warn log_message(Logger::WARN, opts.join(', '), pass: true, **kwargs)
-              exit 1 unless pass || confirm("Run? [#{sub_style(target, styles: styles)}]", 'N')
+              warn log_warn(opts.join(', '), pass: true, **kwargs)
+              exit 1 unless pass || confirm("Run? [#{sub_style(target, styles)}]", 'N')
             end
 
             def delete_key(target, *args, value: false, reverse: false, count: -1)
@@ -2236,10 +2445,9 @@ module Squared
             end
 
             def strip(val)
-              return [] unless val
-
               val = shell_split val if val.is_a?(String)
-              val.map { |s| s.sub(OPT_SINGLE, '\1=\2').sub(OPT_VALUE, '\1=\2').sub(OPT_NAME, '\2') }.reject(&:empty?)
+              Array(val).map { |s| s.sub(OPT_SINGLE, '\1=\2').sub(OPT_VALUE, '\1=\2').sub(OPT_NAME, '\2') }
+                        .reject(&:empty?)
             end
 
             def select(list, bare: true, no: true, single: false, double: false)
@@ -2249,6 +2457,29 @@ module Squared
               return ret if single == double
 
               ret.select { |val| single ? val.size == 1 : val.size > 1 }
+            end
+
+            def uniq!(list, pass = [])
+              keys = {}
+              list.each_with_index do |val, i|
+                j = val =~ OPT_VALUE ? $1 : val
+                (keys[j] ||= []) << i unless pass.include?(j)
+              end
+              data = keys.map { |item| item[1].size > 1 ? item[1][0..-2] : [] }.reject(&:empty?)
+              return if data.empty?
+
+              data.each { |key| key.each { |i| list[i] = nil } }
+              list.compact!
+              list
+            end
+
+            def parse_arg!(name, val)
+              return unless val.is_a?(String)
+
+              a, b = name.size == 1 ? %w[- *] : %w[(?:--) +]
+              return unless val =~ /\A#{a}?#{Regexp.escape(name)}(=|\s#{b})(["'])?(.+)(?(2)\2\z|\z)/m
+
+              [name, $3, $2 || (name.size == 1 && $1.empty? ? true : '')]
             end
 
             def arg?(target, *args, value: false, **)
@@ -2268,7 +2499,7 @@ module Squared
             end
 
             def pattern?(val)
-              val.match?(/(?:\A\^|\$\z)/) || val.match?(/(?:\.[*+]|\(\?:|\\[dsw]|\[.+\]|\{\d+,?\d*})/)
+              val.match?(/\A\^|\$\z/) || val.match?(/[.)][*+?]|\(\?:|\\[dsw\d]|\[.+\]|\{\d+,?\d*\}/i)
             end
 
             private
@@ -2296,13 +2527,13 @@ module Squared
             end
           end
 
-          attr_reader :target, :extras, :found, :errors, :values, :project, :path
+          attr_reader :target, :extras, :found, :errors, :values, :project, :path, :sep
 
           def_delegators :@target, :+, :-, :<<, :any?, :none?, :include?, :add, :add?, :find, :find_all, :find_index,
                          :merge, :compact, :delete, :delete?, :delete_if, :grep, :grep_v, :inspect, :to_a, :to_s
           def_delegators :@extras, :empty?, :member?, :each, :each_with_index, :each_with_object, :partition, :dup,
-                         :first, :shift, :unshift, :pop, :push, :concat, :index, :join, :map, :map!, :detect, :select,
-                         :select!, :reject, :size
+                         :first, :shift, :unshift, :pop, :push, :concat, :index, :join, :detect, :map, :map!, :select,
+                         :select!, :reject, :slice, :slice!, :size
 
           def_delegator :@extras, :delete, :remove
           def_delegator :@extras, :delete_at, :remove_at
@@ -2310,16 +2541,18 @@ module Squared
           def_delegator :@extras, :find_all, :detect_all
           def_delegator :@extras, :find_index, :detect_index
 
-          def initialize(opts, list, target = Set.new, project: nil, path: nil, **kwargs, &blk)
+          def initialize(opts, list, target = JoinSet.new, project: nil, path: nil, sep: '=', **kwargs, &blk)
             @target = target.is_a?(Set) ? target : target.to_set
             @project = project
             @path = path || project&.path
+            @sep = sep
             @errors = []
             @found = []
             parse(list, opts, **kwargs, &blk)
           end
 
-          def parse(list, opts = extras, no: nil, single: nil, args: false, first: nil, underscore: nil, &blk)
+          def parse(list, opts = extras, no: nil, single: nil, args: false, multiple: nil, first: nil, underscore: nil,
+                    stdin: false, &blk)
             @extras = []
             @values = []
             bare = []
@@ -2333,6 +2566,7 @@ module Squared
             f = []
             si = []
             bl = []
+            ml = []
             list.flat_map do |val|
               x, y = val.split('|', 2)
               if y
@@ -2347,7 +2581,7 @@ module Squared
             .each do |val|
               if (n = val.index('='))
                 flag = val[0, n]
-                case val[n + 1]
+                case val[n.succ]
                 when 'e'
                   e << flag
                 when 'b'
@@ -2369,10 +2603,13 @@ module Squared
                   @values << Regexp.escape(flag)
                 when '!'
                   bl << flag
+                when '+'
+                  ml << flag
+                  bare << flag
                 else
                   next
                 end
-                m << flag if flag.size == 1 && val[n + 2] == 'm'
+                m << flag if val[n + 2] == 'm'
                 bare << flag if val.end_with?('?')
               else
                 bare << val
@@ -2381,7 +2618,7 @@ module Squared
             no = (no || []).map { |val| (n = val.index('=')) ? val[0, n] : val }
             bare.concat(no)
             if underscore
-              tr = ->(list) { list.map { |val| val.tr('-', '_') } }
+              tr = ->(a) { a.map { |val| val.tr('-', '_') } }
               @values.concat(tr.call(@values))
               bare.concat(tr.call(bare))
               e.concat(tr.call(e))
@@ -2394,16 +2631,31 @@ module Squared
               f.concat(tr.call(f))
               si.concat(tr.call(si))
               bl.concat(tr.call(bl))
+              ml.concat(tr.call(ml))
               no.concat(tr.call(no))
+            end
+            if target.is_a?(JoinSet)
+              target.multiple = multiple if multiple
+              target.multiple = ml.map { |val| val.size == 1 ? "-#{val}" : "--#{val}" }
             end
             numtype = [
               [i, /\A\d+\z/],
               [f, /\A\d*(?:\.\d+)?\z/],
               [si, /\A-?\d+\z/]
             ].freeze
-            numcheck = ->(k, v) { numtype.any? { |flag, pat| flag.include?(k) && pat.match?(v) } }
+            numcheck = ->(k, v) { numtype.any? { |flag, pat| flag.include?(k) && v.match?(pat) } }
             skip = false
             opts.each do |opt|
+              if stdin
+                if stdin == -1
+                  add_path opt if exist?(opt)
+                  next
+                elsif opt == '-'
+                  add '-'
+                  stdin = -1
+                  next
+                end
+              end
               next skip = true if opt == '--'
               next push opt if skip
 
@@ -2419,21 +2671,21 @@ module Squared
                   val = $2
                   merge = m.include?(key)
                   if e.include?(key)
-                    add shell_option(key, val, merge: merge)
+                    add shell_option(key, val, merge: merge, sep: sep)
                   elsif q.include?(key)
-                    add quote_option(key, val, double: qq.include?(key), merge: merge)
+                    add quote_option(key, val, double: qq.include?(key), merge: merge, sep: sep)
                   elsif p.include?(key)
                     if val.match?(/\A(["']).+\1\z/)
-                      add shell_option(key, val, escape: false, merge: merge)
+                      add shell_option(key, val, escape: false, merge: merge, sep: sep)
                     elsif path
-                      add quote_option(key, path + val, merge: merge)
+                      add quote_option(key, path + val, merge: merge, sep: sep)
                     else
                       push opt
                     end
                   elsif b.include?(key) || (bl.include?(key) && %w[true false].include?(val)) || numcheck.call(key, val)
-                    add basic_option(key, val, merge: merge)
+                    add basic_option(key, val, merge: merge, sep: sep)
                   elsif merge
-                    add basic_option(key, val, merge: true)
+                    add basic_option(key, val, merge: true, sep: sep)
                   else
                     push opt
                   end
@@ -2445,36 +2697,52 @@ module Squared
                 skip = true if first&.any? { |s| s.is_a?(Regexp) ? opt.match?(s) : !opt.include?(s) }
               end
             end
-            @values = @values.empty? ? /\A\s+\z/ : /\A(#{@values.join('|')})=(.+)\z/m
+            @values = @values.empty? ? /\A\s+\z/ : /\A(#{@values.join('|')})#{sep}(.+)\z/m
             @extras.each_with_index(&blk) if block_given?
             self
           end
 
-          def swap(opts = nil)
+          def swap(opts = nil, &blk)
             unless opts
               opts = found
               @found = []
             end
+            opts.sort!(&blk) if block_given?
             @extras = opts
             self
           end
 
-          def append(*args, **kwargs)
+          def append(*args, **kwargs, &blk)
             args = extras if args.empty?
-            OptionPartition.append(target, *args, **kwargs)
+            out = OptionPartition.append(target, *args, **kwargs, &blk)
+            errors.concat(out) if out && (block_given? || kwargs[:filter])
             self
           end
 
-          def append_any(*args, quote: true, **kwargs)
+          def append_any(*args, escape: false, quote: true, **kwargs)
             (args.empty? ? extras : args.flatten).each do |val|
+              if block_given?
+                temp = val
+                val = yield val
+                if val.is_a?(Array)
+                  found << temp
+                  k, v, q = val
+                  add_option(k, v, escape: escape, quote: quote, double: q == '"', merge: q == true, **kwargs)
+                  next
+                end
+              end
+              next unless val.is_a?(String)
+
               if exist?(val)
                 add_path(val, **kwargs)
               elsif quote
                 add_quote(val, **kwargs)
+              elsif escape
+                add shell_escape(val, **kwargs)
               else
                 add val
               end
-              found << val if args.empty?
+              found << (temp || val) if args.empty?
             end
             self
           end
@@ -2485,8 +2753,8 @@ module Squared
           end
 
           def values_of(*args, strict: true, first: false, last: false)
-            eq, s = strict ? ['=', '[^ ]+'] : ['(?:=| +)', '[^-][^ ]*']
-            g = ["\"((?:[^\"]|(?<=\\\\)\"(?!$#{windows? ? '| ' : ''}))*)\""]
+            eq, s = strict ? [sep, '[^ ]+'] : ['(?:=| +)', '[^-][^ ]*']
+            g = ["\"((?:[^\"]|(?<=\\\\)\"(?!$#{'| ' if windows?}))*)\""]
             g << "'((?:[^']|'\\\\'')*)'" unless windows?
             g << "(#{s})"
             args.map! do |opt|
@@ -2524,22 +2792,18 @@ module Squared
           def clear(opts = nil, errors: false, **kwargs)
             styles = project.theme[:inline] if project
             if errors
-              OptionPartition.clear(target, self.errors, styles: styles, **kwargs)
-              self.errors.clear
+              OptionPartition.clear(target, @errors, styles: styles, **kwargs)
+              @errors.clear
               return self unless opts
             end
             opts ||= extras
-            OptionPartition.clear(target, if found.empty?
-                                            opts
-                                          else
-                                            opts.reject { |val| found.include?(val) }
-                                          end, styles: styles, **kwargs)
+            OptionPartition.clear(target, opts - found, styles: styles, **kwargs)
             opts.clear
             self
           end
 
           def adjoin(*args, with: nil, start: false)
-            i = -1
+            index = -1
             temp = compact
             if with
               pat = case with
@@ -2550,50 +2814,91 @@ module Squared
                     else
                       with
                     end
-              temp.each_with_index do |val, index|
+              temp.each_with_index do |val, i|
                 if val.to_s.match?(pat)
-                  i = index + (start.is_a?(Numeric) ? start : 1)
+                  index = i + (start.is_a?(Numeric) ? start : 1)
                   break
                 end
               end
             else
-              temp.each_with_index do |val, index|
-                if i == 0
+              temp.each_with_index do |val, i|
+                if index == 0
                   next unless val.is_a?(String) && val.start_with?('-')
 
-                  i = index
+                  index = i
                   break
-                elsif index > 0 && !val.to_s.start_with?('-')
+                elsif i > 0 && !val.to_s.start_with?('-')
                   if start
-                    i = index + (start.is_a?(Numeric) ? start : 1)
+                    index = i + (start.is_a?(Numeric) ? start : 1)
                     break
                   end
-                  i = 0
+                  index = 0
                 end
               end
             end
-            if i > 0
+            if index > 0
               if args.empty?
                 args = dup
                 reset
               else
                 args.each { |val| remove val }
               end
-              args = temp[0...i] + args + temp[i..-1]
+              args = temp[0, index] + args + temp[index..-1]
               target.clear
             end
             merge args
             self
           end
 
-          def add_path(*args, **kwargs)
-            add shell_quote(path ? path.join(*args) : File.join(*args), option: false, **kwargs)
+          def add_path(*args, option: nil, force: true, double: false, **kwargs)
+            if args.empty?
+              args = select { |val| val.is_a?(String) }
+              found.concat(args)
+              args.map! { |val| path + val } if path
+              append(args, force: force, **kwargs)
+            else
+              val = path ? path.join(*args) : File.join(*args)
+              if option
+                add quote_option(option, val, double: double)
+              else
+                add shell_quote(val, option: false, force: force, double: double)
+              end
+            end
             self
           end
 
           def add_quote(*args, **kwargs)
-            args.compact!
-            merge(args.map! { |val| val == '--' || OptionPartition.opt?(val) ? val : shell_quote(val, **kwargs) })
+            merge(args.compact
+                      .map! { |val| val == '--' || OptionPartition.opt?(val) ? val : shell_quote(val, **kwargs) })
+            self
+          end
+
+          def add_option(flag, val = nil, **kwargs)
+            add shell_option(flag, val, **kwargs)
+            self
+          end
+
+          def add_first(fallback = nil, prefix: nil, path: false, escape: false, quote: false, reverse: false,
+                        expect: false, **kwargs)
+            val = (reverse ? pop : shift) || fallback
+            if val
+              temp = val
+              val = val.delete_prefix(prefix) if prefix && val.is_a?(String)
+              unless block_given? && !(val = yield val).is_a?(String)
+                if path
+                  add_path(val, **kwargs)
+                elsif quote
+                  add_quote(val, **kwargs)
+                elsif escape
+                  add shell_escape(val, **kwargs)
+                else
+                  add val
+                end
+                found << temp unless temp == fallback
+              end
+            elsif expect
+              raise(expect.is_a?(String) ? expect : 'no value queued')
+            end
             self
           end
 
@@ -2602,16 +2907,50 @@ module Squared
             self
           end
 
+          def last(val = nil, &blk)
+            unless block_given?
+              case val
+              when NilClass
+                return extras.last
+              when Numeric
+                return extras.last(val)
+              when String, Array, Regexp
+                val = OptionPartition.send(:matchopts, val) unless val.is_a?(Regexp)
+                blk = proc { |s| s&.match?(val) }
+              else
+                raise TypeError, "unknown: #{val}"
+              end
+            end
+            ret = find_all(&blk)
+            unless ret.empty?
+              ret = case val
+                    when NilClass
+                      ret.first(1)
+                    when Numeric
+                      ret.first(val)
+                    else
+                      ret
+                    end
+              ret.each do |opt|
+                delete opt
+                add opt
+              end
+            end
+            val.nil? ? ret.first : ret
+          end
+
           def splice(*exclude, quote: true, delim: true, path: false, pattern: false, &blk)
             temp, other = if block_given?
                             partition(&blk)
                           elsif exclude.first.is_a?(Symbol)
                             partition(&exclude.first)
                           else
+                            exclude.map! { |pat| Regexp.new(pat) }
                             partition do |val|
-                              next false if pattern && OptionPartition.pattern?(val)
+                              val = val.to_s
+                              next if pattern && OptionPartition.pattern?(val)
 
-                              exclude.none? { |pat| val.match?(Regexp.new(pat)) }
+                              exclude.none? { |pat| val.match?(pat) }
                             end
                           end
             unless temp.empty?
@@ -2621,7 +2960,7 @@ module Squared
               if path
                 temp.each { |val| add_path(val) }
               else
-                temp.map! { |val| shell_quote(val) } if quote
+                temp.quote! if quote
                 merge temp
               end
             end
@@ -2635,7 +2974,7 @@ module Squared
             self
           end
 
-          def append?(key, val = nil, type: nil, force: false, **kwargs)
+          def append?(key, val = nil, type: nil, force: false, sep: '=', **kwargs)
             return false unless force || !arg?(key)
 
             val = yield self if block_given?
@@ -2644,11 +2983,11 @@ module Squared
             type ||= :quote if kwargs.empty?
             add case type
                 when :quote
-                  quote_option(key, val)
+                  quote_option(key, val, sep: sep)
                 when :basic
-                  basic_option(key, val)
+                  basic_option(key, val, sep: sep)
                 else
-                  shell_option(key, val, **kwargs)
+                  shell_option(key, val, sep: sep, **kwargs)
                 end
             true
           end
@@ -2657,24 +2996,23 @@ module Squared
             OptionPartition.arg?(target, *args, **kwargs)
           end
 
-          def exist?(*args, add: false, first: false, last: false)
-            return false unless path
-            return path.join(*args).exist? unless args.empty?
+          def exist?(*args, add: false, first: false, last: false, glob: false)
+            return with_glob?(File.join(*args), glob) unless args.empty?
 
             if first || last
-              return false unless (val = first ? self.first : self.last).is_a?(String)
+              return false unless (val = first ? self.first : self.last)
 
-              path.join(val).exist?.tap do |ret|
+              with_glob?(val, glob).tap do |ret|
                 next unless add && ret
 
-                add_path(first ? shift : pop)
+                add_first(path: true, reverse: !first)
               end
             else
-              each_with_index do |val, index|
-                next unless val.is_a?(String) && path.join(val).exist?
+              each_with_index do |val, i|
+                next unless with_glob?(val, glob)
 
                 if add
-                  remove_at index
+                  remove_at i
                   add_path val
                 end
                 return true
@@ -2696,6 +3034,13 @@ module Squared
             val[OPT_VALUE, 1] || val
           end
 
+          def with_glob?(val, glob = true)
+            return false unless val.is_a?(String) && !val.empty?
+            return File.exist?(val) unless path
+
+            path.join(val).exist? || (glob && !path.glob(val).empty?)
+          end
+
           def windows?
             require 'rake'
             Rake::Win32.windows?
@@ -2709,18 +3054,45 @@ module Squared
 
           alias to_ary to_a
 
-          attr_reader :delim, :extras
+          attr_reader :delim, :extras, :multiple
 
-          def initialize(data = [], delim: ' ', partition: '--', uniq: /\A--?[^=\s-][^=\s]*(?:=|\s+)\S/)
+          def initialize(data = [], delim: ' ', partition: '--', uniq: /\A--?[^=\s-]/, multiple: [])
             @delim = delim
             @partition = partition
             @uniq = uniq
+            @multiple = multiple
             @extras = []
             super(data.compact)
           end
 
+          def multiple=(val)
+            case val
+            when Enumerable
+              @multiple.concat(val.to_a.map { |val| val.is_a?(Regexp) ? val : val.to_s })
+            when String, Symbol, Pathname
+              @multiple << val.to_s
+            when Regexp
+              @multiple << val
+            when NilClass, FalseClass
+              @multiple.clear
+            end
+          end
+
+          def insert(*args)
+            replace Set.new(compact.insert(*args))
+          end
+
+          def slice(*args)
+            compact.slice(*args)
+          end
+
+          def slice!(*args)
+            data = compact
+            data.slice!(*args).tap { replace Set.new(data) }
+          end
+
           def compact
-            to_ary.map!(&:to_s).reject(&:empty?)
+            dump to_ary
           end
 
           def last(val, pat)
@@ -2731,26 +3103,26 @@ module Squared
           def pass(&blk)
             ret = compact
             @last&.each do |val, pat, key|
-              i = []
-              j = nil
-              ret.each_with_index do |opt, index|
+              items = []
+              index = nil
+              ret.each_with_index do |opt, i|
                 if opt == val
-                  j = index
-                elsif j && opt[pat, 1] == key
-                  i << index
+                  index = i
+                elsif index && opt[pat, 1] == key
+                  items << i
                 end
               end
-              next unless j && !i.empty?
+              next unless index && !items.empty?
 
-              val = ret[j]
-              cur = j
-              i.each do |k|
+              val = ret[index]
+              cur = index
+              items.each do |k|
                 ret[cur] = ret[k]
                 cur = k
               end
-              ret[i.last] = val
+              ret[items.last] = val
             end
-            ret.concat(extras.map(&:to_s).reject(&:empty?)) unless extras.empty?
+            ret.concat(dump(extras)) unless extras.empty?
             return ret unless block_given?
 
             ret.reject(&blk)
@@ -2787,12 +3159,12 @@ module Squared
               self
             elsif (n = enum.find_index { |val| extras?(val) })
               data = enum.to_a
-              @extras = if n == 0
-                          data
-                        else
-                          super(data[0...n])
-                          data[n..-1]
-                        end
+              extras.concat(if n == 0
+                              data
+                            else
+                              super(data[0, n])
+                              data[n..-1]
+                            end)
               self
             else
               super
@@ -2800,7 +3172,12 @@ module Squared
           end
 
           def <<(obj)
-            extras!(obj) || super
+            return super if extras.empty? && !extras?(obj)
+
+            unless !extras.include?(@partition) && include?(obj) && @uniq.match?(s = obj.to_s) && !multiple?(s)
+              extras << obj
+            end
+            self
           end
 
           def size
@@ -2812,6 +3189,10 @@ module Squared
             return extras.include?(obj) unless (n = extras.index(@partition))
 
             extras[0..n].include?(obj)
+          end
+
+          def multiple?(val)
+            multiple.any? { |obj| obj.is_a?(Regexp) ? obj.match?(val) : obj == val }
           end
 
           def to_a
@@ -2836,19 +3217,18 @@ module Squared
 
           alias add :<<
           alias add? :<<
+          alias push :<<
           alias member? include?
+          alias concat merge
 
           private
 
-          def extras!(obj)
-            return if extras.empty? && !extras?(obj)
-
-            extras << obj unless !extras.include?(@partition) && include?(obj) && @uniq.match?(obj.to_s)
-            self
+          def dump(enum)
+            enum.map(&:to_s).reject(&:empty?)
           end
 
           def extras?(obj)
-            obj == @partition || (include?(obj) && !@uniq.match?(obj.to_s))
+            obj == @partition || (include?(obj) && (!@uniq.match?(s = obj.to_s) || multiple?(s)))
           end
         end
       end
@@ -2861,15 +3241,17 @@ module Squared
         include Prompt
         include Utils
         include Support
+        include Workspace::Support::Variables
         include Rake::DSL
 
-        VAR_SET = %i[parent global script index envname desc dependfile dependindex theme archive env dev prod graph
-                     pass only exclude asdf].freeze
+        OPTIONS = Workspace::Support.hashobj
+        VAR_SET = %i[parent global script index envname desc dependfile dependname dependindex theme archive env graph
+                     dev prod pass only exclude asdf].freeze
         BLK_SET = %i[run depend doc lint test copy clean].freeze
         SEM_VER = /\b(\d+)(?:(\.)(\d+))?(?:(\.)(\d+))?[-.]?(\S+)?\b/.freeze
         URI_SCHEME = %r{\A([a-z][a-z\d+-.]*)://[^@:\[\]\\^<>|\s]}i.freeze
         TASK_METADATA = Rake::TaskManager.record_task_metadata
-        private_constant :VAR_SET, :BLK_SET, :SEM_VER, :URI_SCHEME, :TASK_METADATA
+        private_constant :OPTIONS, :VAR_SET, :BLK_SET, :SEM_VER, :URI_SCHEME, :TASK_METADATA
 
         class << self
           def populate(*); end
@@ -2881,13 +3263,33 @@ module Squared
             (%i[build archive graph prereqs] + BLK_SET).freeze
           end
 
-          def as_path(val)
-            case val
-            when Pathname
-              val
-            when String
-              Pathname.new(val)
+          def options(*args, **kwargs)
+            name = nil
+            with = []
+            proj = []
+            opts = []
+            args.each do |val|
+              case val
+              when String
+                if name
+                  opts << val
+                else
+                  name = val
+                end
+              when Symbol
+                if name
+                  proj << val
+                else
+                  with << val
+                end
+              end
             end
+            return if !name || (opts.empty? && kwargs.empty? && with.empty?)
+
+            base = OPTIONS[ref]
+            data = [opts.freeze, kwargs.freeze, with.freeze].freeze
+            proj << :_ if proj.empty?
+            proj.each { |val| (base[val] ||= {})[name.to_s] = data }
           end
 
           def ref
@@ -2907,28 +3309,40 @@ module Squared
           def to_s
             super[/[^:]+\z/, 0]
           end
+
+          private
+
+          def as_path(val)
+            case val
+            when Pathname
+              val
+            when String
+              Pathname.new(val)
+            end
+          end
         end
 
         @@tasks = {}
         @@graph = { _: [] }
         @@asdf = Pathname.new("#{Dir.home}/.asdf").yield_self do |path|
-          if path.join('asdf.sh').exist?
-            [path, 15]
-          elsif ENV['ASDF_DATA_DIR']
-            [Pathname.new(ENV['ASDF_DATA_DIR']), 16]
-          end
+          version = if path.join('asdf.sh').exist?
+                      15
+                    elsif ENV['ASDF_DATA_DIR'] && (path = Pathname.new(ENV['ASDF_DATA_DIR'])).exist?
+                      16
+                    end
+          Struct.new(:path, :version).new(path, version) if version
         end
         @@print_order = 0
 
         subtasks({
           'graph' => %i[run print].freeze,
-          'unpack' => %i[zip tar gem ext].freeze,
-          'asdf' => %i[set exec current]
+          'unpack' => %i[zip gz tar ext],
+          'asdf' => %i[set exec current update latest where reshim]
         })
 
-        attr_reader :name, :workspace, :path, :theme, :group, :parent, :dependfile,
-                    :exception, :pipe, :verbose
-        attr_accessor :global, :project
+        attr_reader :name, :workspace, :path, :theme, :group, :parent, :children, :dependfile,
+                    :exception, :pipe, :verbose, :global
+        attr_accessor :project
 
         def initialize(workspace, path, name, *, group: nil, first: {}, last: {}, error: {}, common: ARG[:COMMON],
                        **kwargs)
@@ -2954,20 +3368,20 @@ module Squared
                          else
                            val.nil? ? workspace.verbose : val
                          end
+          self.global = false
           @output = []
           @ref = []
           @children = []
           @events = hashobj.update({ first: first, last: last, error: error })
           @as = hashobj
           @desc = (@name.include?(':') ? @name.split(':').join(ARG[:SPACE]) : @name).freeze
-          @parent = nil
-          @global = false
           @log = nil
           @dev = nil
           @prod = nil
           @withargs = nil
           @session = nil
           @index = -1
+          parent_set kwargs[:parent]
           run_set(kwargs[:run], kwargs[:env], opts: kwargs.fetch(:opts, true))
           graph_set kwargs[:graph]
           pass_set kwargs[:pass]
@@ -3003,32 +3417,24 @@ module Squared
 
           data = @workspace.script_find(*@ref, @group)
           if @output[0].nil?
-            if (scr = data[:script])
+            if data[:script]
               unless kwargs[:script] == false
-                @global = true
-                script_set(scr, args: data.fetch(:args, kwargs[:args]), prod: kwargs[:prod])
+                script_set(data[:script], args: data.fetch(:args, kwargs[:args]), prod: kwargs[:prod], global: true)
               end
-            elsif (run = data[:run])
-              @global = true
-              run_set run
+            elsif data[:run]
+              run_set(data[:run], global: true)
             end
-            unless data[:env]
-              if (scr = kwargs[:script])
-                @global = false
-                script_set(scr, args: kwargs[:args])
-              elsif @script && !data[:global]
-                if (scr = @script[:script])
-                  @global = false
-                  script_set(scr, args: @script.fetch(:args, kwargs[:args]))
-                elsif (run = @script[:run])
-                  @global = false
-                  run_set run
-                end
+            if kwargs[:script]
+              script_set(kwargs[:script], args: kwargs[:args]) unless data[:env][:script]
+            elsif @script
+              if @script[:script]
+                script_set(@script[:script], args: @script.fetch(:args, kwargs[:args])) unless data[:global][:script]
+              elsif @script[:run] && !data[:global][:run]
+                run_set @script[:run]
               end
             end
-          elsif data[:env] && data[:run]
-            @global = true
-            run_set data[:run]
+          elsif data[:run] && data[:env][:run]
+            run_set(data[:run], global: true)
           end
         end
 
@@ -3042,10 +3448,11 @@ module Squared
           return if @log
 
           log = log.is_a?(Hash) ? log.dup : { file: log }
-          if (file = env('LOG_FILE'))
-            file = Time.now.strftime(file)
-          elsif (val = env('LOG_AUTO'))
-            file = "#{@name}-%s.log" % [case val
+          file = if (val = env('LOG_FILE'))
+                   Time.now.strftime(val)
+                 elsif (val = env('LOG_AUTO'))
+                   require 'date'
+                   "#{@name}-%s.log" % [case val
                                         when 'y', 'year'
                                           Date.today.year
                                         when 'm', 'month'
@@ -3055,19 +3462,21 @@ module Squared
                                         else
                                           val.include?('%') ? Time.now.strftime(val) : Time.now.strftime('%FT%T%:z')
                                         end]
-          elsif (val = log[:file])
-            file = val.is_a?(String) ? Time.now.strftime(val) : "#{@name}-#{Date.today}.log"
-          end
-          begin
-            file &&= @workspace.home.join(env('LOG_DIR', ''), file).realdirpath
-          rescue StandardError => e
-            file = nil
-            print_error e
-          end
+                 elsif (val = log[:file])
+                   if val.is_a?(String)
+                     Time.now.strftime(val)
+                   else
+                     require 'date'
+                     "#{@name}-#{Date.today}.log"
+                   end
+                 end
+                 .yield_self do |dir|
+                   @workspace.home.join(env('LOG_DIR', ''), dir).realdirpath if dir
+                 rescue StandardError => e
+                   print_error e
+                 end
           log[:progname] ||= @name
-          if (val = env('LOG_LEVEL', ignore: false))
-            log[:level] = val.match?(/\d/) ? log_sym(val.to_i) : val
-          end
+          env('LOG_LEVEL', ignore: false) { |val| log[:level] = val.start_with?(/\d/) ? log_sym(val.to_i) : val }
           log.delete(:file)
           @log = [file, log]
         end
@@ -3075,28 +3484,23 @@ module Squared
         def initialize_env(dev: nil, prod: nil, **)
           @dev = env_match('BUILD', dev, suffix: 'DEV', strict: true)
           @prod = env_match('BUILD', prod, suffix: 'PROD', strict: true)
-          if (val = env('BUILD', suffix: 'ENV')) && @output[2] != false
-            @output[2] = parse_json(val, hint: "BUILD_#{@envname}_ENV") || @output[2]
-          end
+          env('BUILD', suffix: 'ENV') { |val| @output[2] = val if (val = parse_json(val)) } unless @output[0] == false
           unless @output[0] == false || @output[0].is_a?(Array)
-            if (val = env('BUILD', suffix: 'OPTS'))
+            env('BUILD', suffix: 'OPTS') do |val|
               n = @output[0] ? 1 : 3
               @output[n] = merge_opts(@output[n], shell_split(val))
             end
-            if (val = env(ref.to_s.upcase, suffix: 'OPTS'))
-              @output[4] = merge_opts(@output[4], shell_split(val))
-            end
+            env(ref.to_s.upcase, suffix: 'OPTS') { |val| @output[4] = merge_opts(@output[4], shell_split(val)) }
           end
-          @version = val if (val = env('BUILD', suffix: 'VERSION'))
-          return unless (val = env('BUILD', strict: true))
-
-          @global = false
-          if val == '0'
-            @output = [false]
-          elsif script?
-            script_set val
-          else
-            run_set val
+          env('BUILD', suffix: 'VERSION') { |val| self.version = val }
+          env('BUILD', strict: true) do |val|
+            if val == '0'
+              @output = [false]
+            elsif script?
+              script_set val
+            else
+              run_set val
+            end
           end
         end
 
@@ -3172,6 +3576,10 @@ module Squared
                      end
         end
 
+        def global=(val)
+          @global = val unless val.nil?
+        end
+
         def ref
           Base.ref
         end
@@ -3196,20 +3604,16 @@ module Squared
                       if flag == :run
                         graph args
                       else
-                        out, done = graph(args, out: [])
-                        out.map! do |val|
-                          n = done.index { |proj| val.match?(/ #{Regexp.escape(proj.name)}(?:@\d|\z)/) }
-                          n ? "#{val} (#{n.succ})" : val
-                        end
+                        out = graph(args, out: [], order: {})
                         emphasize(out, title: path, right: true, border: borderstyle, sub: [
-                          { pat: /\A(#{Regexp.escape(path.to_s)})(.*)\z/, styles: theme[:header] },
-                          { pat: /\A(#{Regexp.escape(name)})(.*)\z/, styles: theme[:active] },
-                          { pat: /\A((?~ \() \()(\d+)(\).*)\z/, styles: theme[:inline], index: 2 }
+                          opt_style(theme[:header], /\A(#{Regexp.escape(path.to_s)})(.*)\z/),
+                          opt_style(theme[:active], /\A(#{Regexp.escape(name)})(.*)\z/),
+                          opt_style(theme[:inline], /\A((?~ \() \()(\d+)(\).*)\z/, 2)
                         ])
                       end
                     end
                   when 'unpack'
-                    format_desc(action, flag, 'tag/url,dir,digest?,f|force?', before: flag == :ext ? 'ext' : nil)
+                    format_desc(action, flag, 'tag/url,dir,digest?,f/orce?', before: ('ext' if flag == :ext))
                     params = %i[tag dir digest force]
                     params.unshift(:ext) if flag == :ext
                     task flag, params do |_, args|
@@ -3217,21 +3621,20 @@ module Squared
                       tag = param_guard(action, flag, args: args, key: :tag)
                       dir = param_guard(action, flag, args: args, key: :dir)
                       unless tag.match?(URI_SCHEME)
-                        if flag == :gem
-                          tag = "https://rubygems.org/downloads/#{File.basename(tag, '.gem')}.gem"
-                        elsif @release
-                          tag = "%s.#{ext}" % [@release.include?('??') ? @release.sub('??', tag) : @release + tag]
-                        else
-                          raise_error("no base uri: #{tag}", hint: ext)
-                        end
+                        tag = unpack_get tag, ext
+                        tag ||= if @release
+                                  "%s.#{ext}" % [@release.include?('??') ? @release.sub('??', tag) : @release + tag]
+                                else
+                                  raise_error ArgumentError, "no base uri: #{tag}", hint: ext
+                                end
                       end
-                      case (digest = args.digest)
-                      when 'f', 'force'
-                        digest = nil
-                        force = true
-                      else
-                        force = args.fetch(:force, false)
-                      end
+                      force = case (digest = args.digest)
+                              when 'f', 'force'
+                                digest = nil
+                                true
+                              else
+                                args.fetch(:force, false)
+                              end
                       unpack(basepath(dir), uri: tag, digest: digest, ext: ext, force: force)
                     end
                   when 'asdf'
@@ -3239,7 +3642,7 @@ module Squared
 
                     case flag
                     when :set
-                      format_desc action, flag, 'version,opts*=u|home,p|parent'
+                      format_desc action, flag, 'version,dir?=u/home|p/arent'
                       task flag, [:version] do |_, args|
                         args = if (version = args.version)
                                  args.extras
@@ -3249,14 +3652,14 @@ module Squared
                                                                       .map(&:basename)
                                                                       .sort { |a, b| b <=> a }
                                                                       .push('latest', 'system'),
-                                                              accept: [['Confirm?', false, true]],
-                                                              values: ['Options'])
+                                                              accept: [accept_y('Confirm?')],
+                                                              values: 'Options')
                                  OptionPartition.strip(opts)
                                end
                         asdf(flag, args, version: version)
                       end
                     else
-                      format_desc(action, flag, flag == :exec ? 'command' : nil)
+                      format_desc(action, flag, ('command' if flag == :exec))
                       task flag do |_, args|
                         args = args.to_a
                         args << readline('Enter command', force: true) if args.empty? && flag == :exec
@@ -3275,7 +3678,7 @@ module Squared
         end
 
         def with(**kwargs, &blk)
-          @withargs = kwargs.empty? ? nil : kwargs
+          @withargs = (kwargs unless kwargs.empty?)
           if block_given?
             instance_eval(&blk)
             @withargs = nil
@@ -3296,7 +3699,6 @@ module Squared
             kwargs = hashdup(@withargs).update(kwargs) if @withargs
             kwargs[:group] = group if group && !kwargs.key?(:group)
             kwargs[:ref] = ref unless kwargs.key?(:ref)
-            parent = self
             proj = nil
             name = case name
                    when String, Symbol
@@ -3304,12 +3706,11 @@ module Squared
                    else
                      path.basename
                    end
-            workspace.add(path, name, **kwargs) do
-              __send__ :parent_set, parent
+            workspace.add(path, name, parent: self, **kwargs) do
               proj = self
               instance_eval(&blk) if block_given?
             end
-            @children << proj
+            children << proj
           end
           self
         end
@@ -3321,23 +3722,23 @@ module Squared
 
         def inject(obj, *args, **kwargs, &blk)
           if enabled?
-            out = obj.link(self, *args, **kwargs, &blk) if obj.respond_to?(:link)
-            if !out
-              print_error('link not compatible', subject: obj, hint: name)
-            elsif out.respond_to?(:build)
-              out.build
-            end
+            raise 'link not compatible' unless obj.respond_to?(:link) && (out = obj.link(self, *args, **kwargs, &blk))
+
+            out.build if out.respond_to?(:build)
           end
+          self
+        rescue StandardError => e
+          print_error(e, subject: obj, hint: name)
           self
         end
 
         def build(*args, sync: invoked_sync?('build'), from: :run, **)
-          banner = verbose
+          banner = !silent?
           if args.empty?
             return unless from == :run
 
-            banner = verbosetype > 1 if from_base?('build')
-            run_b(@run, sync: sync, from: from, banner: banner) if series?(@run)
+            banner = verbose? if from_base?('build')
+            run_b(@run, sync: sync, banner: banner, from: from) if series?(@run)
             args = @output
           end
           if args.first.is_a?(Struct)
@@ -3383,19 +3784,18 @@ module Squared
               cmd = replace_bin as_get(cmd, from)
               opts = compose(opts, script: false) if opts && respond_to?(:compose)
               flags = append_hash(flags, target: []).join(' ') if flags.is_a?(Hash)
-              case opts
-              when Hash
-                cmd = Array(cmd).push(flags)
-                                .concat(append_hash(opts, target: [], build: true))
-                                .compact
-                                .join(' ')
-              when Enumerable
-                cmd = Array(cmd).concat(opts.to_a)
-                cmd.map! { |val| "#{val} #{flags}" } if flags
-                cmd = cmd.join(' && ')
-              else
-                cmd = [cmd, flags, opts].compact.join(' ') if opts || flags
-              end
+              cmd = case opts
+                    when Hash
+                      [cmd, flags].concat(append_hash(opts, target: [], build: true))
+                                  .compact
+                                  .join(' ')
+                    when Enumerable
+                      cmd = Array(cmd).concat(opts.to_a)
+                      cmd.map! { |val| "#{val} #{flags}" } if flags
+                      cmd.join(' && ')
+                    else
+                      [cmd, flags, opts].compact.join(' ')
+                    end
             else
               return unless (opts || extra) && respond_to?(:compose)
 
@@ -3403,7 +3803,7 @@ module Squared
               from = :script if from == :run && script?
             end
           end
-          run(cmd, var, sync: sync, from: from, banner: banner)
+          run(cmd, var, sync: sync, banner: banner, from: from)
         end
 
         def depend(*, sync: invoked_sync?('depend'), **)
@@ -3416,7 +3816,7 @@ module Squared
             next if @@graph[:_].include?(proj)
 
             if (val = ENV["PREREQS_#{proj.instance_variable_get(:@envname)}"] || ENV["PREREQS_#{proj.ref.upcase}"])
-              split_escape(val).each do |meth|
+              split_escape(val) do |meth|
                 if proj.respond_to?(meth.to_sym)
                   begin
                     proj.__send__(meth, sync: sync)
@@ -3442,7 +3842,7 @@ module Squared
         end
 
         def doc(*, sync: invoked_sync?('doc'), **)
-          run_b(@doc, sync: sync, banner: from_base?('doc') ? verbose? : verbosetype > 0, from: :doc)
+          run_b(@doc, sync: sync, banner: from_base?('doc') ? verbose? : !silent?, from: :doc)
         end
 
         def lint(*, sync: invoked_sync?('lint'), **)
@@ -3464,10 +3864,10 @@ module Squared
           case @clean
           when Struct
             if (val = instance_eval(&@clean.block) || @clean.run)
-              temp = @clean
-              @clean = val
-              clean(*args, sync: sync, pass: true, **kwargs)
-              @clean = temp
+              @clean = @clean.tap do
+                @clean = val
+                clean(*args, sync: sync, pass: true, **kwargs)
+              end
             end
           when String
             run_s(@clean, sync: sync)
@@ -3483,7 +3883,7 @@ module Squared
                 entry = basepath(val = val.to_s)
                 if entry.directory? && val.match?(%r{[\\/]\z})
                   log&.warn "rm -rf #{entry}"
-                  rm_rf(entry, verbose: verbosetype > 0)
+                  rm_rf(entry, verbose: !silent?)
                 else
                   log&.warn "rm #{entry}"
                   (val.include?('*') ? Dir[entry] : [entry]).each do |file|
@@ -3502,10 +3902,10 @@ module Squared
           on :last, :clean unless pass
         end
 
-        def graph(start = [], tasks = nil, *, sync: invoked_sync?('graph'), pass: [], out: nil, **)
-          if (val = env('GRAPH', strict: true))
+        def graph(start = [], tasks = nil, *, sync: invoked_sync?('graph'), pass: [], out: nil, order: nil, **)
+          env('GRAPH', strict: true) do |val|
             tasks ||= []
-            split_escape(val).each do |task|
+            split_escape(val) do |task|
               if ref?(task.to_sym) && (script = workspace.script_get(:graph, ref: task.to_sym))
                 tasks.concat(script[:graph])
               else
@@ -3513,32 +3913,41 @@ module Squared
               end
             end
           end
-          pass.concat(split_escape(val)) if (val = env('GRAPH', suffix: 'PASS'))
+          env('GRAPH', suffix: 'PASS') { |val| pass.concat(split_escape(val)) }
           start, neg = start.partition { |name| !name.start_with?('-') }
           data = graph_collect(self, start, pass: neg.map! { |name| name[1..-1] })
           unless out
             data[name] << self
             on :first, :graph
           end
-          ret = graph_branch(self, data, tasks, out, sync: sync, pass: pass)
+          ret = graph_branch(self, data, tasks, out, sync: sync, pass: pass, order: order)
         rescue StandardError => e
           on_error(e, :graph, exception: true)
         else
           if out
-            [out, ret]
+            if order
+              out.map! do |val|
+                name = ret.find { |proj| val.match?(/ #{Regexp.escape(proj.name)}(?:@\d|\z)/) }&.name
+                next val unless (n = name && order[name])
+
+                val.subhint(n.succ)
+              end
+            else
+              [out, ret]
+            end
           else
             on :last, :graph
           end
         end
 
         def unpack(target, file = nil, uri: nil, sync: true, digest: nil, ext: nil, force: false, depth: 1, headers: {},
-                   verbose: self.verbose, from: :unpack)
+                   verbose: !silent?, from: :unpack)
           if !target.exist?
             target.mkpath
           elsif !target.directory?
-            raise_error('invalid location', hint: target)
+            raise_error Errno::EEXIST, target, hint: uri
           elsif !file && !target.empty?
-            raise_error('directory not empty', hint: target) unless force || env('UNPACK_FORCE')
+            raise_error Errno::EEXIST, target, hint: uri unless force || env('UNPACK_FORCE')
             create = true
           end
           if digest
@@ -3558,25 +3967,27 @@ module Squared
                    when 128, 'sha512'
                      Digest::SHA512
                    else
-                     raise_error "invalid checksum: #{digest}"
+                     raise_error "invalid checksum: #{digest}", hint: uri
                    end
           end
-          if (val = env('HEADERS')) && (val = parse_json(val, hint: "HEADERS_#{@envname}"))
-            headers = headers.is_a?(Hash) ? headers.merge(val) : val
+          env('HEADERS') do |val|
+            next unless (data = parse_json(val))
+
+            headers = headers.is_a?(Hash) ? headers.merge(data) : data
           end
           if file
             ext ||= File.extname(file)[1..-1]
           else
             require 'open-uri'
             data = nil
-            (uri = Array(uri)).each_with_index do |url, index|
+            (uri = Array(uri)).each_with_index do |url, i|
               URI.open(url, headers) do |f|
                 data = f.read
                 if algo && algo.hexdigest(data) != digest
                   data = nil
-                  raise_error("checksum failed: #{digest}", hint: url) if index == uri.size - 1
+                  raise_error "invalid checksum: #{digest}", hint: url if i == uri.size.pred
                 end
-                next if ext && index == 0
+                next if ext && i == 0
 
                 case f.content_type
                 when 'application/zip'
@@ -3592,7 +4003,7 @@ module Squared
               break uri = url if data
             end
             unless data && (ext ||= URI.decode_www_form_component(URI.parse(uri).path[/\.([\w%]+)(?:\?|\z)/, 1]))
-              raise_error("no content#{data ? ' type' : ''}", hint: uri)
+              raise_error(data ? TypeError : RuntimeError, "no content#{' type' if data}", hint: uri)
             end
           end
           ext = ext.downcase
@@ -3601,13 +4012,13 @@ module Squared
           end
           begin
             unless file
-              if ext == 'gem'
-                dir = Dir.mktmpdir
-                file = File.new(File.join(dir, File.basename(uri)), 'w')
-              else
-                require 'tempfile'
-                file = Tempfile.new("#{name}-")
-              end
+              file = if ext == 'gem'
+                       dir = Dir.mktmpdir
+                       File.new(File.join(dir, File.basename(uri)), 'w')
+                     else
+                       require 'tempfile'
+                       Tempfile.new("#{name}-")
+                     end
               file.write(data)
               file.close
               file = Pathname.new(file)
@@ -3621,8 +4032,8 @@ module Squared
             case ext
             when 'zip', 'aar'
               session 'unzip', shell_quote(file), quote_option('d', target)
-            when 'tar', 'tgz', 'txz', 'tar.gz', 'tar.xz', 'gz', 'xz'
-              flags = +(verbose ? 'v' : '')
+            when 'tar', /\A(?:t|tar\.)?[gx]z\z/
+              flags = +(silent? ? '' : 'v')
               if ext.end_with?('gz')
                 flags += 'z'
               elsif ext.end_with?('xz')
@@ -3664,16 +4075,17 @@ module Squared
         def asdf(flag, opts = [], version: nil)
           return unless @asdf
 
-          cmd = session 'asdf', flag
+          cmd = flag == :update ? session('asdf', 'plugin update') : session('asdf', flag)
           name = @asdf.first
-          legacy = @@asdf[1] == 15
+          legacy = @@asdf.version == 15
+          banner = true
           case flag
           when :set
-            u = has_value?(opts, %w[u home])
+            u = has_value?(opts, 'u', 'home')
             cmd << if legacy
                      cmd.delete(flag)
                      u ? 'global' : 'local'
-                   elsif has_value?(opts, %w[p parent])
+                   elsif has_value?(opts, 'p', 'parent')
                      '--parent'
                    elsif u
                      '--home'
@@ -3685,8 +4097,11 @@ module Squared
           when :current
             cmd << '--no-header' unless legacy
             cmd << name
+          else
+            cmd << name
+            banner = false if flag == :latest || flag == :where
           end
-          print_success if success?(run(from: :"asdf:#{flag}"), flag == :set)
+          success?(run(banner: banner, from: :"asdf:#{flag}"), flag == :set || flag == :reshim)
         end
 
         def first(key, *args, **kwargs, &blk)
@@ -3702,13 +4117,9 @@ module Squared
         end
 
         def event(name, key, *args, override: false, **kwargs, &blk)
-          data = @events[name.to_sym]
-          items = if override
-                    data[key.to_sym] = []
-                  else
-                    data[key.to_sym] ||= []
-                  end
-          items << [block_given? ? [blk] + args : args, kwargs]
+          args.unshift(blk) if block_given?
+          ev = @events[name.to_sym]
+          (override ? ev[key.to_sym] = [] : ev[key.to_sym] ||= []) << [args, kwargs]
           self
         end
 
@@ -3726,28 +4137,29 @@ module Squared
               instance_variable_set :"@#{key}", [blk]
             end
           else
-            log&.warn "series: @#{key} (invalid)"
+            log&.warn "series: @#{key}".subhint('invalid')
           end
           self
         end
 
-        def run(cmd = @session, var = nil, exception: self.exception, sync: true, from: nil, banner: true, chdir: path,
-                interactive: nil, hint: nil, series: true, **)
+        def run(cmd = @session, var = nil, exception: self.exception, sync: true, banner: true, from: nil, chdir: path,
+                interactive: nil, hint: nil, series: false, **)
           unless cmd
             print_error('no command session started', subject: project, hint: from, pass: true)
             return
           end
           cmd = cmd.target if cmd.is_a?(OptionPartition)
-          if interactive && (!@session || !option('y'))
-            title, y = case interactive
-                       when Array
-                         interactive
-                       when String
-                         [interactive, 'N']
-                       else
-                         ['Run', 'Y']
-                       end
-            exit 1 unless confirm("#{title}? [#{sub_style(cmd.to_s, styles: theme[:inline])}]", y)
+          if interactive && sync && (!@session || !option('y'))
+            msg, y, h = case interactive
+                        when Array
+                          interactive
+                        when String
+                          [interactive, 'N']
+                        else
+                          %w[Run Y]
+                        end
+            msg = "#{msg} #{sub_style(h, theme[:active])}" if h
+            exit 1 unless confirm_basic("#{msg}?", cmd, y)
           end
           cmd = session_done cmd
           log&.info cmd
@@ -3757,7 +4169,7 @@ module Squared
               log&.warn "ENV discarded: #{var}" if var
               task_invoke(cmd, exception: exception, warning: warning?)
             else
-              print_item(format_banner(hint ? "#{cmd} (#{hint})" : cmd, banner: banner), series: series) if sync
+              print_item(format_banner(cmd, banner: banner, hint: hint), series: series) if sync
               if var != false && (pre = runenv)
                 case pre
                 when Hash
@@ -3795,14 +4207,7 @@ module Squared
             args = block_args args, &blk
           end
           if variables.include?(key) || blocks.include?(key)
-            val = case args.size
-                  when 0
-                    nil
-                  when 1
-                    args.first
-                  else
-                    args
-                  end
+            val = args.size > 1 ? args : args.first
             case key
             when :index
               index_set val
@@ -3833,7 +4238,7 @@ module Squared
               instance_variable_set(:"@#{key}", val)
             end
           else
-            log&.warn "variable_set: @#{key} (private)"
+            log&.warn "variable_set: @#{key}".subhint('private')
           end
           self
         end
@@ -3854,6 +4259,12 @@ module Squared
 
         def ref?(val)
           @ref.include?(val)
+        end
+
+        def exist?(*args)
+          return false if (args = args.compact).empty?
+
+          basepath(*args).exist?
         end
 
         def build?
@@ -3913,6 +4324,10 @@ module Squared
           @prod != false && workspace.prod?(pat: @prod, **scriptargs)
         end
 
+        def empty?
+          children.empty?
+        end
+
         def exclude?(*refs)
           !@exclude.empty? && has_value?(@exclude, refs.flatten)
         end
@@ -3929,10 +4344,14 @@ module Squared
           @dependindex ? @dependindex.succ : 0
         end
 
+        def dependname
+          @dependname ||= dependfile&.basename.to_s
+        end
+
         def log
           return @log unless @log.is_a?(Array)
 
-          @log = Logger.new(enabled? ? @log.first : nil, **@log.last)
+          @log = Logger.new((@log.first if enabled?), **@log.last)
         end
 
         def allref(&blk)
@@ -3941,6 +4360,33 @@ module Squared
 
         def basepath(*args)
           path.join(*args)
+        end
+
+        def basepath!(*args, type: nil)
+          ret = basepath(*args)
+          return unless ret.exist?
+
+          if type
+            (type.is_a?(String) ? type.chars : type).each do |ch|
+              case ch
+              when 'f'
+                return nil unless ret.file?
+              when 'd'
+                return nil unless ret.directory?
+              when 'l'
+                return nil unless ret.symlink?
+              when 'r'
+                return nil unless ret.readable?
+              when 'w'
+                return nil unless ret.writable?
+              when 'e'
+                return nil unless ret.executable?
+              else
+                return nil
+              end
+            end
+          end
+          ret
         end
 
         def rootpath(*args, ascend: nil)
@@ -3959,6 +4405,12 @@ module Squared
           workspace.task_localname(name)
         end
 
+        def scriptname(from: :run)
+          return unless (name = @output[1]) && respond_to?(:compose)
+
+          as_get name, from
+        end
+
         def inspect
           "#<#{self.class}: #{name} => #{self}>"
         end
@@ -3971,16 +4423,33 @@ module Squared
           name.to_sym
         end
 
+        protected
+
+        def script_get(*args, key: nil)
+          ret = workspace.script_get(*args, group: group, ref: allref)
+          return ret unless ret && key
+
+          ret.fetch(key, nil)
+        end
+
         private
 
         def puts(*args, **kwargs)
           log_console(*args, pipe: kwargs[:pipe] || pipe)
         end
 
-        def run_s(*cmd, env: nil, sync: true, from: nil, banner: verbose != false, **kwargs)
+        def run_s(*cmd, sync: true, banner: !silent?, from: nil, **kwargs)
+          cmd.flatten!
+          case cmd.last
+          when Hash, TrueClass, FalseClass
+            var = cmd.pop
+          end
           on :first, from
           begin
-            cmd.flatten.each { |val| run(val, env, sync: sync, banner: banner, **kwargs) }
+            cmd.each do |val|
+              print_run val, banner
+              run(val, var, sync: sync, banner: banner, **kwargs)
+            end
           rescue StandardError => e
             on_error(e, from, exception: kwargs.fetch(:exception, exception))
           end
@@ -3996,7 +4465,12 @@ module Squared
           when Proc
             instance_eval(&obj)
           when Method
-            obj.call
+            args = if (n = obj.arity.abs) > 0
+                     Array.new(n).tap { |data| data[0] = self }
+                   else
+                     []
+                   end
+            obj.call(*args)
           else
             if series?(obj)
               obj.each(&:call)
@@ -4008,13 +4482,11 @@ module Squared
           end
         end
 
-        def graph_branch(target, data, tasks = nil, out = nil, sync: true, pass: [], done: [], depth: 0,
+        def graph_branch(target, data, tasks = nil, out = nil, sync: true, pass: [], done: [], order: nil, depth: 0,
                          single: false, last: false, context: nil)
-          tag = ->(proj) { "#{proj.name}#{SEM_VER.match?(proj.version) ? "@#{proj.version}" : ''}" }
-          script = ->(proj) { workspace.script_get(:graph, group: proj.group, ref: proj.allref)&.fetch(:graph, nil) }
-          check = ->(deps) { deps.reject { |val| done.include?(val) } }
-          dedupe = lambda do |name|
-            next [] unless (ret = data[name])
+          tag = ->(proj) { "#{proj.name}#{"@#{proj.version}" if SEM_VER.match?(proj.version)}" }
+          uniq = lambda do |name|
+            return [] unless (ret = data[name])
 
             ret.dup.each do |proj|
               next if proj.name == name
@@ -4023,13 +4495,14 @@ module Squared
             end
             ret
           end
-          start = target.name
           if depth == 0
-            items = check.call(dedupe.call(start))
+            items = uniq.call(target.name) - done
             single = items.size == 1
           else
-            items = check.call(data[start])
+            items = data[target.name] - done
           end
+          return done if items.empty?
+
           if out
             a, b, c, d, e = ARG[:GRAPH]
             f = tag.call(target)
@@ -4043,55 +4516,72 @@ module Squared
                        "#{last ? d : c}#{b * 3}#{e} #{f}"
                      end
                    else
-                     "#{single ? ' ' : a}#{'   ' * (depth - 1)}#{last ? d : c}#{b * 3}#{items.empty? ? b : e} #{f}"
+                     "#{single ? ' ' : a}#{'   ' * depth.pred}#{last ? d : c}#{b * 3}#{items.empty? ? b : e} #{f}"
                    end
           end
           items.each_with_index do |proj, i|
             next if done.include?(proj)
 
-            t = dedupe.call(proj.name)
+            t = uniq.call(name = proj.name)
             j = if out
-                  if i == items.size - 1 || check.call(post = items[(i + 1)..-1]).empty?
+                  if i == items.size.pred || (post = items[i.succ..-1] - done).empty?
                     true
                   elsif !t.empty? && depth > 0
-                    post.reject { |pr| t.include?(pr) }.empty?
+                    (post - t).empty?
                   end
                 end
-            unless start == proj.name || (none = check.call(t).empty?)
-              graph_branch(proj, data, tasks, out, sync: sync, pass: pass, done: done, depth: depth.succ,
+            unless target.name == name || (none = (t - done).empty?)
+              graph_branch(proj, data, tasks, out, sync: sync, pass: pass, done: done, order: order, depth: depth.succ,
                                                    single: single, last: j == true, context: target)
             end
-            if !out
-              (tasks || (subtasks = script.call(proj)) || (dev? ? %w[build copy] : %w[depend build])).each do |meth|
-                next if pass.include?(meth)
-
-                if workspace.task_defined?(cmd = task_join(proj.name, meth))
-                  if ENV.key?(key = "BANNER_#{proj.name.upcase}")
-                    key = nil
-                  else
-                    ENV[key] = '0'
-                  end
-                  run(cmd, sync: false, banner: false)
-                  ENV.delete(key) if key
-                elsif proj.has?(meth, tasks || subtasks ? nil : workspace.baseref)
-                  proj.__send__(meth.to_sym, sync: sync)
-                end
-              end
-            elsif none
-              a, b, c, d = ARG[:GRAPH]
-              out << if depth == 0
-                       "#{i == items.size - 1 ? d : c}#{b * 4} #{tag.call(proj)}"
-                     else
-                       s = ''.dup
-                       k = 0
-                       final = data.keys.last
-                       while k < depth
-                         indent = k > 0 ? ((last && !j) || (j && k == depth - 1) || single) : j && last && depth == 1
-                         s += "#{indent || (last && data[final].last == context) ? ' ' : a}   "
-                         k += 1
+            if out
+              if none
+                a, b, c, d = ARG[:GRAPH]
+                out << if depth == 0
+                         "#{i == items.size.pred ? d : c}#{b * 4} #{tag.call(proj)}"
+                       else
+                         s = +''
+                         k = 0
+                         final = data.keys.last
+                         while k < depth
+                           indent = k > 0 ? ((last && !j) || (j && k == depth.pred) || single) : j && last && depth == 1
+                           s += "#{indent || (last && data[final].last == context) ? ' ' : a}   "
+                           k += 1
+                         end
+                         s += "#{j ? d : c}#{b * 3} #{tag.call(proj)}"
                        end
-                       s + "#{j ? d : c}#{b * 3} #{tag.call(proj)}"
-                     end
+              end
+              if order
+                n = order.size
+                order[name] ||= if proj.parent
+                                  if order[s = proj.parent.name]
+                                    order[s] += 1
+                                    n.pred
+                                  else
+                                    order[s] = n.succ
+                                    n
+                                  end
+                                else
+                                  n
+                                end
+              end
+            else
+              (tasks || (graph = proj.script_get(:graph, key: :graph)) || (dev? ? %w[build copy] : %w[depend build]))
+                .each do |meth|
+                  next if pass.include?(meth)
+
+                  if workspace.task_defined?(cmd = task_join(name, meth))
+                    if ENV.key?(key = "BANNER_#{name.upcase}")
+                      key = nil
+                    else
+                      ENV[key] = '0'
+                    end
+                    run(cmd, sync: false, banner: false)
+                    ENV.delete(key) if key
+                  elsif proj.has?(meth, (workspace.baseref unless tasks || graph))
+                    proj.__send__(meth.to_sym, sync: sync)
+                  end
+                end
             end
             done << proj
           end
@@ -4104,13 +4594,10 @@ module Squared
             next if pass.include?(val)
 
             if (obj = workspace.find(name: val))
-              next unless obj.enabled?
-
-              items = [obj]
+              obj.enabled? ? [obj] : []
             else
-              items = workspace.find(group: val, ref: val.to_sym)
-            end
-            items.each do |proj|
+              workspace.find(group: val, ref: val.to_sym).sort
+            end.each do |proj|
               next if pass.include?(name = proj.name)
 
               if proj.graph? && !data.key?(name) && !root.include?(name)
@@ -4145,44 +4632,101 @@ module Squared
         end
 
         def env(key, default = nil, suffix: nil, equals: nil, ignore: nil, strict: false)
-          a = "#{key}_#{@envname}"
+          name = "#{key}_#{@envname}"
           ret = if suffix
-                  ENV.fetch("#{a}_#{suffix}", '')
+                  ENV.fetch("#{name}_#{suffix}", '')
                 elsif strict
-                  ENV[a].to_s
+                  ENV[name].to_s
                 else
                   ignore = ['0'].freeze if ignore.nil?
-                  ENV[a] || ENV.fetch(key, '')
+                  ENV[name] || ENV.fetch(key, '')
                 end
-          return ret == equals.to_s unless equals.nil?
+          if equals.nil?
+            ret = default if ret.empty? || (ignore && Array(ignore).any? { |val| ret == val.to_s })
+            return ret if ret.nil?
+          else
+            ret = Array(equals).any? { |val| ret == val.to_s }
+          end
+          return yield ret if block_given?
 
-          ret.empty? || (ignore && Array(ignore).any? { |val| ret == val.to_s }) ? default : ret
+          ret
         end
 
         def session(*cmd, prefix: cmd.first, main: true, path: true, options: true)
-          prefix = stripext prefix.to_s
+          prefix = prefix.to_s.stripext
           if path && (val = shell_bin(prefix))
             cmd[0] = shell_quote(val, force: false)
           end
           ret = JoinSet.new(cmd.flatten(1))
-          if options && (val = env("#{prefix.upcase}_OPTIONS"))
-            split_escape(val).each { |opt| ret.last(fill_option(opt), /\A(--?[^\[\]=\s-][^\[\]=\s]*)[=\s].+\z/m) }
+          if options
+            env("#{prefix.upcase}_OPTIONS") do |val|
+              if val.start_with?('-')
+                ret.merge(shell_parse(val))
+              else
+                split_escape(val) { |opt| ret.last(fill_option(opt), /\A(--?[^=\s-][^=\s]*)[=\s].+\z/m) }
+              end
+            end
           end
-          main ? @session = ret : ret
-        end
+          return ret unless main
 
-        def session_delete(*args, target: @session)
-          OptionPartition.delete(target, *args)
+          @session = ret
         end
 
         def session_output(*cmd, **kwargs)
           session(*cmd, main: false, options: false, **kwargs)
         end
 
-        def session_done(cmd)
-          return cmd unless cmd.respond_to?(:done)
+        def session_get(val, pass: nil)
+          base = OPTIONS[ref]
+          args = []
+          kwargs = {}
+          with = []
+          [:_, name.to_sym].each do |key|
+            next unless base.key?(key) && (a, b, c = base[key][val])
 
-          raise_error('no args added', hint: cmd.first) unless cmd.size > 1
+            args.concat(a)
+            append_keys(kwargs, b, :opts)
+            with.concat(c)
+          end
+          OptionPartition.uniq!(args, pass) if pass
+          [args, kwargs, with]
+        end
+
+        def session_apply(val, args: nil, kwargs: nil, pass: [], keys: [:opts], exclude: [])
+          a = []
+          b = {}
+          Array(val).each do |c|
+            d, e, f = session_get c
+            unless (f -= exclude).empty?
+              h = []
+              i = {}
+              session_apply(f.map!(&:to_s), args: h, kwargs: i, pass: pass, keys: keys, exclude: exclude.concat(f))
+              a.concat(h)
+              append_keys(b, i, *keys)
+            end
+            a.concat(d)
+            append_keys(b, e, *keys)
+          end
+          if args
+            args.unshift(*a)
+            OptionPartition.uniq!(args, pass) if pass
+          end
+          kwargs&.update(b) { |_, val| val }
+          nil
+        end
+
+        def session_opts(val, args: nil, kwargs: nil, pass: nil, keys: [:opts])
+          opts = kwargs.delete(:opts) || []
+          return opts unless val
+
+          session_apply(val, args: args, kwargs: kwargs, pass: pass, keys: keys)
+          kwargs.fetch(:opts, []).concat(opts)
+        end
+
+        def session_done(cmd)
+          return cmd.to_s unless cmd.respond_to?(:done)
+
+          raise_error 'no command added', hint: cmd.first unless cmd.size > 1
           @session = nil if cmd == @session
           cmd.done
         end
@@ -4197,20 +4741,22 @@ module Squared
           return unless prefix
 
           args.each do |val|
-            next unless (ret = env(env_key(stripext(prefix), val), **kwargs))
+            next unless (ret = env(env_key(prefix.to_s.stripext, val), **kwargs))
 
             return block_given? ? yield(ret) : ret
           end
           nil
         end
 
-        def option_clear(opts, target: @session, **kwargs)
+        def option_clear(opts, empty = true, target: @session, **kwargs)
           return unless target
 
           OptionPartition.clear(target, opts, styles: theme[:inline], **kwargs)
+          opts.clear if empty
+          nil
         end
 
-        def print_success(*)
+        def print_success
           puts 'Success'
         end
 
@@ -4220,10 +4766,17 @@ module Squared
           warn log_message(loglevel, *args, **kwargs)
         end
 
-        def print_item(*val, series: true)
+        def print_run(cmd, banner = true, verbose: nil, **)
+          return if banner || !stdout? || verbose == false || env('BANNER', equals: '0')
+
+          puts "\n> #{cmd}"
+          printsucc
+        end
+
+        def print_item(*val, series: false)
           puts unless printfirst?
-          printsucc if series
-          puts val unless val.empty? || (val.size == 1 && val.first.nil?)
+          printsucc unless series
+          puts val unless val.empty? || (val.size == 1 && !val.first)
         end
 
         def print_banner(*lines, client: false, styles: theme[:banner], border: borderstyle, **)
@@ -4247,37 +4800,40 @@ module Squared
               val
             end
           end
-          (lines << sub_style(ARG[:BORDER][1] * n, styles: border)).join("\n")
+          (lines << sub_style(ARG[:BORDER][1] * n, border)).join("\n")
         end
 
         def print_footer(*lines, sub: nil, reverse: false, right: false, border: borderstyle, **)
           n = line_width lines
+          sub = as_a sub
           lines.map! do |val|
             s = right ? val.rjust(n) : val.ljust(n)
-            sub&.each { |h| s = sub_style(s, **h) }
+            sub.each { |h| sub_style!(s, **h) }
             s
           end
-          ret = [sub_style(ARG[:BORDER][1] * n, styles: border)].concat(lines)
-          ret.reverse! if reverse
-          ret.join("\n")
+          [sub_style(ARG[:BORDER][1] * n, border)].concat(lines)
+                                                  .tap { |ret| ret.reverse! if reverse }
+                                                  .join("\n")
         end
 
         def print_status(*args, from: nil, **kwargs)
-          return if stdin?
+          return if stdin? || silent?
 
           case from
           when :outdated
             out = print_footer("major #{args[0]} / minor #{args[1]} / patch #{args[2]}", right: true).split("\n")
-            out[1] = sub_style(out[1], pat: /^( +major )(\d+)(.+)$/, styles: theme[:major], index: 2)
-            out[1] = sub_style(out[1], pat: /^(.+)(minor )(\d+)(.+)$/, styles: theme[:active], index: 3)
-            puts out
+            sub_style!(out[1], **opt_style(theme[:major], /^( +major )(\d+)(.+)$/, 2))
+            sub_style!(out[1], **opt_style(theme[:active], /^(.+)(minor )(\d+)(.+)$/, 3))
+            sub_style!(out[1], **opt_style(theme[:current], /^(.+)(patch )(\d+)(.+)$/, 3)) if theme[:current]
           when :completed
-            if verbose && kwargs[:start]
-              msg = sub_style('completed', styles: theme[:active])
-              puts log_message(Logger::INFO, *args, msg, subject: kwargs[:subject],
-                                                         hint: time_format(time_epoch - kwargs[:start]))
-            end
+            return unless kwargs[:start]
+
+            out = log_message(Logger::INFO, *args, sub_style('completed', theme[:active]),
+                              subject: kwargs[:subject], hint: time_format(time_epoch - kwargs[:start]))
+          else
+            return
           end
+          puts out
         end
 
         def format_desc(action, flag, opts = nil, **kwargs)
@@ -4286,7 +4842,7 @@ module Squared
           workspace.format_desc([@desc, action, flag].compact, opts, **kwargs)
         end
 
-        def format_banner(cmd, banner: true)
+        def format_banner(cmd, banner: true, hint: nil, strip: nil)
           return unless banner && banner?
 
           if (data = workspace.banner_get(*@ref, group: group))
@@ -4300,11 +4856,14 @@ module Squared
             out = []
             if data.command
               if cmd =~ /\A(?:"((?:[^"]|(?<=\\)")+)"|'((?:[^']|(?<=\\)')+)'|(\S+))( |\z)/
-                path = $3 || $2 || $1
-                name = stripext path
-                cmd = cmd.sub(path, data.command == 0 ? name : name.upcase)
+                arg = $3 || $2 || $1
+                cmd = cmd.sub(arg, data.command == 0 ? arg.stripext : arg.stripext.upcase)
               end
-              out << cmd
+              if strip || (strip.nil? && data.order.include?(:path))
+                cmd = cmd.gsub(/(?:#{s = Regexp.escape(File.join(path, ''))}?(?=["'])|#{s})/, '')
+                         .gsub(/(?: -[^ ])? (?:""|'')/, '')
+              end
+              out << cmd.subhint(hint)
             end
             data.order.each do |val|
               if val.is_a?(Array)
@@ -4332,7 +4891,7 @@ module Squared
           end
         end
 
-        def format_list(items, cmd, type, grep: [], from: nil, each: nil)
+        def format_list(items, cmd, type, grep: [], from: nil)
           reg = grep.map { |val| Regexp.new(val) }
           out = []
           unless items.empty?
@@ -4340,34 +4899,36 @@ module Squared
             items.each_with_index do |val, i|
               next unless matchany?(val.first, reg)
 
-              out << ('%*d. %s' % [pad, i.succ, each ? each.call(val) : val.first])
+              out << ('%*d. %s' % [pad, i.succ, block_given? ? yield(val) : val.first])
             end
           end
           sub = [headerstyle]
-          if out.empty?
-            out = ["No #{type} were found:", '']
-            unless grep.empty?
-              i = 0
-              out.concat(grep.map { |s| "#{i += 1}. #{s}" })
-              out << ''
-            end
-            if from
-              out << (from = from.to_s)
-              pat = /\A(#{Regexp.escape(from)})(.*)\z/
-            end
-          else
-            pat = /\A(\s*\d+\.)(.+)\z/
-            unless grep.empty?
-              footer = "#{out.size} found "
-              sub << { pat: /\A(\d+)( .+)\z/, styles: theme[:inline] }
-            end
-          end
-          sub << { pat: pat, styles: theme[:active] } if pat
+          pat = if out.empty?
+                  out = ["No #{type} were found:", '']
+                  unless grep.empty?
+                    i = 0
+                    out.concat(grep.map { |s| "#{i += 1}. #{s}" })
+                    out << ''
+                  end
+                  if from
+                    out << (from = from.to_s)
+                    /\A(#{Regexp.escape(from)})(.*)\z/
+                  end
+                else
+                  unless grep.empty?
+                    footer = "#{out.size} found "
+                    sub << opt_style(theme[:inline], /\A(\d+)( .+)\z/)
+                  end
+                  /\A(\s*\d+\.)(.+)\z/
+                end
+          sub << opt_style(theme[:active], pat) if pat
           emphasize(out, title: task_join(name, cmd), border: borderstyle, sub: sub, footer: footer, right: true)
         end
 
         def empty_status(msg, title, obj, always: false)
-          "#{msg}#{!always && (!obj || obj == 0 || obj.to_s.empty?) ? '' : message(hint: message(title, obj.to_s))}"
+          return msg if !always && (!obj || obj == 0 || obj.to_s.empty?)
+
+          msg.subhint(obj.is_a?(Numeric) ? "#{obj} #{title}" : message(title, obj.to_s))
         end
 
         def append_repeat(flag, opts, target: @session, **kwargs)
@@ -4376,8 +4937,7 @@ module Squared
 
         def append_hash(data, target: @session || [], build: false)
           if build && (type = env('BUILD', suffix: 'TYPE') || ENV['BUILD_TYPE'])
-            type = "__#{type}__"
-            if (extra = data[type] || data[type.to_sym]).is_a?(Hash)
+            if (extra = data[type = "__#{type}__"] || data[type.to_sym]).is_a?(Hash)
               data = data.merge(extra)
             else
               extra = nil
@@ -4391,7 +4951,9 @@ module Squared
               next if val.nil?
             end
             case val
-            when Array
+            when Hash
+              append_hash(val, target: target, build: build)
+            when Enumerable
               append_repeat(key, val, target: target)
             when Numeric
               target << basic_option(key, val)
@@ -4400,30 +4962,24 @@ module Squared
             when Pathname
               target << shell_option(key, val, escape: false)
             else
-              target << shell_option(key, val.is_a?(String) ? val : nil)
+              target << shell_option(key, (val if val.is_a?(String)))
             end
           end
           target
         end
 
         def append_any(val, target: @session, build: false, delim: false)
-          return unless val
-
           if delim && !target.include?('--')
             target << '--'
           else
             delim = false
           end
-          val = shell_split(val) if val.is_a?(String)
+          val = shell_split val if val.is_a?(String)
           case val
           when Hash
             append_hash(val, target: target, build: build)
           when Enumerable
-            if target.is_a?(Array)
-              target.concat(val.to_a)
-            else
-              target.merge(val.to_a)
-            end
+            merge_list target, val
           else
             target.delete('--') if delim
             nil
@@ -4444,7 +5000,7 @@ module Squared
             next unless (val = option(opt, **kwargs))
 
             return target << if flag
-                               shell_option(opt, equals ? val : nil, quote: quote, escape: escape, force: force)
+                               shell_option(opt, (val if equals), quote: quote, escape: escape, force: force)
                              else
                                shell_quote val
                              end
@@ -4465,14 +5021,32 @@ module Squared
               flag = "no-#{flag}"
               val = nil
             end
-            ret << shell_option(flag, equals ? val : nil, escape: escape, quote: quote, force: force)
+            ret << shell_option(flag, (val if equals), escape: escape, quote: quote, force: force)
           end
-          ret.each { |val| target << val } unless ret.empty?
+          merge_list target, ret unless ret.empty?
           ret
         end
 
         def append_nocolor(target: @session)
           target << '--no-color' if !ARG[:COLOR] || stdin? || option('color', target: target, equals: '0')
+        end
+
+        def append_keys(base, data, *keys)
+          out = {}
+          keys.each do |key|
+            next unless data.key?(key)
+
+            out[key] = case (val = data[key])
+                       when Hash
+                         base.fetch(key, {}).update(val)
+                       when Enumerable
+                         Array(base.fetch(key, [])) + val.to_a
+                       else
+                         val
+                       end
+          end
+          base.update(data)
+              .update(out)
         end
 
         def merge_opts(base, data)
@@ -4515,6 +5089,18 @@ module Squared
           end
         end
 
+        def merge_list(base, data)
+          data = Array(data)
+          case base
+          when Array
+            base.concat(data)
+          when Set
+            base.merge(data)
+          else
+            Array(base).concat(data)
+          end
+        end
+
         def collect_hash(data, pass: [])
           ret = []
           data.each { |key, val| ret.concat(val) unless pass.include?(key) }
@@ -4530,12 +5116,17 @@ module Squared
 
         def parse_json(val, kind: Hash, hint: nil)
           ret = JSON.parse(val)
-          raise_error("invalid JSON #{kind.name}", val, hint: hint) if kind && !ret.is_a?(kind)
+          raise_error 'invalid JSON'.subhint(kind.name), val, hint: hint if kind && !ret.is_a?(kind)
+          ret
         rescue StandardError => e
           log&.warn e
           print_error(e, subject: name)
-        else
-          ret
+        end
+
+        def parse_env(key)
+          env(key) do |val|
+            val.start_with?('-') ? shell_parse(val) : split_escape(val).map! { |opt| fill_option(opt) }
+          end || []
         end
 
         def param_guard(action, flag, args:, key: nil, pat: nil, values: nil)
@@ -4547,33 +5138,50 @@ module Squared
             raise_error(action, "#{flag}[#{key}]", hint: val.nil? ? 'missing' : 'invalid')
           elsif args.is_a?(Array) && args.empty?
             @session = nil
-            raise_error(action, "#{flag}+", hint: 'empty')
+            raise_error action, "#{flag}+", hint: 'empty'
           end
           args
         end
 
-        def confirm_outdated(pkg, ver, rev, cur = nil, lock: false, col1: 0)
-          a = sub_style(case rev
-                        when 1
-                          'MAJOR'
-                        when 2
-                          'MINOR'
-                        else
-                          'PATCH'
-                        end, styles: (rev == 1 && theme[:major]) || theme[:header])
-          b = sub_style(pkg.ljust(col1), styles: theme[:inline])
-          c = lock ? sub_style((cur || 'locked').rjust(7), styles: color(:red)) : cur&.rjust(7)
-          d = rev == 1 || lock ? 'N' : 'Y'
-          confirm "#{a}: #{b}#{c} #{sub_style(ver.rjust(col1 > 0 ? 10 : 0), styles: theme[:inline])}   ", d
+        def confirm_basic(msg, target, default = 'Y', style: :inline, **kwargs)
+          confirm("#{msg} [#{sub_style(target.to_s, style.is_a?(Symbol) ? theme[style] : style)}]", default, **kwargs)
+        end
+
+        def confirm_outdated(pkg, ver, type, cur = nil, lock: false, col0: 0, col1: 0, col2: nil, col3: 0, col4: 0,
+                             **kwargs)
+          h = sub_style(semrev(type).upcase, (type == 1 && theme[:major]) || theme[:header])
+          case col0
+          when 0
+            col0 = "#{h}: "
+          when Numeric
+            puts h
+            col0 = ' ' * col0
+          else
+            puts h
+          end
+          b = sub_style pkg.ljust(col1), theme[:inline]
+          cur ||= 'locked' if lock
+          c = if cur
+                cur = cur.ljust(col2 || cur.size.succ)
+                lock ? sub_style(cur, color(:red)) : cur
+              end
+          d = type == 1 || lock ? 'N' : 'Y'
+          e = "#{col0}#{b}#{c}#{sub_style(col1 > 0 ? ver.ljust(col3) : ver.rjust(ver.size.succ), theme[:inline])}"
+          confirm("#{e}#{col4 > 0 ? ' ' * [col4 - e.stripstyle.size - 1, 2].max : '  '}", d, **kwargs)
+        end
+
+        def confirm_semver(msg, type, style: (type == 1 && theme[:major]) || :inline, timeout: 0, **kwargs)
+          confirm_basic(msg, semrev(type), type == 1 ? 'N' : 'Y', style: style, timeout: timeout, **kwargs)
         end
 
         def choice_index(msg, list, values: nil, accept: nil, series: false, trim: nil, column: nil, multiple: false,
                          force: true, **kwargs)
-          puts if !series && !printfirst?
-          msg = "#{msg} (optional)" unless force
-          unless (ret = choice(msg, list, multiple: multiple, force: force, **kwargs)) && !ret.empty?
+          puts unless series || printfirst?
+          ret = choice(msg, list, multiple: multiple, force: force, **kwargs).tap do |val|
+            next unless !val || val.empty?
+
             exit 1 if force
-            return
+            return nil
           end
           ret = multiple ? ret.map! { |val| val.sub(trim, '') } : ret.sub(trim, '') if trim
           if column
@@ -4582,12 +5190,12 @@ module Squared
             ret = ret.first unless multiple
           end
           if accept
-            hint = Array(ret).map { |val| sub_style(val, styles: theme[:inline]) }.join(', ')
+            hint = Array(ret).map { |val| sub_style(val.to_s, theme[:inline]) }.join(', ')
             accept = Array(accept).map { |val| Array(val) }
             ret = Array(ret) if accept.any? { |val| val[1] == true }
             loop do
               item = accept.first
-              c = confirm("#{item[0]}#{hint ? " [#{hint}]" : ''}", item[2] ? 'Y' : 'N', timeout: 60)
+              c = confirm("#{item[0]}#{" [#{hint}]" if hint}", item[2] ? 'Y' : 'N')
               if item[1] == true
                 ret << c
               elsif !c
@@ -4608,11 +5216,19 @@ module Squared
                 force = false
               end
               val = readline(val, force: force)
-              ret << (val.empty? ? nil : val)
+              ret << (val unless val.empty?)
             end
           end
           printsucc unless series
           ret
+        end
+
+        def accept_b(val, yes = false)
+          [val, true, yes]
+        end
+
+        def accept_y(val, bool = false)
+          [val, bool, true]
         end
 
         def command_args(args, min: 0, force: false, **kwargs)
@@ -4621,27 +5237,30 @@ module Squared
           readline('Enter arguments', force: force)
         end
 
-        def block_args(val = nil, &blk)
-          if (ret = instance_eval(&blk)).nil?
-            val
-          else
-            Array(ret)
-          end
+        def block_args(fallback = nil, &blk)
+          return fallback if (ret = instance_eval(&blk)).nil?
+
+          Array(ret)
         end
 
         def runenv
           nil
         end
 
-        def command(*args)
-          return args.join(' && ') unless workspace.powershell?
-
-          "#{shell_bin('powershell.exe')} -Command \"& {#{args.join(' ; ')}}\""
+        def command(*args, verbose: true)
+          out = unless verbose
+                  cmd = [">#{File::NULL}", '2>&1']
+                  cmd.reverse! if File::NULL == 'NUL'
+                  cmd.unshift('').join(' ')
+                end
+          if workspace.powershell?
+            "#{shell_bin('powershell.exe')} -Command \"& {#{args.join(' ; ')}}\"#{out}"
+          else
+            args.map! { |val| "#{val}#{out}" }.join(' && ')
+          end
         end
 
         def relativepath(*list, all: false)
-          return [] if list.empty?
-
           list.flatten.map! { |val| Pathname.new(val) }.select { |val| projectpath?(val) }.map! do |val|
             ret = (val.absolute? ? val.relative_path_from(path) : val.cleanpath).to_s
             all && val.to_s.end_with?('/') ? "#{ret}/*" : ret
@@ -4659,12 +5278,10 @@ module Squared
 
         def matchmap(list, prefix = nil)
           list.map do |val|
-            if val.is_a?(Regexp)
-              val
-            else
-              val = ".*#{val}" if prefix && !val.sub!(/\A(\^|\\A)/, '')
-              Regexp.new("#{prefix}#{val == '*' ? '.+' : val}")
-            end
+            next val if val.is_a?(Regexp)
+
+            val = ".*#{val}" if prefix && !val.sub!(/\A(\^|\\A)/, '')
+            Regexp.new("#{prefix}#{val == '*' ? '.+' : val}")
           end
         end
 
@@ -4681,7 +5298,8 @@ module Squared
         end
 
         def semscan(val, fill: true)
-          val.scan(SEM_VER).first.yield_self { |data| fill ? semver(data) : data }
+          ret = val.scan(SEM_VER).first
+          fill ? semver(ret) : ret
         end
 
         def semcmp(val, other)
@@ -4697,15 +5315,64 @@ module Squared
             end
             [c[0], c[2], c[4] || '0', d]
           end
-          a.each_with_index do |c, index|
-            next if c == (d = b[index])
+          a.each_with_index do |c, i|
+            next if c == (d = b[i])
 
             return c.to_i < d.to_i ? 1 : -1
           end
           0
         end
 
-        def semgte?(val, other)
+        def sembump(val, flag = :patch, join: true)
+          ret = semscan(val, fill: false)
+          case flag
+          when :major
+            ret[2] = if ret[0] != '0' || ret[2].nil?
+                       ret[0] = ret[0].succ
+                       '0'
+                     else
+                       ret[2].succ
+                     end
+            ret[4] = '0'
+          when :minor
+            if ret[0] == '0'
+              ret[4] &&= ret[4].succ
+            else
+              ret[2] = ret[2].succ
+              ret[4] &&= '0'
+            end
+          when :patch
+            ret[4] &&= ret[4].succ
+          end
+          join ? ret.join : ret
+        end
+
+        def semtype(cur, lat)
+          if semmajor?(cur, lat)
+            1
+          else
+            cur[2] == lat[2] ? 3 : 2
+          end
+        end
+
+        def semrev(type)
+          case type
+          when 1
+            'major'
+          when 2
+            'minor'
+          when 3
+            'patch'
+          else
+            'unknown'
+          end
+        end
+
+        def semgte?(val, other = nil)
+          unless other
+            other = val
+            val = RUBY_VERSION
+          end
           semcmp(val, other) != 1
         end
 
@@ -4714,11 +5381,35 @@ module Squared
         end
 
         def indexerror(val, list = nil)
-          raise_error("requested index #{val}", hint: list && "of #{list.size}")
+          raise_error IndexError, "requested index #{val}", hint: ("of #{list.size}" if list)
         end
 
         def indexchar
           workspace.windows? ? '=' : '^'
+        end
+
+        def shortname(*args, suffix: '?', delim: ',', pass: false)
+          return unless TASK_METADATA || pass
+
+          args.map! do |ch|
+            "#{ch}/#{case ch
+                     when 'i'
+                       'nteractive'
+                     when 's'
+                       'elect'
+                     when 'u'
+                       'pdate'
+                     when 'h'
+                       'ide'
+                     when 'f'
+                       'orce'
+                     when 'd'
+                       'ry-run'
+                     else
+                       next
+                     end}#{suffix}"
+          end.compact
+             .join(delim)
         end
 
         def printsucc
@@ -4731,10 +5422,6 @@ module Squared
 
         def colormap(val)
           val.compact.flat_map { |s| color(s) }
-        end
-
-        def epochtime
-          Time.now.strftime('%s%L').to_i
         end
 
         def verbosetype
@@ -4768,7 +5455,7 @@ module Squared
           end
         end
 
-        def on_error(err, from, exception: self.exception, pass: false, dryrun: false)
+        def on_error(err, from, pass: false, exception: self.exception, dryrun: false)
           log&.error err
           unless dryrun
             ret = on :error, from, err
@@ -4777,19 +5464,19 @@ module Squared
           print_error(err, pass: pass) unless ret
         end
 
-        def pwd_set(pass: false, dryrun: false, from: nil)
+        def pwd_set(pass: false, exception: self.exception, dryrun: false, from: nil)
           return yield if (path.to_s == Dir.pwd || pass == true) && (workspace.mri? || !workspace.windows?)
 
           pwd = Dir.pwd
           Dir.chdir(path)
           yield
         rescue StandardError => e
-          on_error(e, from, dryrun: dryrun)
+          on_error(e, from, exception: exception, dryrun: dryrun)
         ensure
           Dir.chdir(pwd) if pwd
         end
 
-        def run_set(cmd, val = nil, opts: nil, **)
+        def run_set(cmd, val = nil, opts: nil, global: false, **)
           noopt = @output[1] == false && !@output[0].nil?
           noenv = @output[2] == false
           parse = lambda do |data|
@@ -4808,8 +5495,11 @@ module Squared
             ret[2] = data[:env] unless dise
             ret
           end
+          self.global = global
           case cmd
-          when Array
+          when Hash
+            @output = parse.call(data)
+          when Enumerable
             @output = if cmd.all? { |data| data.is_a?(Hash) }
                         noopt = false
                         noenv = false
@@ -4818,8 +5508,6 @@ module Squared
                         cmd.dup
                       end
             return
-          when Hash
-            @output = parse.call(data)
           else
             @output[0] = cmd
           end
@@ -4839,11 +5527,12 @@ module Squared
           end
         end
 
-        def script_set(cmd, prod: nil, args: nil, **)
+        def script_set(cmd, prod: nil, args: nil, global: false, **)
           return if @output[1] == false && @output[0].nil?
 
+          self.global = global
           @output[0] = nil
-          @output[1] = if @global && cmd.is_a?(Array)
+          @output[1] = if self.global && cmd.is_a?(Array)
                          cmd[prod == true ? 1 : 0]
                        else
                          cmd
@@ -4888,13 +5577,13 @@ module Squared
 
         def asdf_set(val)
           @asdf = if @@asdf && val
-                    dir = @@asdf[0].join('installs', val)
-                    [val, dir] if dir.exist? && !dir.empty?
+                    dir = @@asdf.path.join('installs', val)
+                    [val, dir] if dir.directory? && !dir.empty?
                   end
         end
 
         def theme_set(common)
-          @theme = if !verbose
+          @theme = if silent?
                      {}
                    elsif common
                      workspace.theme
@@ -4904,13 +5593,20 @@ module Squared
         end
 
         def dependfile_set(list)
-          @dependindex = list.index { |file| basepath(file).exist? }.tap do |index|
-            @dependfile = basepath(list[index || 0])
-          end
+          @dependindex = if @dependname
+                           @dependfile = basepath @dependname
+                           list.index(@dependname)
+                         else
+                           list.index { |file| exist?(file) }.tap { |i: 0| @dependfile = basepath(list[i]) }
+                         end
         end
 
         def as_get(val, from)
-          (@global && @as[from][val]) || val
+          (global && @as[from][val]) || val
+        end
+
+        def unpack_get(*)
+          nil
         end
 
         def task_build(keys)
@@ -4926,7 +5622,7 @@ module Squared
                   __send__ key
                 end
               end
-              next if (items = @children.select { |item| item.task_include?(key) }).empty?
+              next if (items = children.select { |item| item.task_include?(key) }).empty?
 
               ws.task_desc(@desc, action, 'workspace')
               task task_join(action, 'workspace') => items.map! { |item| task_join(item.name, action) }
@@ -4948,12 +5644,10 @@ module Squared
         end
 
         def checkdir?(val)
-          if val.directory? && !val.empty?
-            true
-          else
-            log&.warn "directory \"#{val}\" (#{val.directory? ? 'empty' : 'not found'})"
-            false
-          end
+          return true if val.directory? && !val.empty?
+
+          log&.warn "directory \"#{val}\"".subhint(val.directory? ? 'empty' : 'missing')
+          false
         end
 
         def semmajor?(cur, want)
@@ -4993,14 +5687,30 @@ module Squared
           return true if val || from_sync?(ac = workspace.task_name(action))
           return val if group && !(val = from_sync?(ac, group)).nil?
           return val if (base = workspace.find_base(self)) && !(val = from_sync?(ac, base.ref)).nil?
-          return false if workspace.series.chain?(val = task_join(name, action))
-          return true if task_invoked?(val) && (!task_invoked?(ac) || !workspace.task_defined?(ac, 'sync'))
+          return false if workspace.series.chain?(key = task_join(name, action))
+          return true if task_invoked?(key) && (!task_invoked?(ac) || !workspace.task_defined?(ac, 'sync'))
 
-          workspace.series.name_get(action).yield_self { |name| name != action && invoked_sync?(name) }
+          ret = workspace.series.name_get(action)
+          ret != action && invoked_sync?(ret)
         end
 
-        def success?(ret, display = true)
-          ret == true && display && stdout? && banner?
+        def success?(run, *cond)
+          case run
+          when TrueClass
+            true
+          when FalseClass
+            false
+          else
+            $?.success?
+          end.tap do |ret|
+            next unless cond.none? { |val| val == false }
+
+            if block_given?
+              yield ret
+            elsif ret && stdout? && banner?
+              print_success
+            end
+          end
         end
 
         def banner?
@@ -5023,14 +5733,37 @@ module Squared
           verbosetype > 1
         end
 
+        def silent?
+          verbosetype == 0
+        end
+
         def warning?
           workspace.warning
         end
 
-        def has_value?(data, other)
-          return false unless data.is_a?(Enumerable)
+        def has_value?(target, *args)
+          return false unless target.is_a?(Enumerable)
 
-          other.is_a?(Enumerable) ? other.any? { |obj,| data.include?(obj) } : data.include?(other)
+          args = args.first if args.size == 1 && args.first.is_a?(Enumerable)
+          args.any? { |obj,| target.include?(obj) }
+        end
+
+        def has_value!(target, *args, first: false)
+          return unless target.is_a?(Enumerable)
+
+          args = args.first if args.size == 1 && args.first.is_a?(Enumerable)
+          found = false
+          args.each do |val|
+            if target.respond_to?(:delete?)
+              found = true if target.delete?(val)
+            elsif target.respond_to?(:delete)
+              found = true if target.delete(val)
+            elsif target.include?(val)
+              found = true
+            end
+            break if found && first
+          end
+          target if found
         end
 
         def variables
@@ -5041,28 +5774,16 @@ module Squared
           BLK_SET
         end
 
-        def hashobj
-          Workspace::Support.hashobj
-        end
-
-        def hashlist
-          Workspace::Support.hashlist
-        end
-
-        def hashdup
-          Workspace::Support.hashdup
-        end
-
         def borderstyle
           workspace.banner_get(*@ref, group: group)&.border || theme[:border]
         end
 
         def headerstyle
-          { pat: /^(\S+)(\s+)$/, styles: theme[:header] }
+          opt_style theme[:header], /^(\S+)(\s+)$/
         end
 
         def scriptargs
-          { target: script? ? @output[1] : @output[0], ref: ref, group: group, global: @global }
+          { target: script? ? @output[1] : @output[0], script: script?, ref: ref, group: group, global: global }
         end
       end
 
@@ -5089,17 +5810,20 @@ module Squared
           end
         elsif uri
           data[name.to_s] = uri
-        elsif name.is_a?(Enumerable)
-          data = name.to_h
-        elsif name.is_a?(String) && name.match?(GIT_PROTO)
-          base = name
-          @project.each_value { |proj| repo << proj if !proj.parent && check.call(proj) }
         else
-          warn log_message(Logger::WARN, name, subject: 'git', hint: 'invalid') if warning
-          return self
+          case name
+          when Enumerable
+            data = name.to_h
+          when GIT_PROTO
+            base = name.to_s
+            each { |proj| repo << proj if !proj.parent && check.call(proj) }
+          else
+            warn log_warn(name, subject: 'git', hint: 'invalid') if warning
+            return self
+          end
         end
         if base
-          base = base.match?(GIT_PROTO) ? "#{base.chomp('/')}/" : @root + base
+          base = base.match?(GIT_PROTO) ? "#{base.chomp('/')}/" : rootpath(base)
           repo.each do |target|
             if target.is_a?(Project::Git)
               data[target.localname] = target.project
@@ -5109,24 +5833,23 @@ module Squared
           end
         end
         data.each do |key, val|
-          if val.is_a?(Hash)
-            uri = val.fetch(:uri, '')
-            opts = val.fetch(:options, {})
-          else
-            uri = val.is_a?(String) ? val : key.to_s
-            opts = options
-          end
+          uri = if val.is_a?(Hash)
+                  opts = val.fetch(:options, {})
+                  val.fetch(:uri, '')
+                else
+                  opts = options
+                  val.is_a?(String) ? val : key.to_s
+                end
           unless uri.match?(GIT_PROTO) || Pathname.new(uri).absolute?
             if uri.start_with?('.')
-              uri = @root + uri
+              uri = rootpath uri
             elsif base
               uri = base + uri
             else
               next
             end
           end
-          key = task_name key
-          GIT_REPO[main][key] = [uri.to_s, opts]
+          GIT_REPO[main][key = task_name(key)] = [uri.to_s, opts]
           @kind[key] << Project::Git
         end
         if cache == true
@@ -5137,20 +5860,26 @@ module Squared
         self
       end
 
+      def git_repo(name)
+        (ret = GIT_REPO[main]) && ret[name]
+      end
+
+      def git_clone?(path, name = nil)
+        return false if name && !git_repo(name)
+
+        !path.exist? || path.empty?
+      end
+
       def revbuild(file: nil)
         @revfile = @home.join(file || "#{@main}.revb")
         @revdoc = JSON.parse(@revfile.read) if @revfile.exist?
       rescue StandardError => e
         @revfile = nil
-        warn log_message(Logger::WARN, e, pass: true)
+        warn log_warn(e, pass: true)
         self
       else
         @revdoc = {} unless @revdoc.is_a?(Hash)
         self
-      end
-
-      def git_repo(name)
-        (ret = GIT_REPO[main]) && ret[name]
       end
 
       def rev_entry(*keys, val: nil, create: true)
@@ -5202,23 +5931,12 @@ module Squared
         File.write(@revfile, JSON.pretty_generate(@revdoc))
       rescue StandardError => e
         log&.debug e
-        warn log_message(Logger::WARN, e, pass: true) if warning
+        warn log_warn(e, pass: true) if warning
       ensure
         @revlock = false
       end
-
-      def git_clone?(path, name = nil)
-        return false if name && !git_repo(name)
-
-        !path.exist? || path.empty?
-      end
-
-      private
-
-      def rev_timenow
-        Time.now.utc.strftime('%s%L').to_i
-      end
     end
+
     Application.include Git
 
     module Project
@@ -5227,10 +5945,9 @@ module Squared
           common: %w[c=q bare glob-pathspecs icase-pathspecs literal-pathspecs no-optional-locks no-pager
                      no-replace-objects noglob-pathspecs paginate attr-source=b config-env=q exec-path=p
                      namespace=p].freeze,
-          add: %w[A|all e|edit f|force ignore-errors ignore-missing ignore-removal i|interactive no-all
-                  no-ignore-removal n|dry-run p|patch pathspec-file-nul renormalize sparse u|update v|verbose
-                  chmod=b pathspec-from-file=p].freeze,
-          branch: %w[a|all create-reflog i|ignore-case omit-empty q|quiet r|remotes v|verbose abbrev=i color=b
+          add: %w[A e|edit f|force ignore-errors ignore-missing i|interactive n|dry-run p|patch pathspec-file-nul
+                  refresh renormalize sparse u|update v|verbose chmod=b pathspec-from-file=p].freeze,
+          branch: %w[a|all create-reflog i|ignore-case omit-empty q|quiet r|remotes v|verbose=+ abbrev=i color=b
                      column=b contains=b format=q merged=b no-contains=b no-merged=b points-at=b u|set-upstream-to=b
                      sort=q t|track=b].freeze,
           checkout: %w[l d|detach f|force ignore-other-worktrees ignore-skip-worktree-bits m|merge p|patch
@@ -5242,21 +5959,26 @@ module Squared
           fetch: {
             base: %w[multiple porcelain progress P|prune-tags refetch stdin u|update-head-ok
                      recurse-submodules-default=b].freeze,
-            pull: %w[4 6 n t a|append atomic dry-run f|force k|keep negotiate-only prefetch p|prune q|quiet
-                     set-upstream unshallow update-shallow v|verbose deepen=i depth=i j|jobs=i negotiation-tip=q
-                     recurse-submodules=v refmap=q o|server-option=q shallow-exclude=b shallow-since=v
-                     upload-pack=q].freeze
+            pull: %w[4 6 n t a|append atomic dry-run f|force k|keep negotiate-only prefetch p|prune q|quiet set-upstream
+                     unshallow update-shallow v|verbose deepen=i depth=i j|jobs=i negotiation-tip=q recurse-submodules=v
+                     refmap=q o|server-option=q shallow-exclude=b shallow-since=v upload-pack=q].freeze
           }.freeze,
           git: {
             add: %w[N|intent-to-add refresh].freeze,
             blame: %w[b c l s t w C=im? L=q M=im? S=p color-by-age color-lines first-parent incremental line-porcelain
-                      p|porcelain root score-debug f|show-name e|show-email n|show-number show-stats abbrev=i
-                      contents=p date=q encoding=b ignore-rev=b ignore-revs-file=p reverse=q].freeze,
+                      p|porcelain root score-debug f|show-name e|show-email n|show-number show-stats abbrev=i contents=p
+                      date=q encoding=b ignore-rev=b ignore-revs-file=p reverse=q].freeze,
             clean: %w[d x X f|force n|dry-run i|interactive q|quiet e|exclude=q].freeze,
+            grep: %w[e f=p h H I O=bm r all-match and G|basic-regexp break cached column c|count E|extended-regexp
+                     l|files-with-matches L|files-without-match F|fixed-strings full-name W|function-context heading
+                     i|ignore-case v|invert-match n|line-number name-only no-index not z|null o|only-matching or
+                     P|perl-regexp q|quiet recurse-submodules p|show-function a|text untracked w|word-regexp
+                     A|after-context=i B|before-context=i color=b C|context=i m|max-count=n max-depth=i
+                     open-files-in-pager=b threads=n].freeze,
             mv: %w[k f|force n|dry-run v|verbose].freeze,
-            revert: %w[e S=bm? abort continue n|no-commit quit reference skip cleanup=b gpg-sign=b? m|mainline=i
-                       s|signoff strategy=b X|strategy-option=b].freeze,
-            rm: %w[r cached f|force n|dry-run ignore-unmatch pathspec-file-nul q|quiet sparse v|verbose
+            revert: %w[e S=bm? n|no-commit reference cleanup=b gpg-sign=b? m|mainline=i s|signoff strategy=b
+                       X|strategy-option=b].freeze,
+            rm: %w[r cached f|force n|dry-run ignore-unmatch pathspec-file-nul q|quiet sparse
                    pathspec-from-file=p].freeze
           }.freeze,
           log: {
@@ -5272,26 +5994,27 @@ module Squared
             format: %w[t children combined-all-paths dd oneline left-right no-diff-merges parents relative-date
                        show-notes-by-default show-signature date=q diff-merges=b encoding=b expand-tabs=i format=q
                        notes=b pretty=q? show-linear-break=q?].freeze,
-            diff: %w[p R u z B=bm? C=bm? l=im G=qm I=qm M=bm? O=qm S=qm U=im binary check compact-summary cumulative
+            diff: %w[p R u z B=bm? C=bm? l=im G=qm I=qm M=bm? O=qm S=qm binary check compact-summary cumulative
                      find-copies-harder full-index W|function-context w|ignore-all-space ignore-blank-lines
                      ignore-cr-at-eol ignore-space-at-eol b|ignore-space-change D|irreversible-delete graph
                      ita-invisible-in-index minimal name-only name-status no-color-moved-ws no-prefix no-renames numstat
                      patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex raw shortstat summary a|text
                      abbrev=i? anchored=q break-rewrites=b? color=b color-moved=b color-moved-ws=b color-words=q?
                      diff-algorithm=b diff-filter=e? X|dirstat=b? dirstat-by-file=b? dst-prefix=q find-copies=i?
-                     find-object=b find-renames=b? ignore-matching-lines=q ignore-submodules=b? inter-hunk-context=i
-                     line-prefix=q output=p output-indicator-context=q output-indicator-new=q output-indicator-old=q
-                     relative=p rotate-to=p skip-to=p src-prefix=q stat=b? stat-count=i stat-width=i stat-name-width=i
-                     submodule=b? unified=i word-diff=b? word-diff-regex=q ws-error-highlight=b].freeze
+                     find-object=b find-renames=b? ignore-matching-lines=q ignore-submodules=b? line-prefix=q output=p
+                     output-indicator-context=q output-indicator-new=q output-indicator-old=q relative=p rotate-to=p
+                     skip-to=p src-prefix=q stat=b? stat-count=i stat-width=i stat-name-width=i submodule=b?
+                     word-diff=b? word-diff-regex=q ws-error-highlight=b].freeze,
+            diff_context: %w[U=im inter-hunk-context=i unified=i].freeze
           }.freeze,
           ls_files: %w[f t v z debug deduplicate directory eol error-unmatch exclude-standard full-name i|ignored
                        k|killed no-empty-directory recurse-submodules sparse s|stage u|unmerged abbrev=i x|exclude=q
                        X|exclude-from=p exclude-per-directory=p format=q with-tree=q].freeze,
           ls_remote: %w[exit-code get-url q|quiet symref o|server-option=q sort=q upload-pack=q].freeze,
-          merge: %w[e n S=bm? allow-unrelated-histories ff-only m=q q|quiet v|verbose cleanup=b F|file=p gpg-sign=b?
-                    into-name=b log=i s|strategy=b X|strategy-option=b].freeze,
-          pull: %w[e n S=bm? allow-unrelated-histories ff-only cleanup=b gpg-sign=b? log=i r|rebase=v? s|strategy=b
-                   X|strategy-option=b].freeze,
+          merge: %w[e n S=bm? allow-unrelated-histories compact-summary ff-only m=q q|quiet v|verbose cleanup=b F|file=p
+                    gpg-sign=b? into-name=b log=i s|strategy=b X|strategy-option=b].freeze,
+          pull: %w[e n S=bm? allow-unrelated-histories compact-summary ff-only cleanup=b gpg-sign=b? log=i r|rebase=v?
+                   s|strategy=b X|strategy-option=b].freeze,
           rebase: %w[n C=im S=bm? allow-empty-message apply committer-date-is-author-date edit-todo empty=b
                      f|force-rebase ignore-date ignore-whitespace i|interactive keep-base m|merge no-ff q|quiet quit
                      reset-author-date root show-current-patch signoff v|verbose empty=b x|exec=q gpg-sign=b? onto=b
@@ -5310,12 +6033,12 @@ module Squared
                    encoding=b expand-tabs=i notes=q show-notes=q?].freeze,
           stash: {
             common: %w[q|quiet].freeze,
-            push: %w[a|all u|include-untracked k|keep-index no-keep-index no-include-untracked pathspec-file-nul
-                     p|patch S|staged m|message=q pathspec-from-file=p].freeze,
+            push: %w[a|all u|include-untracked k|keep-index no-keep-index no-include-untracked pathspec-file-nul p|patch
+                     S|staged m|message=q pathspec-from-file=p].freeze,
             pop: %w[index].freeze,
             apply: %w[index].freeze
           }.freeze,
-          status: %w[z u=bm? b|branch long s|short show-stash v|verbose column=b find-renames=i? ignore-submodules=b?
+          status: %w[z u=bm? b|branch long s|short show-stash v|verbose=+ column=b find-renames=i? ignore-submodules=b?
                      ignored=b? porcelain=b? untracked-files=b?].freeze,
           submodule: {
             status: %w[cached recursive].freeze,
@@ -5329,6 +6052,7 @@ module Squared
           tag: %w[n=im cleanup=b create-reflog i|ignore-case omit-empty color=b? column=b contains=b? format=q merged=b?
                   no-contains=b? no-merged=b? points-at=q sort=q trailer=q].freeze,
           no: {
+            add: %w[all ignore-removal].freeze,
             blame: %w[progress].freeze,
             branch: %w[color color-moved column track].freeze,
             checkout: %w[overwrite-ignore guess overlay progress recurse-submodules track].freeze,
@@ -5336,6 +6060,7 @@ module Squared
               base: %w[auto-gc auto-maintenance write-commit-graph write-fetch-head].freeze,
               pull: %w[all ipv4 ipv6 recurse-submodules show-forced-updates tags].freeze
             },
+            grep: %w[color exclude-standard recursive textconv].freeze,
             log: {
               base: %w[decorate mailmap merges use-mailmap].freeze,
               diff: %w[color color-moved ext-diff indent-heuristic patch relative rename-empty textconv].freeze,
@@ -5364,39 +6089,13 @@ module Squared
             send: %w[continue skip abort quit].freeze,
             value: %w[true false merges interactive].freeze
           }.freeze,
-          reset: %w[soft mixed hard merge keep recurse-submodules no-recurse-submodules].freeze
+          reset: %w[soft mixed hard merge keep recurse-submodules no-recurse-submodules].freeze,
+          revbuild: %w[untracked-files ignore-submodules ignored].freeze
         }.freeze
         private_constant :OPT_GIT, :VAL_GIT
 
         class << self
           include Rake::DSL
-
-          def populate(ws, **)
-            return if ws.series.exclude?(:pull, true) || ws.size == 1
-
-            namespace ws.task_name('git') do |ns|
-              ws.format_desc(all = ws.task_join(ns.scope.path, 'all'), 'stash|rebase|autostash?,depend?')
-              task 'all' do |_, args|
-                args = args.to_a
-                cmd = if args.include?('stash')
-                        ['stash', 'pull']
-                      elsif args.include?('rebase')
-                        ['rebase']
-                      elsif args.include?('autostash')
-                        ['autostash']
-                      else
-                        ['pull']
-                      end
-                cmd.map! { |val| ws.task_sync(val) }
-                cmd << ws.task_sync('depend') if args.include?('depend') && !ws.series.exclude?(:depend, true)
-                cmd << ws.task_sync('build')
-                Common::Utils.task_invoke(*cmd, **ws.invokeargs)
-              end
-
-              ws.series.sync << all
-              ws.series.multiple << all
-            end
-          end
 
           def tasks
             %i[pull rebase autostash fetch clone stash status branch revbuild].freeze
@@ -5416,8 +6115,8 @@ module Squared
           'diff' => %i[head branch files view between contain].freeze,
           'fetch' => %i[origin remote all].freeze,
           'files' => %i[cached modified deleted others].freeze,
-          'git' => %i[add blame clean mv revert rm status].freeze,
-          'log' => %i[view between contain].freeze,
+          'git' => %i[add blame clean grep mv revert rm status].freeze,
+          'log' => %i[view grep between contain].freeze,
           'merge' => %i[commit no-commit send].freeze,
           'pull' => %i[origin remote all].freeze,
           'rebase' => %i[branch onto send].freeze,
@@ -5426,7 +6125,7 @@ module Squared
           'restore' => %i[source staged worktree].freeze,
           'rev' => %i[commit build output].freeze,
           'show' => %i[format oneline textconv].freeze,
-          'stash' => %i[push pop apply branch drop clear list all].freeze,
+          'stash' => %i[push pop apply branch drop clear list all staged worktree].freeze,
           'submodule' => %i[status update branch url sync].freeze,
           'switch' => %i[branch create detach].freeze,
           'tag' => %i[add sign delete list].freeze
@@ -5434,7 +6133,7 @@ module Squared
 
         def initialize(*, **)
           super
-          @submodule = basepath('.gitmodules').exist?
+          @submodule = exist?('.gitmodules')
           initialize_ref Git.ref if gitpath.exist?
         end
 
@@ -5457,16 +6156,16 @@ module Squared
                     if flag == :remote
                       format_desc action, flag, 'remote?,opts*'
                       task flag, [:remote] do |_, args|
-                        if (remote = args.remote)
-                          args = args.extras
-                        else
-                          remote = choice_remote
-                          args = args.to_a
-                        end
+                        args = if (remote = args.remote)
+                                 args.extras
+                               else
+                                 remote = choice_remote
+                                 args.to_a
+                               end
                         __send__(action, flag, args, remote: remote)
                       end
                     else
-                      format_desc(action, flag, 'opts*', after: flag == :all && action == 'pull' ? 'pattern*' : nil)
+                      format_desc(action, flag, 'opts*', after: ('pattern*' if flag == :all && action == 'pull'))
                       task flag do |_, args|
                         __send__ action, flag, args.to_a
                       end
@@ -5503,11 +6202,11 @@ module Squared
                         commit(flag, message: args.message)
                       end
                     else
-                      format_desc(action, flag, 'pathspec+', before: flag == :add ? 'opts*' : nil)
+                      format_desc(action, flag, 'pathspec+', before: ('opts*' if flag == :add))
                       task flag do |_, args|
                         if flag == :fixup
-                          ref, squash, pick = choice_commit(accept: [['Auto squash?', true]], reflog: false,
-                                                            values: ['Pick [amend|reword]'])
+                          ref, squash, pick = choice_commit(reflog: false, accept: [accept_b('Auto squash?')],
+                                                            values: 'Pick [amend|reword]')
                           pick &&= case pick.downcase
                                    when 'a', 'amend'
                                      'amend'
@@ -5549,7 +6248,7 @@ module Squared
                       task flag do |_, args|
                         refs = args.to_a
                         if refs.empty?
-                          refs = choice_refs('Choose a tag', 'tags', multiple: true, accept: 'Delete?', series: true)
+                          refs = choice_refs('Choose a tag', 'tags', multiple: true, series: true, accept: 'Delete?')
                           remote = choice_remote
                         end
                         tag(flag, refs: refs, remote: remote)
@@ -5557,23 +6256,27 @@ module Squared
                     when :add, :sign
                       format_desc action, flag, 'name,message?,commit?,remote?'
                       task flag, [:name, :message, :commit, :remote] do |_, args|
-                        if (name = args.name)
-                          message = args.message
-                          commit = commithead args.commit
-                          remote = args.remote
-                        else
-                          commit, name, message = choice_commit(values: [['Enter tag name', true], 'Enter message'],
-                                                                series: true, reflog: false)
-                          remote = choice_remote
+                        remote = if (name = args.name)
+                                   message = args.message
+                                   commit = commithead args.commit
+                                   args.remote
+                                 else
+                                   commit, name, message = choice_commit(reflog: false, series: true,
+                                                                         values: [
+                                                                           ['Enter tag name', true],
+                                                                           'Enter message'
+                                                                         ])
+                                   choice_remote
+                                 end
+                        tag(flag, refs: [name], message: message, commit: commit, remote: remote).tap do |ret|
+                          success?(ret, !remote)
                         end
-                        ret = tag(flag, refs: [name], message: message, commit: commit, remote: remote)
-                        print_success if success?(ret, !remote)
                       end
                     end
                   when 'stash'
                     format_desc(action, flag, 'opts*', after: case flag
                                                               when :push then 'pathspec*,:'
-                                                              when :branch then 'name,stash?|:'
+                                                              when :branch then 'name,stash/:'
                                                               when :clear, :list, :all then nil
                                                               else 'stash?|:'
                                                               end)
@@ -5583,9 +6286,8 @@ module Squared
                   when 'log', 'diff'
                     case flag
                     when :view, :between, :contain
-                      view = flag == :view
-                      if view && action == 'log'
-                        format_desc action, flag, '(^)commit*|:,opts*,ref?,pathspec*'
+                      if action == 'log' && flag == :view
+                        format_desc action, flag, '(^)commit*|:,opts*,pathspec*'
                         task flag do |_, args|
                           args = args.to_a
                           if args.first == ':'
@@ -5612,16 +6314,17 @@ module Squared
                         format_desc action, flag, 'commit1,commit2,opts*,pathspec*'
                         task flag, [:commit1, :commit2] do |_, args|
                           commit1 = commithead args.commit1
-                          if commit1
-                            commit2 = commithead param_guard(action, flag, args: args, key: :commit2)
-                            args = args.extras
-                            range = [commit1, commit2]
-                          else
-                            range, opts, refs = choice_commit(multiple: view ? true : 2, values: %w[Options Pathspec])
-                            range = range.reverse
-                            args = OptionPartition.strip(opts)
-                            args.concat(refs.shellsplit) if refs
-                          end
+                          range = if commit1
+                                    commit2 = commithead param_guard(action, flag, args: args, key: :commit2)
+                                    args = args.extras
+                                    [commit1, commit2]
+                                  else
+                                    range, opts, refs = choice_commit(multiple: flag == :view ? true : 2,
+                                                                      values: %w[Options Pathspec])
+                                    args = OptionPartition.strip(opts)
+                                    args.concat(refs.shellsplit) if refs
+                                    range.reverse
+                                  end
                           __send__(action == 'log' ? :log! : :diff, flag, args, range: range)
                         end
                       end
@@ -5634,7 +6337,11 @@ module Squared
                           index = choice_commit(multiple: true)
                         else
                           index = []
-                          args.each { |val| index << (commithead(val) || commithash(val) || break) }
+                          args.each do |val|
+                            break unless (sha = commithead(val) || commithash(val))
+
+                            index << sha
+                          end
                           args = args.drop(index.size)
                         end
                         diff(flag, args, index: index)
@@ -5646,36 +6353,67 @@ module Squared
                         diff(flag, args.extras, branch: branch)
                       end
                     when :files
-                      format_desc action, flag, 'path1,path2'
-                      task flag, [:path1, :path2] do |_, args|
+                      format_desc action, flag, 'path1,path2,patch?'
+                      task flag, [:path1, :path2, :patch] do |_, args|
                         path1 = param_guard(action, flag, args: args, key: :path1)
                         path2 = param_guard(action, flag, args: args, key: :path2)
-                        diff(flag, refs: [path1, path2])
+                        diff(flag, refs: [path1, path2, args.patch])
+                      end
+                    when :grep
+                      format_desc action, flag, 'pattern+,a/ll-match?,in/vert-grep?,i/E/F/P?,max-count?=i,f/ormat?=s'
+                      task flag do |_, args|
+                        grep = args.to_a
+                        opts = ['oneline']
+                        while (last = grep.pop)
+                          case last
+                          when '--'
+                            grep << '--' if grep.empty?
+                            break
+                          when /^a(ll-match)?$/
+                            opts << 'all-match'
+                          when /^in(vert-grep)?$/
+                            opts << 'invert-grep'
+                          when 'i', 'E', 'F', 'P'
+                            opts << last
+                          else
+                            if last =~ /^(f(-ormat)?)=(.+)$/
+                              opts.shift
+                              opts << "format=#{$1}"
+                            elsif last =~ /^(max(-count)?)=(\d+)$/
+                              opts << "max-count=#{$1}"
+                            else
+                              grep << last
+                              break
+                            end
+                          end
+                        end
+                        param_guard(action, flag, args: grep)
+                        log!(flag, opts, grep: grep)
                       end
                     end
                   when 'checkout'
                     case flag
                     when :branch
-                      format_desc action, flag, 'name,create?=[bB],commit?,detach?=d'
+                      format_desc action, flag, 'name,create?=[bB],commit?,d/etach?'
                       task flag, [:name, :create, :commit, :detach] do |_, args|
                         if (branch = args.name)
                           branch = param_guard(action, flag, args: args, key: :name)
                           create = args.create
-                          if args.commit == 'd'
-                            detach = 'd'
-                            commit = nil
-                          elsif create == 'd'
-                            create = nil
-                            commit = nil
-                            detach = 'd'
-                          elsif create && create.size > 1
-                            commit = commithead create
-                            create = nil
-                            detach = args.commit
-                          else
-                            detach = args.detach
-                            commit = commithead args.commit
-                          end
+                          detach = if args.commit == 'd'
+                                     commit = nil
+                                     'd'
+                                   elsif create == 'd'
+                                     create = nil
+                                     commit = nil
+                                     'd'
+                                   elsif create && create.size > 1
+                                     commit = commithead create
+                                     create = nil
+                                     args.commit
+                                   else
+                                     commit = commithead args.commit
+                                     args.detach
+                                   end
                           param_guard(action, flag, args: { create: create }, key: :create, pat: /\A[Bb]\z/) if create
                         else
                           branch = choice_refs 'Choose a branch to switch'
@@ -5688,7 +6426,7 @@ module Squared
                         if (origin = args.origin)
                           branch = args.name
                         else
-                          origin, branch = choice_refs('Choose a remote', 'remotes', values: ['Enter branch name'])
+                          origin, branch = choice_refs('Choose a remote', 'remotes', values: 'Enter branch name')
                         end
                         checkout(flag, branch: branch, origin: origin)
                       end
@@ -5699,7 +6437,7 @@ module Squared
                         args = if commit
                                  args.extras
                                else
-                                 commit, opts = choice_commit(values: ['Options'])
+                                 commit, opts = choice_commit(values: 'Options')
                                  OptionPartition.strip(opts)
                                end
                         checkout(flag, args, commit: commit)
@@ -5709,7 +6447,7 @@ module Squared
                       task flag, [:commit] do |_, args|
                         commit = commithead args.commit
                         unless commit
-                          commit, merge = choice_commit(values: ['Merge? [y/N]'])
+                          commit, merge = choice_commit(values: 'Merge? [y/N]')
                           merge = merge&.upcase == 'Y'
                         end
                         checkout(flag, commit: commit, merge: merge)
@@ -5723,11 +6461,13 @@ module Squared
                   when 'branch'
                     case flag
                     when :create
-                      format_desc action, flag, 'name,ref?=HEAD|:'
+                      format_desc action, flag, 'name,ref/:'
                       task flag, [:name, :ref] do |_, args|
                         target = param_guard(action, flag, args: args, key: :name)
                         ref = commithead args.ref
-                        ref, remote = choice_refs('Choose a remote', 'remotes', accept: [['Push?', true]]) if ref == ':'
+                        if ref == ':'
+                          ref, remote = choice_refs('Choose a remote', 'remotes', accept: [accept_b('Push?')])
+                        end
                         branch(flag, target: target, ref: ref, remote: remote)
                       end
                     when :track
@@ -5737,8 +6477,8 @@ module Squared
                           target = args.name
                           remote = true if ref.delete_prefix!('~')
                         else
-                          ref, remote, target = choice_refs('Choose a remote', 'remotes', accept: [['Push?', true]],
-                                                                                          values: ['Enter branch name'])
+                          ref, remote, target = choice_refs('Choose a remote', 'remotes', accept: [accept_b('Push?')],
+                                                                                          values: 'Enter branch name')
                         end
                         branch(flag, target: target, ref: ref, remote: remote)
                       end
@@ -5748,7 +6488,7 @@ module Squared
                         refs = args.to_a
                         if refs.empty? || (r = refs.last == ':')
                           accept = ['Delete?']
-                          accept << ['Force?', true] unless r
+                          accept << accept_b('Force?') unless r
                           remote = choice_refs('Choose a branch', r ? 'remotes' : 'heads', multiple: true,
                                                                                            accept: accept)
                           if r
@@ -5786,57 +6526,57 @@ module Squared
                   when 'switch'
                     case flag
                     when :create
-                      format_desc action, flag, '(^)name,ref?=HEAD|:'
+                      format_desc action, flag, '(^)name,ref/:'
                       task flag, [:name, :commit] do |_, args|
                         branch = param_guard(action, flag, args: args, key: :name)
                         commit = commithead args.commit
-                        commit, track = choice_commit(values: ['Track? [Y/n]'], force: false) if commit == ':'
+                        commit, track = choice_commit(force: false, values: 'Track? [Y/n]') if commit == ':'
                         switch(flag, branch: branch, commit: commit, track: track)
                       end
                     when :detach
-                      format_desc action, flag, 'ref?=HEAD'
+                      format_desc action, flag, 'ref?'
                       task flag, [:commit] do |_, args|
                         commit = commithead(args.commit) || choice_commit(force: false)
                         switch(flag, commit: commit)
                       end
                     when :branch
-                      format_desc action, flag, 'name|:,opts*'
+                      format_desc action, flag, 'name/:,opts*'
                       task flag, [:name] do |_, args|
-                        if (branch = args.name)
-                          args = args.extras
-                          branch = nil if branch == ':'
-                        else
-                          args = []
-                        end
+                        args = if (branch = args.name)
+                                 branch = nil if branch == ':'
+                                 args.extras
+                               else
+                                 []
+                               end
                         switch(flag, args, branch: branch || choice_refs('Choose a branch'))
                       end
                     end
                   when 'reset'
                     case flag
                     when :commit
-                      format_desc action, flag, 'ref|:,opts*'
+                      format_desc action, flag, 'ref/:,opts*'
                       task flag, [:commit] do |_, args|
                         commit = commithead args.commit
-                        if commit && commit != ':'
-                          args = args.extras
-                        else
-                          commit, mode = choice_commit(values: ['Mode [mixed|soft|hard|N]'])
-                          args = args.extras.concat(case mode&.downcase
+                        args = if commit && commit != ':'
+                                 args.extras
+                               else
+                                 commit, mode = choice_commit(values: ['Mode [mixed|soft|hard|N]'])
+                                 args.extras.concat(case mode&.downcase
                                                     when 'h', 'hard' then ['hard']
                                                     when 's', 'soft' then ['soft']
-                                                    when 'n', 'N' then ['mixed', 'N']
+                                                    when 'n', 'N' then %w[mixed N]
                                                     else ['mixed']
                                                     end)
-                        end
-                        print_success if success?(reset(flag, args, commit: commit))
+                               end
+                        success?(reset(flag, args, commit: commit))
                       end
                     when :index, :undo
-                      format_desc(action, flag, flag == :index ? 'opts*,pathspec*' : nil)
+                      format_desc(action, flag, ('opts*,pathspec*' if flag == :index))
                       task flag do |_, args|
                         reset(flag, flag == :index ? args.to_a : [])
                       end
                     when :mode
-                      format_desc action, flag, 'mode,ref?=HEAD|:'
+                      format_desc action, flag, 'mode,ref/:'
                       task flag, [:mode, :ref] do |_, args|
                         mode = param_guard(action, flag, args: args, key: :mode)
                         ref = commithead args.ref
@@ -5844,7 +6584,7 @@ module Squared
                         reset(flag, mode: mode, ref: ref)
                       end
                     when :patch
-                      format_desc action, flag, 'ref?=HEAD|:,pathspec*'
+                      format_desc action, flag, 'ref/:,pathspec*'
                       task flag, [:ref] do |_, args|
                         ref = commithead args.ref
                         ref = choice_commit(reflog: false) unless ref && ref != ':'
@@ -5873,18 +6613,18 @@ module Squared
                   when 'rebase', 'merge'
                     case flag
                     when :branch
-                      format_desc action, flag, 'upstream,branch?=HEAD,opts*'
+                      format_desc action, flag, 'upstream,branch?,opts*'
                       task flag, [:upstream] do |_, args|
                         args = if (upstream = args.upstream)
                                  args.extras
                                else
-                                 upstream, opts = choice_refs('Choose upstream branch', values: ['Options'])
+                                 upstream, opts = choice_refs('Choose upstream branch', values: 'Options')
                                  OptionPartition.strip(opts)
                                end
                         rebase(flag, args, upstream: upstream)
                       end
                     when :onto
-                      format_desc action, flag, 'ref,upstream,branch?=HEAD'
+                      format_desc action, flag, 'ref,upstream,branch?'
                       task flag, [:commit, :upstream, :branch] do |_, args|
                         commit = commithead args.commit
                         args = if commit
@@ -5893,7 +6633,7 @@ module Squared
                                  []
                                else
                                  commit = choice_refs 'Choose "onto" branch'
-                                 target, opts = choice_commit(reflog: false, multiple: 2, values: ['Options'])
+                                 target, opts = choice_commit(reflog: false, multiple: 2, values: 'Options')
                                  branch, upstream = target
                                  OptionPartition.strip(opts)
                                end
@@ -5905,7 +6645,7 @@ module Squared
                         args = args.to_a
                         if args.empty?
                           accept = "Merge with #{`#{git_output('branch --show-current')}`.chomp}?"
-                          branch, opts = choice_refs('Choose a branch', values: ['Options'], accept: accept)
+                          branch, opts = choice_refs('Choose a branch', values: 'Options', accept: accept)
                           args = OptionPartition.strip(opts)
                         end
                         merge(flag, args, branch: branch)
@@ -5921,7 +6661,7 @@ module Squared
                   when 'rev'
                     case flag
                     when :commit
-                      format_desc action, flag, 'ref?=HEAD,size?'
+                      format_desc action, flag, 'ref?,size?'
                       task flag, [:ref, :size] do |_, args|
                         ref = commithead args.ref
                         size = args.size
@@ -5951,7 +6691,7 @@ module Squared
                         ls_remote(flag, args.extras, remote: args.remote)
                       end
                     else
-                      format_desc(action, flag, 'opts*,pattern*', after: action == 'files' ? 'pathspec*' : nil)
+                      format_desc(action, flag, 'opts*,pattern*', after: ('pathspec*' if action == 'files'))
                       task flag do |_, args|
                         __send__(action == 'refs' ? :ls_remote : :ls_files, flag, args.to_a)
                       end
@@ -5972,7 +6712,7 @@ module Squared
                         restore(flag, args, commit: commit, files: files)
                       end
                     when :staged, :worktree
-                      format_desc action, flag, 'opts*,pathspec*,:?'
+                      format_desc action, flag, 'opts*,pathspec*|:'
                       task flag do |_, args|
                         args = args.to_a
                         if args.empty? || args.last == ':'
@@ -5992,16 +6732,22 @@ module Squared
                     end
                   when 'git'
                     before = case flag
-                             when :blame then 'file'
-                             when :mv then 'source+,destination'
-                             when :revert then 'commit+'
+                             when :blame
+                               'file'
+                             when :mv
+                               'source+,destination'
+                             when :revert
+                               'commit+'
                              end
-                    format_desc(action, flag, 'opts*', before: before, after: case flag
-                                                                              when :add
-                                                                                'pathspec*,pattern*'
-                                                                              when :clean, :rm, :status
-                                                                                'pathspec*'
-                                                                              end)
+                    after = case flag
+                            when :add
+                              'pathspec*,pattern*'
+                            when :grep
+                              'tree*,pathspec*'
+                            when :clean, :rm, :status
+                              'pathspec*'
+                            end
+                    format_desc(action, flag, 'opts*', before: before, after: after)
                     task flag do |_, args|
                       __send__(flag == :status ? :status : :git, flag, args.to_a)
                     end
@@ -6066,10 +6812,10 @@ module Squared
                 cur ||= line.delete_prefix!('* ')
                 heads << line if matchany?(line, reg)
               end
-              raise_error('head not found', hint: 'for-each-ref') unless cur
+              raise_error 'head not found', hint: 'for-each-ref' unless cur
               opts << 'ff-only' if opts.empty? && !option('ff-only', equals: '0')
-              (heads.dup << cur).each_with_index do |branch, index|
-                next unless (index < heads.size && cur != branch) || index == heads.size
+              (heads.dup << cur).each_with_index do |branch, i|
+                next unless (i < heads.size && cur != branch) || i == heads.size
 
                 git_spawn 'switch --quiet', force && '--force', shell_quote(branch)
                 pull(nil, opts, sync: false, hint: branch) if heads.include?(branch)
@@ -6080,11 +6826,11 @@ module Squared
             end
           end
           append_pull(opts, OPT_GIT[:pull] + OPT_GIT[:fetch][:pull],
-                      no: OPT_GIT[:no][:pull] + OPT_GIT[:no][:fetch][:pull], remote: remote, flag: flag, from: :pull)
+                      flag: flag, from: :pull, remote: remote, no: OPT_GIT[:no][:pull] + OPT_GIT[:no][:fetch][:pull])
           source(sync: sync, sub: if stdout?
                                     [
-                                      { pat: /^(.+)(\|\s+\d+\s+)([^-]*)(-+)(.*)$/, styles: color(:red), index: 4 },
-                                      { pat: /^(.+)(\|\s+\d+\s+)(\++)(.*)$/, styles: color(:green), index: 3 }
+                                      opt_style(color(:red), /^(.+)(\|\s+\d+\s+)([^-]*)(-+)(.*)$/, 4),
+                                      opt_style(color(:green), /^(.+)(\|\s+\d+\s+)(\++)(.*)$/, 3)
                                     ]
                                   end, hint: hint, **threadargs)
         end
@@ -6100,7 +6846,7 @@ module Squared
 
             op = OptionPartition.new(opts, OPT_GIT[:rebase], cmd, project: self, no: OPT_GIT[:no][:rebase])
             op << upstream
-            append_head op.shift
+            append_head op.shift&.delete_prefix(':')
             op.clear(pass: false)
           when :onto
             return unless upstream
@@ -6111,8 +6857,8 @@ module Squared
             append_head branch
           else
             unless gitpath('REBASE_HEAD').exist?
-              puts log_message(Logger::INFO, name, 'no rebase in progress', hint: command) if stdout?
-              return
+              puts log_message('no rebase in progress', subject: name, hint: command) if stdout?
+              exit 1
             end
             return unless VAL_GIT[:rebase][:send].include?(command)
 
@@ -6128,8 +6874,8 @@ module Squared
         def fetch(flag = nil, opts = [], sync: invoked_sync?('fetch', flag), remote: nil)
           opts = git_session('fetch', opts: opts).last
           opts << 'all' if flag == :all || option('all')
-          append_pull(opts, collect_hash(OPT_GIT[:fetch]), no: collect_hash(OPT_GIT[:no][:fetch]),
-                                                           remote: remote, flag: flag, from: :fetch)
+          append_pull(opts, collect_hash(OPT_GIT[:fetch]), flag: flag, from: :fetch, remote: remote,
+                                                           no: collect_hash(OPT_GIT[:no][:fetch]))
           source(sync: sync, **threadargs)
         end
 
@@ -6158,26 +6904,46 @@ module Squared
           end
           option('local', strict: true) { |val| opts[:local] = val != '0' }
           option('bare') { |val| opts[:bare] = val }
+          option('single-branch', ignore: false) do |val|
+            opts[:'single-branch'] = val != '0' && val != 'false'
+            opts.delete(:'no-single-branch')
+          end
+          option('no-checkout') do
+            opts[:'no-checkout'] = true
+            opts.delete(:n)
+          end
+          option('no-tags') { opts[:'no-tags'] = true }
           opts.delete(:'recurse-submodules') || opts.delete(:'no-recurse-submodules') if append_submodules(from: :clone)
           append_hash opts
-          cmd << '--quiet' unless verbose
+          cmd << '--quiet' if option('quiet') || !verbose
           append_value(data[0], path, delim: true)
           source(sync: sync, banner: sync && !quiet?, multiple: !sync || quiet?)
         end
 
         def stash(flag = nil, opts = [], sync: invoked_sync?('stash', flag))
           if flag
-            if flag == :all
+            case flag
+            when :all
               opts << 'include-untracked'
               flag = :push
+            when :staged
+              opts << 'staged'
+              flag = :push
+            when :worktree
+              opts << 'keep-index'
+              flag = :push
+            end
+            unless (file = gitpath('logs/refs/stash')).exist? || flag == :push
+              puts log_message('no stashes were found', subject: name, hint: flag) if stdout?
+              exit 1
             end
             cmd, opts = git_session('stash', flag, opts: opts)
             list = OPT_GIT[:stash][:common] + OPT_GIT[:stash].fetch(flag, [])
             if flag == :list
-              list += collect_hash OPT_GIT[:log]
+              list.concat(collect_hash(OPT_GIT[:log]))
               no = collect_hash OPT_GIT[:no][:log]
             end
-            op = OptionPartition.new(opts, list, cmd, project: self, no: no, first: flag == :push ? matchpathspec : nil)
+            op = OptionPartition.new(opts, list, cmd, project: self, no: no, first: (matchpathspec if flag == :push))
             case flag
             when :push
               op.append?('message', readline('Enter message', force: true), force: true) if op.remove(':')
@@ -6188,7 +6954,7 @@ module Squared
                   if op.empty?
                     values = [['Branch name', true]]
                   else
-                    op << op.shift
+                    op.add_first(prefix: ':')
                   end
                 end
                 out = choice_index('Choose a stash', git_spawn('stash list', stdout: false),
@@ -6199,13 +6965,15 @@ module Squared
                   op << out
                 end
               elsif !op.empty?
-                op << op.shift
+                op.add_first(prefix: ':')
               elsif flag == :branch
-                raise_error 'no branch name'
+                raise_error ArgumentError, 'no branch name'
               end
               op.clear
             when :clear
-              source(stdout: true) if confirm("Remove #{sub_style('all', styles: theme[:active])} stash entries?", 'N')
+              n = sub_style file.read.lines.size, theme[:inline]
+              s = sub_style name, theme[:active]
+              source(stdout: true) if confirm("Remove #{n} stash entries from #{s}?", 'N')
               return
             when :list
               op.clear
@@ -6219,7 +6987,7 @@ module Squared
             append_option(OptionPartition.select(OPT_GIT[:stash][:push], no: false), no: true, ignore: false)
             append_message
           end
-          source(banner: !quiet?, sync: sync, **threadargs)
+          source(sync: sync, banner: !quiet?, **threadargs)
         end
 
         def status(flag = nil, opts = [])
@@ -6249,32 +7017,32 @@ module Squared
             g = color(:green)
             sub = if session_arg?('short')
                     [
-                      { pat: /^(.)([A-Z?!])(.+)$/, styles: r, index: 2 },
-                      { pat: /^([A-Z?!])(.+)$/, styles: g },
-                      { pat: /^(\?\?)(.+)$/, styles: r },
-                      { pat: /^(## )((?~\.{3}))(\.{3})(.+)$/, styles: [nil, g, nil, r], index: -1 }
+                      opt_style(r, /^(.)([A-Z?!])(.+)$/, 2),
+                      opt_style(g, /^([A-Z?!])(.+)$/),
+                      opt_style(r, /^(\?\?)(.+)$/),
+                      opt_style([nil, g, nil, r], /^(## )((?~\.{3}))(\.{3})(.+)$/, -1)
                     ]
                   else
-                    [pat: /^(\t+)([a-z]+: +.+)$/, styles: r, index: 2]
+                    opt_style(r, /^(\t+)([a-z]+: +.+)$/, 2)
                   end
           end
           out, banner, from = source(io: true)
           ret = write_lines(out, banner: banner, sub: sub)
-          list_result(ret, 'files', from: from, action: 'modified')
+          list_result(ret, 'files', action: 'modified', from: from)
         end
 
         def revbuild(flag = nil, opts = [], sync: nil, **kwargs)
-          statusargs = lambda do
+          kw = lambda do
             {
-              include: relativepath(Array(kwargs[:include]), all: true),
-              exclude: relativepath(Array(kwargs[:exclude]), all: true)
+              include: relativepath(*Array(kwargs[:include]), all: true),
+              exclude: relativepath(*Array(kwargs[:exclude]), all: true)
             }
           end
           unless workspace.closed
             if @revbuild
-              statusargs.call.each { |key, val| @revbuild[key] += val }
+              kw.call.each { |key, val| @revbuild[key] += val }
             else
-              @revbuild = statusargs.call
+              @revbuild = kw.call
             end
             return
           end
@@ -6282,28 +7050,24 @@ module Squared
           return if sha.empty?
 
           sync = invoked_sync?('revbuild', flag) if sync.nil?
-          kwargs = kwargs.key?(:include) || kwargs.key?(:exclude) ? statusargs.call : @revbuild || {}
+          kwargs = kwargs.key?(:include) || kwargs.key?(:exclude) ? kw.call : @revbuild || {}
           case flag
           when :build
-            op = OptionPartition.new(opts, %w[ignore-submodules=b? ignored=b? untracked-files=b?], project: self)
+            op = OptionPartition.new(opts, VAL_GIT[:revbuild].map { |key| "#{key}=b?" }, project: self)
             op.clear(append: true)
             args = op.to_a
           else
-            args = []
-            option('untracked-files', prefix: 'git') { |val| args << basic_option('untracked-files', val) }
-            option('ignore-submodules', prefix: 'git') { |val| args << basic_option('ignore-submodules', val) }
-            option('ignored', prefix: 'git') { |val| args << basic_option('ignored', val) }
+            args = parse_env('GIT_OPTIONS')
+                   .grep(/\A--#{Regexp.union(*VAL_GIT[:revbuild])}/)
+                   .concat(VAL_GIT[:revbuild].map { |key| option(key, prefix: 'git') { |val| basic_option(key, val) } })
+                   .compact
+            OptionPartition.uniq!(args)
           end
           if (cur = workspace.rev_entry(name)) && cur['revision'] == sha && !env('REVBUILD_FORCE')
             files = status_digest(*args, **kwargs)
             if cur['files'].size == files.size && cur['files'].find { |key, val| files[key] != val }.nil?
-              if stdout?
-                if (since = workspace.rev_timesince(name, 'build'))
-                  puts log_message(Logger::INFO, name, 'no changes', subject: 'revbuild', hint: "#{since} ago")
-                else
-                  workspace.rev_timeutc(name, 'build')
-                end
-              end
+              workspace.rev_timeutc(name, 'build') unless (since = workspace.rev_timesince(name, 'build'))
+              puts log_message(['revbuild', 'no changes'], subject: name, hint: ("#{since} ago" if since)) if stdout?
               return
             end
           end
@@ -6312,7 +7076,7 @@ module Squared
         rescue StandardError => e
           print_error(e, pass: true)
         else
-          print_status(name, subject: 'revbuild', start: start, from: :completed)
+          print_status('revbuild', subject: name, start: start, from: :completed)
           workspace.rev_write(name, { 'revision' => sha, 'files' => status_digest(*args, **kwargs) },
                               sync: sync, utc: 'build')
         end
@@ -6321,9 +7085,8 @@ module Squared
           cmd, opts = git_session('reset', opts: opts)
           case flag
           when :commit, :index
-            op = OptionPartition.new(opts, OPT_GIT[:reset] + VAL_GIT[:reset], cmd,
-                                     project: self, no: OPT_GIT[:no][:reset],
-                                     first: flag == :index ? matchpathspec : nil)
+            op = OptionPartition.new(opts, OPT_GIT[:reset] + VAL_GIT[:reset] + OPT_GIT[:log][:diff_context], cmd,
+                                     project: self, no: OPT_GIT[:no][:reset], first: (matchpathspec if flag == :index))
             if flag == :commit
               op.append(commit)
                 .clear(pass: false)
@@ -6354,7 +7117,7 @@ module Squared
 
         def checkout(flag, opts = [], branch: nil, origin: nil, create: nil, commit: nil, detach: nil, merge: false)
           cmd, opts = git_session('checkout', opts: opts)
-          append_option 'force', 'f', 'merge'
+          append_option 'f', 'force', 'merge'
           case flag
           when :branch
             cmd << '--detach' if detach == 'd' || option('detach')
@@ -6367,13 +7130,13 @@ module Squared
             cmd << '-m' if merge
             cmd << '--detach' << commit
           else
-            op = OptionPartition.new(opts, OPT_GIT[:checkout], cmd, project: self, no: OPT_GIT[:no][:checkout],
-                                                                    first: flag == :path ? matchpathspec : nil)
+            list = OPT_GIT[:checkout] + OPT_GIT[:log][:diff_context]
+            op = OptionPartition.new(opts, list, cmd, project: self, no: OPT_GIT[:no][:checkout],
+                                                      first: (matchpathspec if flag == :path))
             if flag == :path
               append_head
               append_pathspec(op.extras, pass: false)
-              print_success if success?(source)
-              return
+              return success?(source)
             end
             op.append(commit)
               .clear(pass: false)
@@ -6390,7 +7153,7 @@ module Squared
             elsif !session_arg?('s', 'sign', 'u', 'local-user')
               cmd << '--annotate'
             end
-            cmd << '--force' if option('force', 'f')
+            cmd << '--force' if option('f', 'force')
             if !commit && message && (sha = commithash(message))
               commit = sha
               message = nil
@@ -6406,15 +7169,14 @@ module Squared
             out, banner, from = source(io: true)
             print_item banner
             ret = write_lines(out, grep: op.extras)
-            list_result(ret, 'tags', from: from, grep: op.extras)
+            list_result(ret, 'tags', grep: op.extras, from: from)
             return
           end
-          remote ||= option 'remote'
-          source
-          git_spawn('push', flag == :delete ? '-d' : nil, remote, *refs.map { |val| shell_quote(val) }) if remote
+          remote ||= option('remote')
+          source.tap { |ret| git_spawn('push', ('-d' if flag == :delete), remote, *refs.quote!) if ret && remote }
         end
 
-        def log!(flag, opts = [], range: [], index: [])
+        def log!(flag, opts = [], range: [], index: [], grep: [])
           cmd, opts = git_session('log', opts: opts)
           op = OptionPartition.new(opts, collect_hash(OPT_GIT[:log]), cmd, project: self,
                                                                            no: collect_hash(OPT_GIT[:no][:log]),
@@ -6422,6 +7184,8 @@ module Squared
           case flag
           when :between, :contain
             op.add_quote(range.join(flag == :between ? '..' : '...'))
+          when :grep
+            op.merge(grep.map { |val| quote_option('grep', val) })
           else
             op.merge(index)
           end
@@ -6432,9 +7196,11 @@ module Squared
 
         def diff(flag, opts = [], refs: [], branch: nil, range: [], index: [])
           cmd, opts = git_session('diff', opts: opts)
-          op = OptionPartition.new(opts, collect_hash(OPT_GIT[:diff]) + OPT_GIT[:log][:diff], cmd,
+          op = OptionPartition.new(opts,
+                                   collect_hash(OPT_GIT[:diff]) + OPT_GIT[:log][:diff] + OPT_GIT[:log][:diff_context],
+                                   cmd,
                                    project: self, no: OPT_GIT[:no][:log][:diff],
-                                   first: flag == :files ? nil : matchpathspec)
+                                   first: (matchpathspec unless flag == :files))
           case flag
           when :files, :view, :between, :contain
             op.delete('--cached')
@@ -6442,7 +7208,16 @@ module Squared
           append_nocolor
           if flag == :files
             op << '--no-index'
+            patch = refs.pop
             append_pathspec(refs, parent: true)
+            if patch
+              patch = basepath patch
+              exit 1 if patch.exist? && !confirm_basic('Overwrite?', patch)
+              op << '>' << shell_quote(patch)
+              source(banner: false)
+              puts patch.read if patch.exist? && (stdin? || verbose?)
+              return
+            end
           else
             op << '--merge-base' if option('merge-base')
             case flag
@@ -6455,7 +7230,7 @@ module Squared
               op.add_quote(branch) if branch
               if !index.empty?
                 if op.arg?('cached')
-                  raise_error("one commit only: #{index.join(', ')}", hint: 'cached') if index.size > 1
+                  raise_error "single commit: #{index.join(', ')}", hint: 'cached' unless index.size == 1
                   op << index.first
                 else
                   op.merge(index)
@@ -6471,7 +7246,7 @@ module Squared
 
         def commit(flag, opts = [], refs: [], ref: nil, squash: nil, pick: nil, message: nil, pass: false)
           fixup = flag == :fixup
-          amend = !fixup && flag.to_s.start_with?('amend')
+          amend = flag.match?(/^amend/) && !fixup
           unless flag == :add || pick == 'reword'
             pathspec = if flag == :all || ((fixup || amend) && refs.size == 1 && refs.first == '*')
                          '--all'
@@ -6482,12 +7257,12 @@ module Squared
                        end
           end
           if fixup
-            source git_session('commit', basic_option('fixup', "#{pick ? "#{pick}:" : ''}#{ref}"), pathspec)
-            source git_output('rebase --autosquash', squash) if squash.is_a?(String)
-            return
+            ret = source(git_session('commit', basic_option('fixup', pick ? "#{pick}:#{ref}" : ref), pathspec))
+            source git_output('rebase --autosquash', squash) if ret && squash.is_a?(String)
+            return ret
           end
           message ||= messageopt
-          if !message && !amend
+          unless message || amend
             return if pass
 
             message = readline('Enter message', force: true)
@@ -6496,8 +7271,9 @@ module Squared
           origin = nil
           upstream = nil
           cmd, opts = git_session('add', opts: opts)
-          op = OptionPartition.new(opts, OPT_GIT[:add], cmd, project: self, first: matchpathspec)
-          op << '--verbose' if verbose
+          op = OptionPartition.new(opts, OPT_GIT[:add] + OPT_GIT[:log][:diff_context], cmd,
+                                   project: self, no: OPT_GIT[:no][:add], first: matchpathspec)
+          op << '--verbose' unless silent?
           format = '%(if)%(HEAD)%(then)%(refname:short)...%(upstream:short)...%(upstream:track)%(end)'
           git_spawn 'fetch --no-tags --quiet'
           foreachref('heads', format: format).each do |line|
@@ -6505,10 +7281,9 @@ module Squared
 
             branch, origin, hint = line.split('...')
             if hint && !hint.match?(/^\[(\D+0,\D+0)\]$/)
-              raise_error('work tree is not usable', hint: hint[1..-2])
-            elsif !origin || origin.empty?
+              raise_error 'work tree is not usable', hint: hint[1..-2]
+            elsif (!origin || origin.empty?) && !dryrun?
               return nil if pass
-              break if dryrun?
 
               unless (origin = option('upstream', prefix: 'git', ignore: false))
                 if (origin = choice_refs('Choose an upstream', 'remotes', attempts: 1, force: false))
@@ -6547,14 +7322,17 @@ module Squared
           cached = git_spawn 'diff --cached --name-only --no-color'
           if amend || !cached.empty? || dryrun?
             if adding.empty? && !cached.empty? && banner?
-              puts(cached.lines.map! { |val| "cached #{shell_quote(val.chomp)}" })
+              puts(cached.lines(chomp: true).map! { |val| "cached #{shell_quote(val)}" })
             end
             source co
             source pu
-          elsif banner?
-            puts 'Nothing to commit'
-          elsif stdout?
-            puts log_message(Logger::INFO, name, 'nothing to commit', hint: flag)
+          else
+            if banner?
+              puts 'Nothing to commit'
+            elsif stdout?
+              puts log_message('nothing to commit', subject: name, hint: flag)
+            end
+            exit 1
           end
         end
 
@@ -6570,20 +7348,20 @@ module Squared
               op << branch
               op.clear(pass: false)
             else
-              raise_error 'no branch/commit' if op.empty?
+              raise_error ArgumentError, 'no branch/commit' if op.empty?
               append_commit(*op.extras)
             end
           else
             unless gitpath('MERGE_HEAD').exist?
-              puts log_message(Logger::INFO, name, 'no merge in progress', hint: command) if stdout?
-              return
+              puts log_message('no merge in progress', subject: name, hint: command) if stdout?
+              exit 1
             end
             return unless VAL_GIT[:merge][:send].include?(command)
 
             cmd << "--#{command}"
             display = command == 'abort'
           end
-          print_success if success?(source, display)
+          success?(source, display)
         end
 
         def branch(flag = nil, opts = [], refs: [], ref: nil, target: nil, remote: nil)
@@ -6601,11 +7379,11 @@ module Squared
                        '--track'
                      end
             end
-            cmd << '--force' if option('force', 'f')
+            cmd << '--force' if option('f', 'force')
             cmd << shell_quote(target)
             cmd << shell_quote(ref) if ref
           when :track
-            raise_error('invalid upstream', hint: ref) unless ref.include?('/')
+            raise_error 'invalid upstream', hint: ref unless ref.include?('/')
             if ref.delete_prefix!('^')
               cmd << '--unset-upstream' << shell_quote(ref)
               remote = false
@@ -6615,9 +7393,7 @@ module Squared
               cmd << shell_quote(target) if target
             end
           when :delete
-            remote&.each do |val|
-              source git_output('push --delete', *val.split('/', 2).map { |s| shell_quote(s) })
-            end
+            remote&.each { |val| source git_output('push --delete', *val.split('/', 2).quote!) }
             force, list = refs.partition { |val| val.start_with?(/[~^]/) }
             force.each do |val|
               r = '-r' if val.delete!('~')
@@ -6630,13 +7406,13 @@ module Squared
             remote = nil
           when :move, :copy
             s = +"-#{flag.to_s[0]}"
-            s.upcase! if option('force', 'f')
+            s.upcase! if option('f', 'force')
             cmd << s
-            refs.compact.each { |val| cmd << shell_quote(val) }
+            cmd.merge(refs.compact.quote!)
             stdout = true
           when :current
             cmd << '--show-current'
-            source(banner: verbosetype > 1, stdout: true)
+            source(banner: verbose?, stdout: true)
             return
           when :list
             op = OptionPartition.new(opts, OPT_GIT[:branch], cmd << '--list',
@@ -6645,8 +7421,8 @@ module Squared
             out, banner, from = source(io: true)
             print_item banner
             ret = write_lines(out, sub: [
-              { pat: /^(\*\s+)(\S+)(.*)$/, styles: color(:green), index: 2 },
-              { pat: %r{^(\s*)(remotes/\S+)(.*)$}, styles: color(:red), index: 2 }
+              opt_style(color(:green), /^(\*\s+)(\S+)(.*)$/, 2),
+              opt_style(color(:red), %r{^(\s*)(remotes/\S+)(.*)$}, 2)
             ])
             list_result(ret, 'branches', from: from)
             return
@@ -6657,21 +7433,23 @@ module Squared
               git_spawn 'fetch --all --prune --quiet' if option('sync')
               cmd << '-vv --no-abbrev --list'
               out, banner, from = source(io: true)
-              ret = write_lines(out, grep: [/^\*\s+#{Regexp.escape(head)}\s/], banner: banner, first: true) do |line|
+              first = workspace.size > 1
+              grep = first ? [/^\*\s+#{Regexp.escape(head)}\s/] : []
+              ret = write_lines(out, grep: grep, banner: banner, first: first) do |line, index|
                 next line if stdin?
 
-                data = line.sub(/^\*\s+/, '').split(/\s+/)
-                a = sub_style(data[0], styles: theme[:inline])
-                b = sub_style(data[1], styles: theme[:extra])
-                r = /\A(?:\[((?~\]\s))\]\s)?(.+)\z/m.match(data[2..-1].join(' '))
+                data = line.sub(/^\*?\s+/, '').split(/\s+/, 3)
+                a = sub_style(data[0], theme[:inline], styles: (:underline if !first && line.start_with?('*')))
+                b = commitstyle data[1]
+                r = /\A(?:\[((?~\]\s))\]\s)?(.+)\z/m.match(data[2])
                 if (r1 = r[1]) && r1 =~ /^(.+):(?: ([a-z]+) (\d+),)? ([a-z]+) (\d+)$/
-                  write = ->(s1, s2) { "#{s1.capitalize.rjust(7)}: #{sub_style(s2, styles: theme[:warn])}" }
+                  write = ->(s1, s2) { "#{s1.capitalize.rjust(7)}: #{sub_style(s2, theme[:warn])}" }
                   r1 = $1
                   r2 = $2 && write.call($2, $3)
                   r3 = write.call($4, $5)
                 end
                 r1 = nil if r1 == "origin/#{data[0]}"
-                [" Branch: #{a + (r1 ? " (#{r1})" : '')}", r2, r3, " Commit: #{b}", "Message: #{r[2]}"]
+                ["#{"\n" unless index == 0} Branch: #{a.subhint(r1)}", r2, r3, " Commit: #{b}", "Message: #{r[2]}"]
                   .compact
                   .join("\n")
               end
@@ -6680,35 +7458,31 @@ module Squared
             print_error(name, 'no ref found', subject: 'branch', hint: 'head', pass: true) if ret == 0
             return
           end
-          return unless success?(source(stdout: stdout))
+          return unless success?(source(stdout: stdout), !ref && flag == :create) && !ref && remote && target
 
-          if !ref
-            print_success if flag == :create
-          elsif remote && target
-            source git_output('push -u', shell_quote(ref.split('/', 2).first), shell_quote(target))
-          end
+          source git_output('push -u', shell_quote(ref.split('/', 2).first), shell_quote(target))
         end
 
         def switch(flag, opts = [], branch: nil, commit: nil, track: nil)
           cmd, opts = git_session('switch', opts: opts)
-          cmd << '--force' if option('force', 'f')
+          cmd << '--force' if option('f', 'force')
           if flag == :branch
-            op = OptionPartition.new(opts, OPT_GIT[:switch], cmd, project: self, no: OPT_GIT[:no][:switch])
-            op.add_quote(branch)
+            OptionPartition.new(opts, OPT_GIT[:switch], cmd, project: self, no: OPT_GIT[:no][:switch])
+                           .add_quote(branch)
           else
             case flag
             when :create
               cmd << quote_option(branch.delete_prefix!('^') ? 'C' : 'c', branch)
-              cmd << case (track ||= option('track', ignore: false))
-                     when 'n', 'N', '0', 'false'
+              cmd << case (track ||= option('track', ignore: false))&.downcase
+                     when 'n', '0', 'false'
                        '--no-track'
-                     when 'y', 'Y', '1', 'true'
+                     when 'y', '1', 'true'
                        '--track'
                      when 'direct', 'inherit'
                        basic_option 'track', track
                      end
             when :detach
-              cmd << "--#{flag}"
+              cmd << '--detach'
             end
             append_head commit
           end
@@ -6724,16 +7498,18 @@ module Squared
             op.add_quote(branch, '--', path, url)
           else
             op.adjoin(flag)
-            op << '--recursive' if option('recursive', 'r')
+            op << '--recursive' if option('r', 'recursive')
             op.splice(path: true)
           end
-          print_success if success?(source, flag == :branch)
+          source.tap { |ret| success?(ret, flag == :branch) }
         end
 
         def restore(flag, opts = [], commit: nil, files: nil)
           cmd, opts = git_session('restore', shell_option(flag, commit, escape: false, force: false), opts: opts)
-          op = OptionPartition.new(opts, OPT_GIT[:restore], cmd, project: self, no: OPT_GIT[:no][:restore],
-                                                                 first: matchpathspec)
+          op = OptionPartition.new(opts,
+                                   OPT_GIT[:restore] + OPT_GIT[:log][:diff_context],
+                                   cmd,
+                                   project: self, no: OPT_GIT[:no][:restore], first: matchpathspec)
           append_pathspec(op.extras + (files || []), pass: false)
           source(sync: false, stderr: true)
         end
@@ -6754,14 +7530,14 @@ module Squared
           case format
           when 'oneline', 'short', 'medium', 'full', 'fuller', 'reference', 'email', 'raw'
             cmd << basic_option('format', format)
-          when /(?:^t?format:|%)/
+          when /^t?format:|%/
             cmd << quote_option('pretty', format)
           else
             opts << format if format
           end
-          op = OptionPartition.new(opts, OPT_GIT[:show] + OPT_GIT[:diff][:show] + OPT_GIT[:log][:diff], cmd,
-                                   project: self,
-                                   no: OPT_GIT[:no][:show] + collect_hash(OPT_GIT[:no][:log], pass: [:base]))
+          list = OPT_GIT[:show] + OPT_GIT[:diff][:show] + OPT_GIT[:log][:diff] + OPT_GIT[:log][:diff_context]
+          op = OptionPartition.new(opts, list, cmd, project: self, pass: [:base],
+                                                    no: OPT_GIT[:no][:show] + collect_hash(OPT_GIT[:no][:log]))
           op.append(delim: true)
           source(exception: false, banner: flag != :oneline)
         end
@@ -6780,85 +7556,104 @@ module Squared
               cmd << '--sq-quote'
               args = true
             end
-            op = OptionPartition.new(opts, OPT_GIT[:rev_parse], cmd, project: self, no: OPT_GIT[:no][:rev_parse],
-                                                                     args: args)
-            op.append(escape: args)
+            OptionPartition.new(opts, OPT_GIT[:rev_parse], cmd, project: self, no: OPT_GIT[:no][:rev_parse], args: args)
+                           .append(escape: args)
           end
-          source(banner: verbosetype > 1)
+          source(banner: verbose?)
         end
 
         def ls_remote(flag, opts = [], remote: nil)
-          cmd, opts = git_session('ls-remote', '--refs', opts: opts)
+          cmd, opts = git_session('ls-remote --refs', opts: opts)
           cmd << "--#{flag}" unless flag == :remote
           op = OptionPartition.new(opts, OPT_GIT[:ls_remote], cmd, project: self)
           op.add_quote(remote) if remote
           out, banner, from = source(io: true)
           print_item banner
           ret = write_lines(out, grep: op.extras, prefix: "refs/#{flag}/")
-          list_result(ret, flag.to_s, from: from, grep: op.extras)
+          list_result(ret, flag.to_s, grep: op.extras, from: from)
         end
 
         def ls_files(flag, opts = [])
-          cmd, opts = git_session('ls-files', "--#{flag}", opts: opts)
+          cmd, opts = git_session("ls-files --#{flag}", opts: opts)
           op = OptionPartition.new(opts, OPT_GIT[:ls_files], cmd, project: self)
           op.splice(path: true, pattern: true)
           out, banner, from = source(io: true)
           print_item banner
           ret = write_lines(out, grep: op.extras)
-          list_result(ret, 'files', from: from, grep: op.extras)
+          list_result(ret, 'files', grep: op.extras, from: from)
         end
 
         def git(flag, opts = [])
           cmd, opts = git_session(flag, opts: opts)
-          op = OptionPartition.new(opts, OPT_GIT[:git].fetch(flag, []) + OPT_GIT.fetch(flag, []), cmd,
-                                   project: self, no: OPT_GIT[:no][flag], first: case flag
-                                                                                 when :blame, :revert
-                                                                                   nil
-                                                                                 else matchpathspec
-                                                                                 end)
+          list = OPT_GIT[:git].fetch(flag, []) + OPT_GIT.fetch(flag, [])
+          case flag
+          when :add
+            list.concat(OPT_GIT[:log][:diff_context])
+          when :revert
+            list.concat(VAL_GIT[:rebase][:send])
+          end
+          op = OptionPartition.new(opts, list, cmd, project: self, no: OPT_GIT[:no][flag], single: /\A\d+\z/,
+                                                    first: case flag
+                                                           when :blame, :revert then nil
+                                                           else matchpathspec
+                                                           end)
           case flag
           when :blame
-            raise_error 'no file found' unless (n = op.index { |s| basepath(s).file? })
-            op.delim << shell_quote(basepath(op.delete_at(n)))
-            op.clear
+            raise_error Errno::ENOENT, 'no file target' unless (n = op.index { |s| basepath(s).file? })
+            op.append(basepath(op.remove_at(n)), delim: true)
+              .clear
           when :revert
-            if VAL_GIT[:rebase][:send].any? { |val| op.arg?(val) }
+            if op.arg?(*VAL_GIT[:rebase][:send])
               op.clear
             elsif op.empty?
-              raise_error 'no commit given'
+              raise_error 'no commit target'
             else
               append_commit(*op.extras)
             end
           when :add
             if flag == :add && !op.arg?('pathspec-from-file')
-              grep, list = op.partition { |val| OptionPartition.pattern?(val) }
-              unless grep.empty? && !list.empty?
+              grep, pathspec = op.partition { |val| OptionPartition.pattern?(val) }
+              unless grep.empty? && !pathspec.empty?
                 grep.map! { |val| Regexp.new(val[1..-2]) }
                 files = []
                 status_data.each do |a, b|
                   next if b.strip.empty? || (!grep.empty? && grep.none? { |pat| pat.match?(a) })
 
-                  files << "#{sub_style(b, styles: color(:red))} #{a}"
+                  files << "#{sub_style(b, color(:red))} #{a}"
                 end
                 unless files.empty?
                   files = choice_index('Select files', files, multiple: true, trim: /^\S+\s/,
-                                                              accept: [['Add?', false, true]])
+                                                              accept: [accept_y('Add?')])
                 end
-                op.swap(list + files)
+                op.swap(pathspec + files)
               end
             end
             return source(git_session('status -s'), banner: false) unless append_pathspec(op.extras)
-
-            print_success if success?(source, flag == :add && !op.arg?('verbose'))
-            return
+            return success?(source) if flag == :add && !op.arg?('verbose')
           when :mv
             refs = projectmap op.extras
             raise_error 'no source/destination' unless refs.size > 1
             op.merge(refs)
           when :rm, :clean
             append_pathspec(op.extras, expect: flag == :rm)
+          when :grep
+            op.each do |val|
+              if op.include?('--')
+                op.add_path(val)
+              elsif op.exist?(val, glob: true)
+                op.delim
+                  .add_path(val)
+              else
+                op.add_quote(val)
+              end
+            end
           end
-          source(sync: false, stderr: true)
+          case flag
+          when :revert, :mv, :rm
+            source(sync: false, stderr: true)
+          else
+            source
+          end
         end
 
         def clone?
@@ -6886,19 +7681,18 @@ module Squared
               banner = nil unless banner? && !multiple
               args = true
             end
-            if cmd.respond_to?(:done)
-              if from.nil? && (from = cmd.drop(1).find { |val| val.match?(/\A[a-z]{1,2}[a-z-]*\z/) })
-                from = :"git:#{from}"
-              end
-              banner &&= cmd.temp { |val| val.start_with?(/--(?:work-tree|git-dir)/) }
+            if from == false
+              from = nil
+            elsif !from && cmd.respond_to?(:drop)
+              from = cmd.drop(1).find { |val| val.match?(/\A[a-z]{1,2}[a-z-]*\z/) }
+              from &&= :"git:#{from}"
             end
-            from = nil if from == false
+            banner &&= cmd.temp { |val| val.start_with?(/--(?:work-tree|git-dir)/) } if cmd.respond_to?(:temp)
           end
           cmd = session_done cmd
           log&.info cmd
           banner = if banner
-                     banner = (banner.is_a?(String) ? banner : cmd).gsub(File.join(path, ''), '')
-                     format_banner(hint ? "#{banner} (#{hint})" : banner)
+                     format_banner(banner.is_a?(String) ? banner : cmd, hint: hint, strip: true)
                    end
           on :first, from
           begin
@@ -6909,10 +7703,12 @@ module Squared
             elsif stdin? ? sync : stdout
               print_item banner unless multiple
               ret = `#{cmd}`.chomp
-              if !ret.empty?
+              raise(ret.empty? ? $?.to_s : ret) unless $?.success?
+
+              if ret.empty?
+                success?(true, !banner.nil?)
+              else
                 puts ret
-              elsif success?(!banner.nil?)
-                print_success
               end
             elsif !kwargs[:sub] && (sync || (!exception && !stderr))
               print_item banner unless multiple
@@ -6924,7 +7720,7 @@ module Squared
                   n = write_lines(out, banner: banner, pass: true, **kwargs)
                   if n == 0
                     n = write_lines(err, banner: banner)
-                    print_success if success?(n == 0 && !banner.nil?)
+                    success?(n == 0, n == 0 && !banner.nil?)
                   else
                     write_lines(err, loglevel: Logger::DEBUG)
                   end
@@ -6943,21 +7739,18 @@ module Squared
         end
 
         def write_lines(data, grep: [], prefix: nil, sub: nil, banner: nil, loglevel: nil, pass: false, first: false)
-          grep = grep.empty? ? nil : matchmap(grep, prefix)
-          sub = nil if stdin?
+          grep = (matchmap(grep, prefix) unless grep.empty?)
+          sub = (as_a sub unless stdin?)
           ret = 0
           out = []
           data.each do |line|
             next if grep&.none? { |pat| pat.match?(line) }
+            next if block_given? && !(line = yield(line, ret))
 
-            if block_given?
-              line = yield line
-              next unless line
-            end
             if loglevel
               log&.add loglevel, line
             else
-              sub&.each { |h| line = sub_style(line, **h) }
+              sub&.each { |h| sub_style!(line, **h) }
               if banner
                 out << line
               else
@@ -6971,14 +7764,14 @@ module Squared
           ret
         end
 
-        def list_result(size, type, grep: [], action: 'found', from: nil)
+        def list_result(size, type, action: 'found', grep: [], from: nil)
           if size == 0
             puts empty_status("No #{type} were #{action}", 'grep', grep.join(', '))
           elsif stdout?
             styles = theme.fetch(:banner, []).reject { |s| s.to_s.end_with?('!') }
             styles << :bold if styles.size <= 1
             puts print_footer("#{size} #{size == 1 ? type.sub(/(?:(?<!l)e)?s\z/, '') : type}",
-                              sub: [pat: /^(\d+)(.+)$/, styles: styles])
+                              sub: opt_style(styles, /^(\d+)(.+)$/))
           end
           on :last, from
         end
@@ -6986,7 +7779,7 @@ module Squared
         def choice_refs(msg, *type, format: nil, sort: '-creatordate', count: true, short: true, **kwargs)
           type << 'heads' if type.empty?
           unless format
-            format = +"%(refname#{short ? ':short' : ''})"
+            format = +"%(refname#{':short' if short})"
             if type.include?('heads') || type.include?('tags')
               format += '%(if)%(HEAD)%(then) *%(end)'
               trim = /\s+\*\z/
@@ -7001,9 +7794,17 @@ module Squared
         def choice_commit(count: true, reflog: true, force: true, **kwargs)
           kwargs[:attempts] ||= 1 unless force
           cmd = git_output(reflog && env('GIT_REFLOG') ? 'reflog' : 'log')
-          cmd << quote_option('format', '(%h) %s')
+          cmd << quote_option('format', "#{commitstyle('%h')} %s")
           cmd << basic_option('max-count', env('GIT_COUNT', ARG[:CHOICE])) if count
-          choice_index('Choose a commit', git_spawn(cmd, stdout: false), column: /\((\w+)\)/, force: force, **kwargs)
+          ret = choice_index('Choose a commit', git_spawn(cmd, stdout: false), column: /^(\S+)/, force: force, **kwargs)
+          case ret
+          when Array
+            ret.map!(&:stripstyle)
+          when String
+            ret.stripstyle
+          else
+            ret
+          end
         end
 
         def choice_remote(force: false, **kwargs)
@@ -7019,7 +7820,7 @@ module Squared
           ret = {}
           status_data(*args).each do |file,|
             next if !glob.empty? && glob.none? { |val| File.fnmatch?(val, file, File::FNM_DOTMATCH) }
-            next if !pass.empty? && pass.any? { |val| File.fnmatch?(val, file, File::FNM_DOTMATCH) }
+            next if pass.any? { |val| File.fnmatch?(val, file, File::FNM_DOTMATCH) }
 
             ret[file] = algorithm.hexdigest(File.read(basepath(file)))
           end
@@ -7036,8 +7837,8 @@ module Squared
           ret
         end
 
-        def append_pull(opts, list, target: @session, flag: nil, no: nil, remote: nil, from: nil)
-          target << '--force' if option('force', 'f', target: target)
+        def append_pull(opts, list, flag:, from:, target: @session, no: nil, remote: nil)
+          target << '--force' if option('f', 'force', target: target)
           append_submodules(target: target, from: from)
           return if !remote && opts.empty?
 
@@ -7049,6 +7850,7 @@ module Squared
               when 'rebase'
                 op << basic_option($1, $2) if VAL_GIT[:rebase][:value].include?($2)
               when 'shallow-since'
+                require 'date'
                 op.append?($1) { Date.parse($2).strftime('%F %T') }
               when 'recurse-submodules'
                 op.append?($1, $2, type: :basic)
@@ -7128,9 +7930,7 @@ module Squared
               when '1', 'true'
                 target << '--recurse-submodules'
               else
-                projectmap(split_escape(val)).each do |path|
-                  target << basic_option('recurse-submodules', path)
-                end
+                projectmap(split_escape(val)).each { |path| target << basic_option('recurse-submodules', path) }
               end
             else
               target << case val
@@ -7177,28 +7977,26 @@ module Squared
                                                                       stdout: stdout, banner: banner, **kwargs)
         end
 
-        def dryrun?(*, target: @session, **)
-          return false unless target
-
-          target.include?('--dry-run') || !option('dry-run', target: target).nil?
+        def dryrun?(*, target: @session, prefix: target&.first)
+          Array(target).include?('--dry-run') || !option('dry-run', target: target, prefix: prefix).nil?
         end
 
         def quiet?(*, target: @session, **)
           return false unless target
 
-          target.include?('--quiet') || (target.include?('-q') && stripext(target.first) == 'git')
+          target.include?('--quiet') || (target.include?('-q') && target.first.stripext == 'git')
         end
 
         def gitpath(*args)
-          path.join('.git', *args)
+          basepath('.git', *args)
         end
 
         def repotrack(origin, branch, quote: true)
           unless origin && branch && (i = origin.index('/'))
             raise_error(ArgumentError, "missing #{origin ? 'branch' : 'remote'} name", hint: origin)
           end
-          branch = "#{branch}:#{origin[(i + 1)..-1]}" unless origin.end_with?("/#{branch}")
-          [origin[0..(i - 1)], branch].tap { |ret| ret.map! { |val| shell_quote(val) } if quote }
+          branch = "#{branch}:#{origin[i.succ..-1]}" unless origin.end_with?("/#{branch}")
+          [origin[0..i.pred], branch].tap { |ret| ret.quote! if quote }
         end
 
         def commithash(val)
@@ -7209,6 +8007,10 @@ module Squared
           return val unless (s = matchhead(val))
 
           s.start_with?(/\d/) ? "@~#{s}" : "@#{s}"
+        end
+
+        def commitstyle(val)
+          sub_style(val, theme[:extra] || color(:yellow))
         end
 
         def matchhead(val)
@@ -7240,8 +8042,9 @@ module Squared
           if id.is_a?(Symbol)
             project id
           else
-            values.find { |proj| proj.name == id } || values.find { |proj| proj.project == id } ||
-              values.find { |proj| proj.path.to_s == File.expand_path(id, base) }
+            values.find { |proj| proj.name == id } ||
+            values.find { |proj| proj.project == id } ||
+            values.find { |proj| proj.path.to_s == File.expand_path(id, base) }
           end
         end
         ret.size == 1 ? ret.first : ret
@@ -7266,19 +8069,12 @@ module Squared
     end
 
     module Repo
-      class << self
-        def read_manifest(path)
-          require 'rexml/document'
-          return unless (file = path + '.repo/manifest.xml').exist?
-
-          doc = REXML::Document.new(file.read)
-          doc.elements['manifest/include'].attributes['name']&.sub('.xml', '')
-        end
-      end
+      REPO_URL = 'https://storage.googleapis.com/git-repo-downloads/repo'
+      private_constant :REPO_URL
 
       attr_reader :manifest_url, :manifest
 
-      def repo(url, manifest = 'latest', run: nil, script: nil, args: nil, dev: nil, prod: nil,
+      def repo(url, manifest = 'latest', install: nil, run: nil, script: nil, args: nil, dev: nil, prod: nil,
                ref: @ref, group: @group)
         @home = if (val = env('REPO_HOME'))
                   path = Pathname.new(val)
@@ -7288,18 +8084,18 @@ module Squared
                       @root = nil unless path.directory?
                     elsif !@root.exist?
                       @root.mkpath
-                    elsif !repo_install?
-                      @root = nil unless repo_confirm
+                    elsif !repo_install? && !repo_confirm
+                      @root = nil
                     end
+                    raise_error Errno::EEXIST, path.cleanpath, hint: 'REPO_HOME' unless @root
                   end
-                  raise_error("path invalid: #{val}", hint: 'REPO_HOME') unless @root
                   path.realdirpath
                 elsif (val = env('REPO_ROOT'))
                   @root = Pathname.new(val).realdirpath
                   if !@root.exist?
                     @root.mkpath
-                  elsif !repo_install?(parent: true)
-                    raise_error("path does not exist: #{val}", hint: 'REPO_ROOT') unless repo_confirm
+                  elsif !repo_install?(parent: true) && !repo_confirm
+                    raise_error Errno::EEXIST, @root, hint: 'REPO_ROOT'
                   end
                   @root.join(main).realdirpath
                 elsif repo_install?(parent: true) && (!@home.exist? || @root + main == @home)
@@ -7314,9 +8110,13 @@ module Squared
         @manifest = manifest
         data = scriptobj
         if repo?
+          sc, ru = env('REPO_BUILD', '').split(',', 2).map!(&:strip)
           if script
-            if (val = env('REPO_BUILD'))
-              data[:script] = case val
+            data[:script] = if sc.to_s.empty?
+                              script
+                            else
+                              data[:env][:script] = true
+                              case sc
                               when 'verbose'
                                 @verbose = 1
                                 if script.is_a?(Array)
@@ -7330,20 +8130,23 @@ module Squared
                                 @warning = false
                                 script
                               else
-                                val
+                                sc
                               end
-              data[:env] = true
-            else
-              data[:script] = script
-            end
+                            end
             data[:args] = (val = env('REPO_SCRIPT')) ? shell_split(val, join: true) : args
-          elsif (val = env('REPO_BUILD'))
-            data[:run] = val
-            data[:env] = true
+            data[:global][:script] = true
           else
-            data[:run] = run
+            ru ||= sc
           end
-          data[:global] = true
+          if run
+            data[:run] = if ru.to_s.empty?
+                           run
+                         else
+                           data[:env][:run] = true
+                           ru
+                         end
+            data[:global][:run] = true
+          end
           data[:dev] = env_match 'REPO_DEV', dev
           data[:prod] = env_match 'REPO_PROD', prod
           if (val = env('REPO_GROUP'))
@@ -7361,13 +8164,13 @@ module Squared
           if script
             data[:script] = script
             data[:args] = args
-          else
-            data[:run] = run
           end
+          data[:run] = run if run
           data[:dev] = dev
           data[:prod] = prod
           script_set(data, group: group, ref: ref)
         end
+        @repo_bin = install.is_a?(String) ? @root + install : @root if install
         self
       end
 
@@ -7378,7 +8181,7 @@ module Squared
 
         namespace task_name('repo') do |ns|
           path = ns.scope.path
-          branch = env('REPO_MANIFEST') || Repo.read_manifest(root)
+          branch = env('REPO_MANIFEST') || repo_manifest
           target = branch || manifest
           stage = nil
           opts = %w[force rebase detach submodules fail no-update gc]
@@ -7397,7 +8200,7 @@ module Squared
             ns['sync'].invoke(*args.to_a)
             next if (n = env('REPO_STAGE')) == '1'
 
-            @project.select do |_, proj|
+            select do |proj|
               next unless proj.enabled?(proj.workspace.baseref) && proj.global
 
               proj.depend(sync: true) if proj.depend?
@@ -7405,7 +8208,7 @@ module Squared
 
               proj.build?
             end
-            .each_value do |proj|
+            .each do |proj|
               proj.build(sync: true)
               next if n == '3'
               next unless proj.copy? && (proj.dev? || n == '4')
@@ -7423,7 +8226,7 @@ module Squared
             args = args.to_a
             u = env('REPO_GIT') || manifest_url
             m = args.first && !opts.include?(args.first) ? args.shift : target
-            g = args.first && !opts.include?(args.first) ? args.shift : nil
+            g = (args.shift if args.first && !opts.include?(args.first))
             g = case (val = env('REPO_GROUPS'))
                 when '', NilClass
                   g
@@ -7487,29 +8290,58 @@ module Squared
         end
       end
 
+      def repo_manifest(path = root)
+        return unless (file = Pathname.new(path).join('.repo/manifest.xml')).exist?
+
+        require 'rexml/document'
+        doc = REXML::Document.new(file.read)
+        doc.elements['manifest/include'].attributes['name']&.sub('.xml', '')
+      end
+
       def repo_confirm
         return false unless root.directory?
 
-        path = sub_style(root, styles: theme[:inline])
-        @repo_override = Common::Prompt.confirm(
-          "#{log_title(:warn)} \"#{path}\" is not empty. Continue with installation?", 'N',
-          timeout: env('REPO_TIMEOUT').to_i.yield_self { |n| n > 0 ? n : 15 }
-        )
+        path = sub_style root, theme[:inline]
+        @repo_override = case env('REPO_Y')
+                         when '0', 'false'
+                           false
+                         when '1', 'true'
+                           true
+                         else
+                           Common::Prompt.confirm(
+                             "#{log_title(:warn)} \"#{path}\" is not empty. Continue with installation?", 'N',
+                             force: true, timeout: env('REPO_TIMEOUT').to_i.yield_self { |n| n > 0 ? n : 15 }
+                           )
+                         end
       end
 
       def repo_run(cmd, exception: false)
-        puts log_message(Logger::INFO, cmd, subject: main, hint: root) if verbose
+        puts log_message(cmd, subject: main, hint: root) if verbose
         Common::System.shell(cmd, chdir: root, exception: exception)
       end
 
       def repo_bin
-        Common::Shell.shell_bin('repo')
+        return Common::Shell.shell_bin('repo') unless @repo_bin
+
+        @repo_bin.join('repo').tap do |bin|
+          next if bin.file?
+
+          require 'open-uri'
+          puts log_message('Installing repo...', subject: main, hint: @repo_bin) if verbose
+          URI.open(REPO_URL) do |url|
+            @repo_bin.mkpath
+            File.open(bin, 'wb') do |f|
+              f.write(url.read)
+              f.chmod(0o755)
+            end
+          end
+        end
       end
 
       def repo_opts(*args)
         return args unless (n = ARGV.index('--'))
 
-        ARGV[(n + 1)..-1].concat(args)
+        ARGV[n.succ..-1].concat(args)
       end
 
       def repo?
@@ -7539,38 +8371,47 @@ module Squared
     module Project
       class Node < Git
         OPT_NPM = {
-          common: %w[dry-run=!? include-workspace-root=!? loglevel=b workspaces=!? w|workspace=v].freeze,
+          common: %w[dry-run=!? loglevel=b include-workspace-root=!? workspaces=!? w|workspace=v].freeze,
           install: %w[package-lock-only=!? prefer-dedupe=!? E|save-exact=!? before=q cpu=b libc=b os=b].freeze,
-          install_base: %w[audit=! bin-links=! foreground-scripts=!? fund=! ignore-scripts=!? install-links=!?
-                           package-lock=! strict-peer-deps=!? include=b install-strategy=b omit=b].freeze,
-          install_no: %w[audit bin-links fund package-lock].freeze,
-          install_as: %w[no-save B|save-bundle D|save-dev O|save-optional save-peer P|save-prod g|global=!?
-                         S|save=!?].freeze,
+          install_a: %w[audit=! bin-links=! foreground-scripts=!? fund=! ignore-scripts=!? install-links=!?
+                        package-lock=! strict-peer-deps=!? include=b install-strategy=b omit=b].freeze,
+          install_b: %w[no-save B|save-bundle D|save-dev O|save-optional save-peer P|save-prod g|global=!?
+                        S|save=!?].freeze,
           run: %w[foreground-scripts=!? if-present=!? ignore-scripts=!? script-shell=p].freeze,
           exec: %w[c|call=q package=b].freeze,
-          pack: %w[ignore-scripts=!? json=!? pack-destination=p].freeze
+          pack: %w[ignore-scripts=!? json=!? pack-destination=p].freeze,
+          rebuild: %w[bin-links=! foreground-scripts=!? global=!? ignore-scripts=!? install-links=!?].freeze,
+          no: {
+            install: %w[audit bin-links fund package-lock].freeze
+          }.freeze
         }.freeze
         OPT_PNPM = {
           common: %w[aggregate-output color ignore-workspace-root-check no-color stream use-stderr C|dir=p loglevel=b
                      r|recursive w|workspace-root].freeze,
-          cpu: %w[cpu=b libc=b os=b].freeze,
-          filter: %w[fail-if-no-match changed-files-ignore-pattern=q filter=q filter-prod=q test-pattern=q].freeze,
+          common_cpu: %w[cpu=b libc=b os=b].freeze,
+          common_filter: %w[fail-if-no-match changed-files-ignore-pattern=q filter=q filter-prod=q
+                            test-pattern=q].freeze,
           install: %w[fix-lockfile force ignore-pnpmfile ignore-workspace lockfile-only merge-git-branch-lockfiles
                       optimistic-repeat-install no-hoist no-lockfile no-optional prefer-frozen-lockfile resolution-only
                       shamefully-hoist side-effects-cache side-effects-cache-readonly s|silent strict-peer-dependencies
                       use-running-store-server use-store-server child-concurrency=i hoist-pattern=q lockfile-dir=p
                       modules-dir=p network-concurrency=i package-import-method=b public-hoist-pattern=q
                       reporter=b].freeze,
-          install_base: %w[dangerously-allow-all-builds global-dir ignore-scripts offline prefer-offline store-dir=p
-                           virtual-store-dir=p].freeze,
-          install_no: %w[frozen-lockfile verify-store-integrity].freeze,
-          install_as: %w[D|dev no-optional P|prod].freeze,
+          install_a: %w[dangerously-allow-all-builds global-dir ignore-scripts offline prefer-offline store-dir=p
+                        virtual-store-dir=p].freeze,
+          install_b: %w[D|dev no-optional P|prod].freeze,
+          add: %w[allow-build config g|global save-catalog D|save-dev O|save-optional save-peer P|save-prod
+                  save-catalog-name=b].freeze,
           update: %w[g|global i|interactive L|latest depth=i].freeze,
           dedupe: %w[check].freeze,
-          run: %w[if-present no-bail parallel report-summary reporter-hide-prefix resume-from
-                  sequential].freeze,
+          run: %w[if-present no-bail parallel report-summary reporter-hide-prefix resume-from sequential].freeze,
           exec: %w[no-reporter-hide-prefix parallel report-summary resume-from c|shell-mode].freeze,
-          pack: %w[json pack-destination=p pack-gzip-level=i].freeze
+          pack: %w[json pack-destination=p pack-gzip-level=i out=p workspace-concurrency=i].freeze,
+          rebuild: %w[filter=q].freeze,
+          no: {
+            install: %w[frozen-lockfile verify-store-integrity].freeze,
+            add: %w[save-exact save-workspace-protocol].freeze
+          }.freeze
         }.freeze
         OPT_YARN = {
           common: %w[check-files disable-pnp enable-pnp flat focus force frozen-lockfile json har ignore-engines
@@ -7581,22 +8422,59 @@ module Squared
                      network-timeout=i preferred-cache-folder=p production=b? proxy=q otp=b registry=q update-checksums
                      use-yarnrc=p].freeze,
           install: %w[A|audit g|global S|save D|save-dev E|save-exact P|save-peer O|save-optional T|save-tilde].freeze,
+          add: %w[A|audit D|dev E|exact O|optional P|peer T|tilde ignore-workspace-root-check].freeze,
           update: %w[A|audit C|caret E|exact L|latest T|tilde P|pattern=q S|scope=b].freeze,
           run: %w[scripts-prepend-node-path=b?].freeze
         }.freeze
         OPT_BERRY = {
           install: %w[check-cache check-resolutions immutable immutable-cache inline-builds json refresh-lockfile
                       mode=b].freeze,
-          update: %w[C|caret E|exact F|fixed interactive T|tilde R|recursive mode=b].freeze,
+          add: %w[cached D|dev json O|optional P|peer prefer-dev].freeze,
+          add_a: %w[C|caret E|exact F|fixed interactive T|tilde mode=b].freeze,
+          update: %w[R|recursive].freeze,
           dedupe: %w[check json mode=b strategy=b].freeze,
           run: %w[B|binaries-only inspect inspect-brk T|top-level require=q].freeze,
           pack: %w[n|dry-run install-if-needed json o|out=p].freeze
         }.freeze
-        private_constant :OPT_NPM, :OPT_PNPM, :OPT_YARN, :OPT_BERRY
+        OPT_TSC = {
+          base: %w[all b|build init listFilesOnly locale=b p|project=p showConfig w|watch].freeze,
+          compiler: %w[allowArbitraryExtensions=!? allowImportingTsExtensions=!? allowJs=!?
+                       allowSyntheticDefaultImports=!? allowUmdGlobalAccess=!? allowUnreachableCode=!?
+                       allowUnusedLabels=!? alwaysStrict=!? assumeChangesOnlyAffectDirectDependencies=!? baseUrl=p
+                       charset=b checkJs=!? composite=!? customConditions=q d|declaration=!? declarationDir=p
+                       declarationMap=!? diagnostics=!? disableReferencedProjectLoad=!? disableSizeLimit=!?
+                       disableSolutionSearching=!? downlevelIteration=!? emitBOM=!? emitDeclarationOnly=!?
+                       emitDecoratorMetadata=!? erasableSyntaxOnly=!? esModuleInterop=!? exactOptionalPropertyTypes=!?
+                       experimentalDecorators=!? explainFiles=!? extendedDiagnostics=!?
+                       forceConsistentCasingInFileNames=!? generateCpuProfile=b importHelpers=!?
+                       importsNotUsedAsValues=b incremental=!? inlineSourceMap=!? inlineSources=!?
+                       isolatedDeclarations=!? isolatedModules=!? jsx=b jsxFactory=q jsxFragmentFactory=q
+                       jsxImportSource=q keyofStringsOnly=!? lib=q libReplacement=!? listEmittedFiles=!? listFiles=!?
+                       mapRoot=p maxNodeModuleJsDepth=i m|module=b moduleDetection=b moduleResolution=b moduleSuffixes=b
+                       newLine=b noCheck=!? noEmit=!? noEmitHelpers=!? noEmitOnError=!? noErrorTruncation=!?
+                       noFallthroughCasesInSwitch=!? noImplicitAny=!? noImplicitOverride=!? noImplicitReturns=!?
+                       noImplicitThis=!? noImplicitUseStrict=!? noLib=!? noPropertyAccessFromIndexSignature=!?
+                       noResolve=!? noStrictGenericChecks=!? noUncheckedIndexedAccess=!? noUncheckedSideEffectImports=!?
+                       noUnusedLocals=!? noUnusedParameters=!? outDir=p outFile=p paths=q plugins=b
+                       preserveConstEnums=!? preserveSymlinks=!? preserveValueImports=!? preserveWatchOutput=!?
+                       pretty=!? reactNamespace=b removeComments=!? resolveJsonModule=!? resolvePackageJsonExports=!?
+                       resolvePackageJsonImports=!? rewriteRelativeImportExtensions=!? rootDir=p rootDirs=p
+                       skipDefaultLibCheck=!? skipLibCheck=!? sourceMap=!? sourceRoot=p stopBuildOnErrors=!? strict=!?
+                       strictBindCallApply=!? strictBuiltinIteratorReturn=!? strictFunctionTypes=!? strictNullChecks=!?
+                       strictPropertyInitialization=!? stripInternal=!? suppressExcessPropertyErrors=!?
+                       suppressImplicitAnyIndexErrors=!? t|target=b traceResolution=!? tsBuildInfoFile=p typeRoots=p
+                       types=b useDefineForClassFields=!? useUnknownInCatchVariables=!? verbatimModuleSyntax=!?].freeze,
+          build: %w[clean=!? dry=!? force=!? v|verbose=!?].freeze,
+          watch: %w[excludeDirectories=p excludeFiles=p fallbackPolling=b synchronousWatchDirectory=!? watchDirectory=b
+                    watchFile=b].freeze
+        }.freeze
+        PASS_NODE = {
+          tsc: %w[excludeDirectories excludeFiles customConditions lib moduleSuffixes plugins rootDirs typeRoots
+                  types].freeze
+        }.freeze
+        private_constant :OPT_NPM, :OPT_PNPM, :OPT_YARN, :OPT_BERRY, :OPT_TSC, :PASS_NODE
 
         class << self
-          def populate(*); end
-
           def tasks
             %i[outdated update publish].freeze
           end
@@ -7625,10 +8503,11 @@ module Squared
         end
 
         subtasks({
-          'package' => %i[install dedupe update].freeze,
+          'package' => %i[install add update dedupe rebuild reinstall].freeze,
           'outdated' => %i[major minor patch].freeze,
           'bump' => %i[version major minor patch].freeze,
           'publish' => %i[latest tag].freeze,
+          'tsc' => %i[project build].freeze,
           'add' => nil,
           'run' => nil,
           'exec' => nil,
@@ -7636,7 +8515,7 @@ module Squared
           'pack' => nil
         })
 
-        def initialize(*, init: nil, asdf: 'nodejs', **kwargs)
+        def initialize(*, init: nil, ts: 'tsconfig.json', asdf: 'nodejs', **kwargs)
           super
           if @pass.include?(Node.ref)
             initialize_ref Node.ref
@@ -7645,7 +8524,9 @@ module Squared
             initialize_build(Node.ref, prod: prod?, **kwargs)
             initialize_env(**kwargs)
           end
-          @dependfile = basepath 'package.json'
+          @dependname = 'package.json'
+          dependfile_set [@dependname]
+          @tsfile = basepath! ts
           @pm = { __: init }
         end
 
@@ -7664,18 +8545,17 @@ module Squared
               if flags.nil?
                 case action
                 when 'add'
-                  format_desc action, nil, 'save?=prod|dev|optional|peer,name+'
+                  format_desc action, nil, 'save?=[=-]prod|dev|optional|peer|bundle,(-)name+'
                   task action, [:save] do |_, args|
-                    packages = if args.save =~ /\A(=)?(prod|dev|optional|peer)\z/
-                                 exact = !$1.nil?
-                                 save = $2
+                    packages = if args.save =~ /\A([=-]*)?(prod|dev|optional|peer|bundle)\z/
+                                 save = [$2, $1.include?('='), $1.include?('-')]
                                  args.extras
                                else
                                  save = 'prod'
                                  args.to_a
                                end
                     param_guard(action, 'name', args: packages)
-                    depend(:add, packages: packages, save: save, exact: exact)
+                    depend(:add, packages: packages, save: save)
                   end
                 when 'run'
                   next if scripts.empty?
@@ -7690,13 +8570,12 @@ module Squared
                       opts = []
                       args.each do |val|
                         if (n, extra = indexitem(val))
-                          if (item = list[n - 1])
+                          if (item = list[n.pred])
                             run compose([item.first, extra].compact.join(' '), script: true)
                           elsif exception
                             indexerror n, list
                           else
-                            log.warn "run script #{n} of #{list.size} (out of range)"
-                            next
+                            next log.warn "run script #{n} of #{list.size} (out of range)"
                           end
                         else
                           opts << val
@@ -7707,13 +8586,13 @@ module Squared
                       list = if (yarn = dependtype(:yarn)) > 0
                                yarn == 1 ? OPT_YARN[:run] + OPT_YARN[:common] : OPT_BERRY[:run]
                              elsif pnpm?
-                               OPT_PNPM[:run] + OPT_PNPM[:filter] + OPT_PNPM[:common]
+                               pnpmopts :run, :common_filter
                              else
-                               OPT_NPM[:run] + OPT_NPM[:common]
+                               npmopts :run
                              end
-                      op = OptionPartition.new(opts, list, session(dependbin, 'run'), project: self)
-                      op << op.extras.shift
-                      op.append(delim: true, quote: false)
+                      OptionPartition.new(opts, list, session(dependbin, 'run'), project: self)
+                                     .add_first
+                                     .append(delim: true, quote: false)
                       run(from: :run)
                     end
                   end
@@ -7722,14 +8601,14 @@ module Squared
                   task action, [:package] do |_, args|
                     if (package = args.package)
                       args = args.extras
-                      if pnpm?
-                        pre = ->(ch) { "-#{ch}" if (ch = args.delete(ch)) }
-                        cmd = session 'pnpm', pre.call('r'), pre.call('c'), 'exec'
-                        list = OPT_PNPM[:exec] + OPT_PNPM[:filter] + OPT_PNPM[:common]
-                      else
-                        cmd = session 'npm', 'exec'
-                        list = OPT_NPM[:exec] + OPT_NPM[:common]
-                      end
+                      cmd = if pnpm?
+                              pre = ->(ch) { "-#{ch}" if args.delete(ch) }
+                              list = pnpmopts :exec, :common_filter
+                              session 'pnpm', pre.call('r'), pre.call('c'), 'exec'
+                            else
+                              list = npmopts :exec
+                              session 'npm', 'exec'
+                            end
                       op = OptionPartition.new(args, list, cmd, project: self)
                       if op.empty?
                         op << package
@@ -7768,16 +8647,22 @@ module Squared
                   flags.each do |flag|
                     case action
                     when 'outdated'
-                      format_desc(action, flag, %w[update interactive dry-run], arg: 'opts?')
+                      format_desc action, flag, "#{shortname('i', 's', 'u', 'd')},diff"
                       task flag do |_, args|
                         outdated flag, args.to_a
                       end
                     when 'package'
-                      format_desc(action, flag, 'opts*', after: flag == :dedupe ? nil : 'name*')
+                      format_desc(action, flag, 'opts*', before: case flag
+                                                                 when :dedupe, :rebuild then nil
+                                                                 when :reinstall then 'force?'
+                                                                 else 'name*'
+                                                                 end)
                       task flag do |_, args|
                         package flag, args.to_a
                       end
                     when 'bump'
+                      break unless version
+
                       if flag == :version
                         format_desc action, flag, 'version'
                         task flag, [:version] do |_, args|
@@ -7791,21 +8676,37 @@ module Squared
                         end
                       end
                     when 'publish'
-                      format_desc(action, flag, 'otp?,dry-run?,public|restricted?', before: flag == :tag ? 'tag' : nil)
+                      format_desc(action, flag, 'otp?,p/ublic|r/estricted?,d/ry-run?', before: ('tag' if flag == :tag))
                       task flag do |_, args|
                         args = args.to_a
-                        dryrun = true if args.delete('dry-run') || args.delete('d')
-                        if args.delete('public') || args.delete('p')
-                          access = 'public'
-                        elsif args.delete('restricted') || args.delete('r')
-                          access = 'restricted'
-                        end
+                        access = if has_value!(args, 'r', 'restricted')
+                                   'restricted'
+                                 elsif has_value!(args, 'p', 'public')
+                                   'public'
+                                 end
+                        dryrun = has_value!(args, 'd', 'dry-run')
                         if flag == :latest
                           otp = args.first
                         else
                           tag, otp = param_guard(action, flag, args: args)
                         end
-                        publish(flag, otp: otp, tag: tag, dryrun: dryrun, access: access)
+                        publish(flag, otp: otp, tag: tag, access: access, dryrun: dryrun)
+                      end
+                    when 'tsc'
+                      break unless @tsfile
+
+                      format_desc(action, flag, 'opts*', "#{flag == :project ? 'before' : 'after'}": 'config?')
+                      task flag do |_, args|
+                        args = args.to_a
+                        if flag == :project
+                          project = if exist?(args.first)
+                                      args.shift
+                                    else
+                                      @tsfile
+                                    end
+                        end
+                        watch = has_value!(args, 'w', 'watch')
+                        tsc(*args, banner: true, project: project, build: flag == :build, watch: !watch.nil?)
                       end
                     end
                   end
@@ -7845,7 +8746,7 @@ module Squared
           return if items.empty?
 
           on :first, :copy
-          print_item unless @output[0] || !verbose || task_invoked?(/^copy(?::#{Node.ref}|$)/)
+          print_item unless @output[0] || silent? || task_invoked?(/^copy(?::#{Node.ref}|$)/)
           packed = false
           items.each do |dir|
             case dir
@@ -7853,16 +8754,16 @@ module Squared
               dest = dir
               @workspace.rev_clear(dest, sync: sync)
             when String
-              dest = @workspace.root + dir
+              dest = @workspace.rootpath(dir)
               @workspace.rev_clear(dest, sync: sync)
             when Symbol
-              if (proj = @workspace.find(name: dir))
-                @workspace.rev_clear(proj.name, sync: sync)
-                dest = proj.path
-              else
-                log.warn message("copy project :#{dir}", hint: 'not found')
-                dest = nil
-              end
+              dest = if (proj = @workspace.find(name: dir))
+                       @workspace.rev_clear(proj.name, sync: sync)
+                       proj.path
+                     else
+                       log.warn message("copy project :#{dir}", hint: 'missing')
+                       nil
+                     end
             when Hash
               from = dir[:from] if dir.key?(:from)
               into = dir[:into] if dir.key?(:into)
@@ -7880,7 +8781,7 @@ module Squared
               dest = dir.path
               @workspace.rev_clear(dir.name, sync: sync)
             else
-              raise_error "copy: given #{dir}"
+              raise_error TypeError, "unknown: #{dir}", hint: 'copy'
             end
             next unless from && dest&.directory?
 
@@ -7892,25 +8793,24 @@ module Squared
                     Open3.capture2e(session_output('npm', 'pack --dry-run --no-color', npmname).to_s)
                          .first
                          .scan(/^npm notice \d+(?:\.\d+)?[a-z]+ (.+)$/i)
-                         .map { |item| Pathname.new(item.first) }
+                         .map! { |item| Pathname.new(item.first) }
                          .select(&:exist?)
-                  end
-                  .concat(Array(files))
+                  end.concat(Array(files))
                   packed = true
                 end
-                to = dest.join(into, npmname)
-                to.mkpath
-                log.info "cp npm:#{npmname} #{to}"
+                base = dest.join(into, npmname)
+                base.mkpath
+                log.info "cp npm:#{npmname} #{base}"
                 subdir = []
                 errors = 0
                 files.each do |file|
                   s, d = file.is_a?(Array) ? file : [file, file]
-                  dest = to + d
+                  dest = base + d
                   unless subdir.include?((target = dest.dirname).to_s)
                     target.mkpath
                     subdir << target.to_s
                   end
-                  FileUtils.cp(basepath(s), dest, verbose: verbosetype > 0)
+                  FileUtils.cp(basepath(s), dest, verbose: !silent?)
                 rescue StandardError => e
                   print_error e
                   errors += 1
@@ -7918,7 +8818,7 @@ module Squared
               rescue StandardError => e
                 on_error e, :copy
               else
-                puts message(to, subdir.size, files.size - errors) if verbose
+                puts message(base, subdir.size, files.size - errors) unless silent?
               end
               next
             end
@@ -7931,20 +8831,19 @@ module Squared
 
                 sub = if (proj = @workspace.find(entry))
                         proj.packagename
-                      elsif (file = entry + 'package.json').exist?
+                      elsif (file = entry + dependname).exist?
                         begin
                           doc = JSON.parse(file.read)
+                          doc['name']
                         rescue StandardError => e
                           log.error e
                           raise if exception
-                        else
-                          doc['name']
                         end
                       end
                 if sub
                   target << [entry, dest.join(into, sub)]
                 else
-                  log.debug message("package.json in \"#{entry}\"", hint: 'not found')
+                  log.debug message("#{dependname} in \"#{entry}\"", hint: 'missing')
                 end
               end
             else
@@ -7952,7 +8851,7 @@ module Squared
             end
             target.each do |src, to|
               glob.each { |val| log.info "cp #{from + val} #{to}" }
-              copy_dir(src, to, glob, create: create, link: link, force: force, pass: pass, verbose: verbosetype > 0)
+              copy_dir(src, to, glob, create: create, link: link, force: force, pass: pass, verbose: !silent?)
             rescue StandardError => e
               on_error e, :copy
             end
@@ -7960,88 +8859,160 @@ module Squared
           on :last, :copy
         end
 
-        def depend(flag = nil, *, sync: invoked_sync?('depend', flag), packages: [], save: nil, exact: nil, **)
+        def depend(flag = nil, *, sync: invoked_sync?('depend', flag), packages: [], save: nil, exact: nil,
+                   omit: env('NPM_OMIT'), **)
           if @depend && !flag
             super
           elsif outdated?
             workspace.rev_clear(name, sync: sync)
             return update if !flag && env('NODE_UPDATE')
 
+            add = flag == :add
+            if add
+              remove, packages = packages.partition { |val| val.delete_prefix!('-') }
+              remove.quote!
+            end
+            save, exact, omit = save if save.is_a?(Array)
+            ws = env('NODE_WORKSPACES', equals: '0')
+            om = lambda do |cmd|
+              if omit
+                save = case save
+                       when 'peer'
+                         'optional'
+                       when 'optional'
+                         'dev'
+                       when 'dev'
+                         'prod'
+                       end
+              end
+              return unless save && save != 'bundle'
+
+              cmd << "--#{save}"
+            end
+            rm = lambda do |target|
+              return if remove.empty?
+
+              run(target.temp(*remove).sub!(/ (?:add|install) /, ' remove '), from: :remove, sync: sync)
+            end
             if (yarn = dependtype(:yarn)) > 0
-              cmd = session 'yarn'
-              if flag == :add
-                cmd << 'add'
-                cmd << "--#{save}" unless save == 'prod'
-                cmd << '--exact' if exact
+              cmd = session('yarn', flag || 'install')
+              append_loglevel
+              if yarn == 1
+                cmd << '--ignore-engines' unless option('ignore-engines', equals: '0')
+                cmd << '--ignore-scripts' if option('ignore-scripts')
+                cmd << '--force' if option('force')
               else
-                cmd << 'install'
-                cmd << '--ignore-engines' if yarn == 1 && !option('ignore-engines', equals: '0')
+                cmd << '--mode=skip-build' if option('ignore-scripts')
+                cmd << '--check-cache' if !flag && option('force')
+              end
+              if nolockfile?('yarn')
+                cmd << '--no-lockfile'
+              elsif option('ci')
+                if yarn == 1
+                  cmd << '--frozen-lockfile'
+                elsif !flag
+                  cmd << '--immutable' << '--refresh-lockfile'
+                end
+              end
+              if add
+                cmd << '-W' if yarn == 1 && !option('w', 'ignore-workspace-root-check', equals: '0')
+                rm.call(cmd)
+                om.call(cmd)
+                cmd << '--exact' if exact
               end
             elsif pnpm?
-              cmd = session 'pnpm'
-              if flag == :add
-                cmd << 'add' << "--save-#{save}"
+              cmd = session('pnpm', flag || 'install')
+              append_nocolor
+              append_loglevel
+              if add
+                om.call(cmd)
+                rm.call(cmd)
                 cmd << '--save-exact' if exact
                 option('allow-build') { |val| cmd << quote_option('allow-build', val) }
               else
-                cmd << 'install'
                 append_platform
               end
               option('public-hoist-pattern') do |val|
-                split_escape(val).each { |opt| cmd << shell_option('public-hoist-pattern', opt) }
+                split_escape(val) { |opt| cmd << shell_option('public-hoist-pattern', opt) }
               end
-              cmd << '--ignore-workspace' if env('NODE_WORKSPACES', equals: '0')
+              cmd << '--ignore-workspace' if ws
+              cmd << if option('force')
+                       '--force'
+                     elsif nolockfile?('pnpm')
+                       '--no-lockfile'
+                     elsif option('ci')
+                       '--frozen-lockfile'
+                     end
+              cmd << '--ignore-scripts' if option('ignore-scripts')
               cmd << '--dangerously-allow-all-builds' if option('approve-builds')
-              append_nocolor
             else
-              cmd = session 'npm', 'install'
-              if flag == :add
-                cmd << "--save-#{save}"
-                cmd << '--save-exact' if exact
-              else
-                append_platform
-              end
-              cmd << '--workspaces=false' if env('NODE_WORKSPACES', equals: '0')
-              cmd << '--package-lock=false' if option('package-lock', equals: '0')
+              cmd = session 'npm'
+              cmd << (ci = option('ci') ? 'ci' : 'install')
+              cmd << '--workspaces=false' if ws
               append_nocolor
+              append_loglevel
+              if omit
+                cmd << "--omit=#{save || omit}"
+                save = nil
+              end
+              unless ci
+                if add
+                  cmd << "--save-#{save}" if save
+                  rm.call(cmd)
+                  cmd << '--save-exact' if exact
+                else
+                  append_platform
+                end
+              end
+              cmd << '--package-lock=false' << 'save=false' if nolockfile?('npm')
+              cmd << '--ignore-scripts' if option('ignore-scripts')
             end
-            append_loglevel
-            cmd.merge(packages.map { |pkg| shell_quote(pkg) }) if flag == :add
+            if add
+              return if packages.empty?
+
+              cmd.merge(packages.quote!)
+            end
             run(from: flag || :depend, sync: sync)
           end
         end
 
         def outdated(flag = nil, opts = [], sync: invoked_sync?('outdated', flag))
-          dryrun = opts.include?('dry-run') || opts.include?('d')
-          if pnpm?
-            cmd = session 'pnpm', 'outdated'
-            dryrun ||= dryrun?('pnpm')
-          else
-            cmd = session 'npm', 'outdated'
-            dryrun ||= dryrun?('npm')
-          end
+          cmd = session(pnpm? ? 'pnpm' : 'npm', 'outdated')
+          dryrun = has_value?(opts, 'd', 'dry-run') || dryrun?
           unless dryrun
             log.info cmd.to_s
             on :first, :outdated
           end
-          banner = format_banner(cmd.temp(dryrun ? '--dry-run' : nil))
+          banner = format_banner(cmd.temp(('--dry-run' if dryrun)))
           print_item banner if sync
           begin
-            data = pwd_set(dryrun: dryrun) { `#{cmd.temp('--json', '--loglevel=error')}` }
+            data = pwd_set(dryrun: dryrun) { `#{cmd.temp('--json --loglevel=error')}` }
             doc = dependfile.read
             json = JSON.parse(doc)
-          rescue StandardError => e
-            on_error(e, :outdated, dryrun: dryrun)
-            return
-          else
             dep1 = json['dependencies'] || {}
             dep2 = json['devDependencies'] || {}
             target = json['name']
+          rescue StandardError => e
+            on_error(e, :outdated, dryrun: dryrun)
+            return
           end
           found = []
           avail = []
-          rev = flag || (prod? ? :patch : :minor)
-          inter = opts.include?('interactive') || opts.include?('i')
+          flag ||= case (up = option('u', 'update'))
+                   when 'major', 'minor'
+                     up.to_sym
+                   else
+                     prod? ? :patch : :minor
+                   end
+          if sync && !stdin?
+            items = if has_value?(opts, 's', 'select')
+                      se = true
+                      []
+                    elsif has_value?(opts, 'i', 'interactive')
+                      ia = true
+                      []
+                    end
+          end
           unless data.empty?
             JSON.parse(data).each_pair do |key, val|
               val = val.find { |obj| obj['dependent'] == target } if val.is_a?(Array)
@@ -8051,7 +9022,7 @@ module Squared
               ch = file[0]
               if ch.match?(/[~^]/)
                 file = file[1..-1]
-              elsif inter && rev == :major
+              elsif ia && flag == :major
                 major = true
               else
                 avail << [key, file, latest, true]
@@ -8060,7 +9031,7 @@ module Squared
               current = val['current'] || file
               want = val['wanted']
               unless latest[SEM_VER, 6]
-                case rev
+                case flag
                 when :major
                   want = latest
                 when :minor
@@ -8079,14 +9050,14 @@ module Squared
               b = f[2]
               c = w[0]
               d = w[2]
-              case rev
-              when :major
-                upgrade = a == '0' ? c == '0' || c == '1' : true
-              when :minor
-                upgrade = ch == '^' && (a == '0' ? c == '0' && b == d : a == c)
-              when :patch
-                upgrade = a == c && b == d && f[4] != w[4]
-              end
+              upgrade = case flag
+                        when :major
+                          a == '0' ? c == '0' || c == '1' : true
+                        when :minor
+                          ch == '^' && (a == '0' ? c == '0' && b == d : a == c)
+                        when :patch
+                          a == c && b == d && f[4] != w[4]
+                        end
               if upgrade && !w[5]
                 next if file == want
 
@@ -8104,13 +9075,10 @@ module Squared
           end
           pending = 0
           modified = 0
-          size_col = ->(items, i) { items.map { |a| a[i] }.max_by(&:size).size }
-          pad_ord = lambda do |val, ord|
-            ret = val.succ.to_s
-            ord.size > 9 ? ret.rjust(ord.size.to_s.size) : ret
-          end
+          width = ->(a, i) { a.map { |aa| aa[i] }.max_by(&:size).size }
+          pad = ->(val, ord) { val.succ.to_s.rjust([ord.size.to_s.size, 2].max) }
           footer = lambda do |val, size|
-            next unless verbose
+            return unless verbose
 
             msg, hint = if modified == -1
                           ['Packages were updated', 'more possible']
@@ -8122,70 +9090,118 @@ module Squared
           end
           print_item banner unless sync
           if !found.empty?
-            col1 = size_col.call(found, 0) + 4
-            col2 = size_col.call(found, 1) + 4
+            col1 = width.call(found, 0) + 4
+            col2 = width.call(found, 1) + 4
+            col3 = pad.call(found.size, found).size + 2 + col1 + col2 + width.call(found, 2)
+            packages = []
+            pat = ->(a) { /("#{Regexp.escape(a[0])}"\s*:\s*)"([~^])#{'?' if a[4]}#{Regexp.escape(a[1])}"/ }
+            edit = lambda do |a, pkg, mod|
+              packages << a[0]
+              modified += 1
+              "#{pkg}\"#{mod || (a[3] == 1 && a[4] ? '^' : '')}#{a[2]}\""
+            end
             found.each_with_index do |item, i|
               a, b, c, d, e = item
-              f = inter && (rev != :major || e || semmajor?(item[5], item[6]))
-              if f && !confirm_outdated(a, c, (d / 2.0).ceil, b, lock: e, col1: col1)
-                cur = -1
-              else
-                cur = modified
-                doc.sub!(/("#{Regexp.escape(a)}"\s*:\s*)"([~^])#{e ? '?' : ''}#{Regexp.escape(b)}"/) do |capture|
-                  if $2 == '~' && rev != :patch
-                    cur = -1
-                    pending += 1
-                    capture
-                  else
-                    modified += 1
-                    "#{$1}\"#{$2 || (d == 1 && e ? '^' : '')}#{c}\""
-                  end
+              cur = modified
+              doc.send(items ? :sub : :sub!, pat.call(item)) do |capture|
+                if $2 == '~' && flag != :patch
+                  cur = -1
+                  pending += 1
+                  capture
+                else
+                  edit.call(item, $1, $2)
                 end
               end
               a = a.ljust(col1)
               b = b.ljust(col2)
-              b = sub_style(b, styles: theme[:current]) if theme[:current]
-              c = if cur == -1
-                    'SKIP'
-                  elsif modified == cur
-                    'FAIL'
-                  elsif d == 1
-                    a = sub_style(a, styles: theme[:major])
-                    sub_style(c, :bold, styles: color(:green))
-                  else
-                    sub_style(c, pat: SEM_VER, styles: color(d == 3 ? :green : :yellow), index: d)
-                  end
-              puts "#{pad_ord.call(i, found)}. #{a + b + c}"
+              sub_style! b, theme[:current] if theme[:current] && !stdin?
+              if cur == -1
+                c = 'SKIP'
+              elsif modified == cur
+                c = 'FAIL'
+              elsif !stdin?
+                if d == 1
+                  sub_style! a, theme[:major]
+                  sub_style! c, :bold, color(:green)
+                else
+                  sub_style!(c, **opt_style(color(d == 3 ? :green : :yellow), SEM_VER, d))
+                end
+                g = item
+              end
+              s = "#{pad.call(i, found)}. #{a}#{b}#{c}"
+              if se
+                items << [s, g]
+                next
+              elsif ia && g
+                items << [g]
+                if flag != :major || e || semmajor?(item[5], item[6])
+                  items.pop unless confirm_semver(s.ljust(col3 + s.size - s.stripstyle.size), (d / 2.0).ceil)
+                  next
+                end
+              end
+              puts s
             end
             pending = avail.reduce(pending) { |a, b| a + (b[3] ? 0 : 1) }
-            if dryrun || (modified == 0 && pending > 0)
-              footer.call(modified, found.size)
+            if (dryrun && Array(items).empty?) || (modified == 0 && (pending > 0 || (items && pending == 0)))
+              n = if items
+                    if items.empty?
+                      puts 'No updates were selected'
+                      0
+                    else
+                      puts items.map(&:first) if se
+                      items.size
+                    end
+                  else
+                    found.size
+                  end
+              footer.call(modified, n) unless n == 0
             elsif modified > 0
-              modified = -1
-              File.write(dependfile, doc)
-              if opts.include?('update') || opts.include?('u') || option('update')
-                update
-              else
-                footer.call(0, found.size)
+              if items
+                packages.clear
+                if ia
+                  (1..items.size)
+                else
+                  choice('Select a package', items.map(&:first), multiple: true, force: false, index: true,
+                                                                 border: true)
+                end.each do |n|
+                  item = items[n.pred].last
+                  doc.sub!(pat.call(item)) { edit.call(item, $1, $2) }
+                end
               end
-              printsucc
-              commit(:add, ['package.json'], pass: true)
+              unless packages.empty?
+                modified = -1
+                if dryrun
+                  footer.call(0, found.size)
+                else
+                  File.write(dependfile, doc)
+                  if sync && (opts.include?('diff') || option('diff'))
+                    run(git_output('diff', shell_quote(dependfile)), banner: false)
+                  end
+                  if has_value?(opts, 'u', 'update') || up
+                    package(:update, packages: packages, from: :'outdated:update')
+                  else
+                    footer.call(0, found.size)
+                  end
+                  printsucc
+                  commit(:add, [dependname], pass: true)
+                end
+              end
             end
           elsif !avail.empty?
-            col1 = size_col.call(avail, 0) + 4
-            col2 = size_col.call(avail, 1)
-            col3 = size_col.call(avail, 2) + 4
+            col1 = width.call(avail, 0) + 4
+            col2 = width.call(avail, 1)
+            col3 = width.call(avail, 2) + 4
             avail.each_with_index do |item, i|
               a, b, c, d = item
               a = a.ljust(col1)
-              b = sub_style(b.ljust(col2), styles: color(d ? :red : :yellow))
+              b = sub_style b.ljust(col2), color(d ? :red : :yellow)
               c = c.ljust(col3)
               unless d
-                a = sub_style(a, styles: theme[:active])
-                c = sub_style(c, styles: color(:green))
+                sub_style! a, theme[:active]
+                sub_style! c, color(:green)
                 pending += 1
               end
-              puts "#{pad_ord.call(i, avail)}. #{a + c + b} (#{d ? 'locked' : 'latest'})"
+              puts "#{pad.call(i, avail)}. #{(a + c + b).subhint(d ? 'locked' : 'latest')}"
             end
             footer.call(0, avail.size)
           else
@@ -8199,10 +9215,17 @@ module Squared
         end
 
         def publish(flag = nil, *, sync: invoked_sync?('publish', flag), otp: nil, tag: nil, access: nil, dryrun: nil)
-          unless version && !read_packagemanager(:private)
-            print_error('invalid task "publish"', subject: name, hint: version ? 'private' : nil)
+          if read_package('private')
+            ws = children.select { |proj| proj.ref?(Node.ref) }
+            if ws.empty?
+              print_error('nothing to publish', subject: name, hint: 'private')
+            elsif confirm_basic('Publish workspace?', ws.map(&:name).join(', '), 'N')
+              ws.each { |proj| proj.publish(flag, sync: sync, otp: otp, tag: tag, access: access, dryrun: dryrun) }
+            end
             return
           end
+          return print_error('version not found', subject: name, hint: dependname) unless version
+
           cmd = session 'npm', 'publish'
           cmd << basic_option('otp', otp) if otp ||= option('otp')
           cmd << basic_option('tag', tag.tr(' ', '-')) if tag ||= option('tag')
@@ -8216,134 +9239,189 @@ module Squared
           if dryrun
             cmd << '--dry-run'
           else
-            from = :publish
+            from = :'npm:publish'
             log.info cmd.to_s
           end
           if sync
-            run(sync: sync, from: from, interactive: !dryrun && "Publish #{sub_style(npmname, styles: theme[:active])}")
+            run(sync: sync, from: from, interactive: !dryrun && ['Publish', 'N', npmname])
           else
             require 'open3'
             on :first, from
             pwd_set(from: from, dryrun: dryrun) do
-              cmd = session_done cmd
-              Open3.popen2e(cmd) do |_, out|
+              Open3.popen2e(cmd = session_done(cmd)) do |_, out|
                 write_lines(out, banner: format_banner(cmd),
-                                 sub: npmnotice + [pat: /^(.+)(Tarball .+)$/, styles: color(:bright_blue), index: 2])
+                                 sub: npmnotice(opt_style(color(:bright_blue), /^(.+)(Tarball .+)$/, 2)))
               end
             end
             on :last, from
           end
         end
 
-        def package(flag, opts = [], from: nil)
+        def package(flag, opts = [], packages: [], from: nil)
           workspace.rev_clear(name)
-          if (yarn = dependtype(:yarn)) > 0
-            cmd = session 'yarn', if flag == :update
-                                    yarn == 1 ? 'upgrade' : 'up'
+          yarn = dependtype(:yarn)
+          if yarn > 0 && !(yarn == 1 && ((flag == :update && !packages.empty?) || flag == :rebuild))
+            cmd = session 'yarn', case flag
+                                  when :update
+                                    if yarn == 1
+                                      'upgrade'
+                                    else
+                                      spec = 0
+                                      'up'
+                                    end
+                                  when :reinstall
+                                    if yarn == 1
+                                      remove_modules 'yarn' if opts.include?('force')
+                                    elsif opts.delete('force')
+                                      opts << 'check-cache'
+                                    end
+                                    opts << 'no-lockfile' if lockfile(true)
+                                    'install'
+                                  when :add
+                                    spec = 1
+                                    'add'
                                   else
                                     yarn == 1 && flag == :dedupe ? 'install' : flag
                                   end
             op = OptionPartition.new(opts, if yarn == 1
                                              OPT_YARN.fetch(flag == :dedupe ? :install : flag, []) + OPT_YARN[:common]
                                            else
-                                             OPT_BERRY[flag]
+                                             OPT_BERRY.fetch(flag, []) + case flag
+                                                                         when :add, :update then OPT_BERRY[:add_a]
+                                                                         else []
+                                                                         end
                                            end, cmd, project: self)
-            op << '--ignore-engines' if yarn == 1 && !option('ignore-engines', equals: '0')
-            op.clear
-            append_loglevel
-          else
-            if pnpm?
-              cmd = session 'pnpm', flag
-              list = OPT_PNPM[:install_base] + OPT_PNPM.fetch(flag, []) + OPT_PNPM[:common]
-              list.concat(OPT_PNPM[:install_as] + OPT_PNPM[:filter]) unless flag == :dedupe
-              list.concat(OPT_PNPM[:cpu]) unless flag == :update
-              no = OPT_PNPM[:"#{flag}_no"]
-            else
-              cmd = session 'npm', flag
-              list = OPT_NPM[:install_base] + OPT_NPM.fetch(flag, []) + OPT_NPM[:common]
-              list.concat(OPT_NPM[:install_as]) if flag == :install || flag == :update
-              no = OPT_NPM[:install_no]
+            if yarn == 1 && flag != :reinstall
+              op << '--no-lockfile' if nolockfile?('yarn')
+              op << '--ignore-engines' unless option('ignore-engines', equals: '0')
             end
-            op = OptionPartition.new(opts, list, cmd, no: no, project: self)
+          else
+            args = if pnpm?
+                     case flag
+                     when :install, :update
+                       opts << 'no-lockfile' if nolockfile?('pnpm')
+                       spec = 0 if flag == :update
+                     when :add
+                       spec = 1
+                     when :reinstall
+                       opts << 'force'
+                       flag = :install
+                     end
+                     flags = [flag]
+                     unless flag == :rebuild
+                       flags << :install_a
+                       no = OPT_PNPM[:no][flag]
+                     end
+                     [
+                       opts,
+                       flags.yield_self do |out|
+                         unless flag == :dedupe
+                           out << :common_filter
+                           unless flag == :add
+                             out << :install_b
+                             out << :common_cpu unless flag == :update
+                           end
+                         end
+                         pnpmopts(*out)
+                       end,
+                       session('pnpm', flag)
+                     ]
+                   else
+                     case flag
+                     when :install, :update
+                       opts.unshift('package-lock=false', 'save=false') if nolockfile?('npm')
+                       spec = flag == :install ? 0 : 2
+                     when :add
+                       spec = 1
+                       flag = :install
+                     when :reinstall
+                       remove_modules 'npm' if opts.delete('force')
+                       opts.unshift('package-lock=false') if lockfile(true)
+                       flag = :install
+                     end
+                     flags = [flag]
+                     unless flag == :rebuild
+                       flags << :install_a
+                       unless flag == :dedupe
+                         %w[save ignore-scripts strict-peer-deps].each do |key|
+                           option(key, prefix: 'npm', ignore: false) do |val|
+                             opts << case val
+                                     when '0', 'false'
+                                       "#{key}=false"
+                                     else
+                                       "#{key}=true"
+                                     end
+                           end
+                         end
+                         flags << :install_b
+                       end
+                       no = OPT_NPM[:no][:install]
+                     end
+                     [
+                       opts,
+                       npmopts(*flags),
+                       session('npm', flag)
+                     ]
+                   end
+            op = OptionPartition.new(*args, no: no, project: self)
+            append_platform if flag == :install
+            append_nocolor
+          end
+          append_loglevel
+          case spec
+          when Numeric
             op.each do |opt|
               if opt =~ op.values
                 case $1
                 when 'w', 'workspace'
-                  op << ($2.match?(%r{[\\/]}) ? quote_option($1, basepath($2)) : shell_option($1, $2))
+                  op << quotepath($1, $2)
                 end
-              elsif opt.include?('=')
+              elsif opt.match?(/^-|=/)
                 op.errors << opt
               else
-                op.found << opt
+                op.found << (spec == 2 && (n = opt.index('@')) ? opt[0, n] : opt)
               end
             end
             op.swap
-            append_platform if flag == :install
-            append_nocolor
-            append_loglevel
-            if flag == :dedupe || pnpm?
-              op.clear
-            else
-              op.append(quote: true)
-            end
+              .concat(packages)
+            raise_error ArgumentError, 'no packages to add' if op.empty? && spec == 1
+            op.append(quote: true)
+              .clear(errors: true)
+          else
+            op.clear
           end
-          op.clear(errors: true)
           run(from: from || :"package:#{flag}")
         end
 
         def bump(flag, val = nil)
-          return unless (cur = version)
+          return unless val ||= sembump(version, flag)
 
-          if flag == :version
-            return unless val
+          doc = dependfile.read
+          if doc.sub!(/"version"\s*:\s*"#{version}"/, "\"version\": \"#{val}\"")
+            unless dryrun?
+              log.info "bump version #{version} to #{val.subhint(flag)}"
+              on :first, :bump
+              dependfile.write(doc)
+            end
+            if stdin?
+              puts val
+            elsif !silent?
+              major = flag == :major
+              emphasize("version: #{val}", title: name, border: borderstyle, sub: [
+                headerstyle,
+                opt_style(color(major ? :green : :yellow), /\A(version:)( )(\S+)(.*)\z/, 3),
+                opt_style(theme[major ? :major : :active], /\A(version:)(.*)\z/)
+              ])
+            end
+            unless dryrun?
+              commit(:add, [dependname], pass: true)
+              on :last, :bump
+            end
           else
-            seg = semscan(cur, fill: false)
-            case flag
-            when :major
-              if seg[0] != '0' || seg[2].nil?
-                seg[0] = seg[0].succ
-                seg[2] = '0'
-              else
-                seg[2] = seg[2].succ
-              end
-              seg[4] = '0'
-            when :minor
-              if seg[0] == '0'
-                seg[4] &&= seg[4].succ
-              else
-                seg[2] = seg[2].succ
-                seg[4] &&= '0'
-              end
-            when :patch
-              seg[4] &&= seg[4].succ
-            end
-            return if (val = seg.join) == cur
+            raise_error 'version not found', hint: dependfile
           end
-          begin
-            doc = dependfile.read
-            if doc.sub!(/"version"\s*:\s*"#{cur}"/, "\"version\": \"#{val}\"")
-              unless dryrun?
-                dependfile.write(doc)
-                log.info "bump version #{cur} to #{val} (#{flag})"
-                on :first, :bump
-              end
-              if stdin?
-                puts val
-              elsif verbose
-                major = flag == :major
-                emphasize("version: #{val}", title: name, border: borderstyle, sub: [
-                  headerstyle,
-                  { pat: /\A(version:)( )(\S+)(.*)\z/, styles: color(major ? :green : :yellow), index: 3 },
-                  { pat: /\A(version:)(.*)\z/, styles: theme[major ? :major : :active] }
-                ])
-              end
-              on :last, :bump unless dryrun?
-            else
-              raise_error('version not found', hint: dependfile)
-            end
-          rescue StandardError => e
-            on_error(e, :bump, dryrun: dryrun?)
-          end
+        rescue StandardError => e
+          on_error(e, :bump, dryrun: dryrun?)
         end
 
         def pack(opts = [])
@@ -8354,15 +9432,14 @@ module Squared
             op = OptionPartition.new(opts, OPT_BERRY[:pack], cmd, project: self)
             op.append?('out', Pathname.pwd + "#{project}-#{version}.tgz")
           else
-            op = OptionPartition.new(opts, pnpm? ? OPT_PNPM[:pack] : OPT_NPM[:pack] + OPT_NPM[:common], cmd,
-                                     project: self)
+            op = OptionPartition.new(opts, pnpm? ? OPT_PNPM[:pack] : npmopts(:pack), cmd, project: self)
             unless pnpm?
               op.each do |opt|
                 next unless opt =~ op.values
 
                 case $1
                 when 'w', 'workspace'
-                  op << ($2.match?(%r{[\\/]}) ? quote_option($1, basepath($2)) : shell_option($1, $2))
+                  op << quotepath($1, $2)
                   op.found << opt
                 end
               end
@@ -8373,15 +9450,53 @@ module Squared
           run(from: :pack)
         end
 
+        def tsc(*args, with: nil, pass: PASS_NODE[:tsc], sync: true, banner: verbose?, from: :tsc, **kwargs)
+          session_apply(with, args: args, kwargs: kwargs, pass: pass) if with
+          p = kwargs[:project]
+          b = kwargs[:build]
+          w = kwargs[:watch]
+          list = OPT_TSC[:base] + OPT_TSC[:compiler]
+          cmd = session 'tsc', if p
+                                 quote_option 'p', basepath(p)
+                               elsif b
+                                 list.concat(OPT_TSC[:build])
+                                 '-b'
+                               end
+          if w
+            list.concat(OPT_TSC[:watch])
+            cmd << '-w'
+          end
+          op = OptionPartition.new(args, list, cmd, project: self, sep: ' ')
+          unless p
+            if b.is_a?(String)
+              op.add_path(b)
+            elsif w.is_a?(String)
+              op.add_path(w)
+            else
+              op.exist?(add: true)
+            end
+          end
+          op.clear
+          cmd = session_done(op.target)
+          print_run(cmd, banner, **kwargs)
+          session 'npx', cmd
+          start = time_epoch if kwargs.fetch(:verbose, verbose? && !stdin?)
+          run(sync: sync, banner: banner, exception: kwargs.fetch(:exception, exception), from: from).tap do |ret|
+            next unless success?(ret, banner, start.nil?) && start
+
+            print_status(name, subject: 'tsc', start: start, from: :completed)
+          end
+        end
+
         def compose(target, opts = nil, script: false, args: nil, from: nil, **)
           return unless target
 
           if script
             ret = session dependbin, 'run'
-            raise_error("#{dependbin} run: given #{target}", hint: from) unless append_any(target, build: true)
-            append_any opts
+            raise_error "#{dependbin} run: #{target}", hint: from unless append_any(target, build: true)
+            append_any opts if opts
             append_loglevel
-            append_any(args, delim: true)
+            append_any(args, delim: true) if args
             ret
           else
             case target
@@ -8392,7 +9507,7 @@ module Squared
             when Enumerable
               target.to_a.join(' ')
             else
-              raise_error("compose: given #{target}", hint: from)
+              raise_error TypeError, "unknown: #{target}", hint: 'compose'
             end
           end
         end
@@ -8414,9 +9529,9 @@ module Squared
         end
 
         def yarn?
-          (@pm[:yarn] ||= if rootpath('yarn.lock', ascend: dependext).exist?
+          (@pm[:yarn] ||= if rootpath('yarn.lock', ascend: dependroot).exist?
                             yarntype
-                          elsif (ver = read_packagemanager || read_install)
+                          elsif (ver = read_package || read_install)
                             if ver =~ /^yarn(?:@(\d)|$)/
                               $1 && $1.to_i > 1 ? yarntype : 1
                             else
@@ -8435,9 +9550,9 @@ module Squared
         end
 
         def pnpm?
-          (@pm[:pnpm] ||= if rootpath('pnpm-lock.yaml', ascend: dependext).exist?
+          (@pm[:pnpm] ||= if rootpath('pnpm-lock.yaml', ascend: dependroot).exist?
                             pnpmtype
-                          elsif (ver = read_packagemanager || read_install)
+                          elsif (ver = read_package || read_install)
                             ver.start_with?('pnpm') ? pnpmtype : 0
                           else
                             @pm[:__] == 'pnpm' ? pnpmtype : 0
@@ -8446,9 +9561,9 @@ module Squared
 
         def workspaces?
           if pnpm?
-            basepath('pnpm-workspace.yaml').exist?
+            exist?('pnpm-workspace.yaml')
           else
-            read_packagemanager(:workspaces).is_a?(Array)
+            read_package('workspaces').is_a?(Array)
           end
         end
 
@@ -8476,76 +9591,76 @@ module Squared
         end
 
         def version
-          @version ||= read_packagemanager(:version)
+          @version ||= read_package('version')
         end
 
         def packagename
-          read_packagemanager :name
+          read_package 'name'
         end
 
         def scripts
-          @scripts ||= read_packagemanager(:scripts).yield_self { |ret| ret.is_a?(Hash) ? ret : {} }
+          @scripts ||= read_package('scripts').yield_self { |ret| ret.is_a?(Hash) ? ret : {} }
         end
 
         private
 
-        def read_packagemanager(key = nil, version: nil, update: false)
-          if (key ? !@pm.key?(key) : @pm[:_].nil?) || update
+        def read_package(key = 'packageManager', update: false)
+          if !@pm.key?(key) || update
             doc = JSON.parse(dependfile.read)
-            if @pm[:_].nil?
-              @pm[:_] = (val = doc['packageManager']) ? val[0, val.index('+') || val.size] : false
-              @pm[:name] = doc['name']
-              @pm[:scripts] = doc['scripts']
-              @pm[:version] = doc['version']
-              @pm[:private] = doc['private']
-              @pm[:workspaces] = doc['workspaces']
+            @pm[key] = case key
+                       when 'packageManager'
+                         if (val = doc['packageManager'])
+                           (n = val.index('+')) ? val[0, n] : val
+                         else
+                           false
+                         end
+                       else
+                         doc[key]
+                       end
+            unless @pm[:_]
+              %w[name scripts version private workspaces].each { |s| @pm[s] = doc[s] }
+              @pm[:_] = true
             end
-            @pm[key] = doc[key.to_s] if key
           end
         rescue StandardError => e
           log.debug e
-          @pm[:_] = false
-          nil
+          @pm[key] = nil
         else
-          if key
-            @pm[key]
-          elsif (ret = @pm[:_]) && (!version || semgte?(ret[(ret.index('@') + 1)..-1], version))
+          @pm[key]
+        end
+
+        def read_install
+          env('NODE_INSTALL') do |ret|
+            if ret.include?(',')
+              catch :found do
+                split_escape(ret) do |val|
+                  case val
+                  when /^yarn/
+                    next if yarntype(exist: true) == 0
+                  when /^pnpm/
+                    next if pnpmtype(exist: true) == 0
+                  when /^npm/
+                    nil
+                  else
+                    next
+                  end
+                  ret = val
+                  throw :found
+                end
+                return
+              end
+            end
+            @pm['packageManager'] ||= ret
             ret
           end
         end
 
-        def read_install
-          return unless (ret = env('NODE_INSTALL'))
-
-          if ret.include?(',')
-            catch :found do
-              split_escape(ret).each do |val|
-                case val
-                when /^yarn/
-                  next if yarntype(exist: true) == 0
-                when /^pnpm/
-                  next if pnpmtype(exist: true) == 0
-                when /^npm/
-                  nil
-                else
-                  next
-                end
-                ret = val
-                throw :found
-              end
-              return
-            end
-          end
-          @pm[:_] ||= ret
-          ret
-        end
-
         def yarntype(exist: false)
-          if (rc = rootpath('.yarnrc.yml', ascend: dependext)).exist?
+          if (rc = rootpath('.yarnrc.yml', ascend: dependroot)).exist?
             require 'yaml'
             doc = YAML.load_file(rc)
             doc.nodeLinker == 'node-modules' ? 2 : 3
-          elsif exist && !basepath('yarn.lock').exist?
+          elsif exist && !exist?('yarn.lock')
             0
           else
             1
@@ -8559,7 +9674,7 @@ module Squared
 
         def pnpmtype(exist: false)
           require 'yaml'
-          doc = YAML.load_file(basepath('node_modules/.modules.yaml', ascend: dependext))
+          doc = YAML.load_file(basepath('node_modules/.modules.yaml', ascend: dependroot))
           @pm['packageManager'] = doc['packageManager']
           case doc['nodeLinker']
           when 'hoisted'
@@ -8571,16 +9686,32 @@ module Squared
           end
         rescue StandardError => e
           if exist
-            %w[pnpm-lock.yaml pnpm-workspace.yaml].any? { |val| basepath(val).exist? } ? 4 : 0
+            %w[pnpm-lock.yaml pnpm-workspace.yaml].any? { |val| exist?(val) } ? 4 : 0
           else
             log.debug e
             4
           end
         end
 
+        def remove_modules(prefix = dependbin)
+          modules = basepath 'node_modules'
+          return false unless modules.directory? && (option('y', prefix: prefix) || confirm_basic('Remove?', modules))
+
+          modules.rmtree
+        rescue Timeout::Error => e
+          puts
+          print_error(e, hint: modules, pass: true)
+          exit 1
+        rescue StandardError => e
+          print_error(e, pass: true)
+          false
+        else
+          true
+        end
+
         def append_loglevel(target: @session)
           level = env('NODE_LOGLEVEL')
-          silent = verbosetype == 0 || level == 'silent'
+          silent = silent? || level == 'silent'
           return unless silent || level
 
           if yarn?
@@ -8611,28 +9742,72 @@ module Squared
         end
 
         def append_platform(target: @session)
-          %w[cpu os libc].each { |name| option(name) { |val| target << basic_option(name, val) } }
+          %w[cpu os libc].each do |name|
+            next unless (val = option(name))
+
+            target << basic_option(name, val)
+          end
         end
 
-        def dependext
-          'package.json' if parent&.has?('outdated', Node.ref)
+        def quotepath(name, val)
+          if $2.include?(File::SEPARATOR) || (workspace.windows? && val.match?(%r{[\\/]}))
+            quote_option name, basepath(val)
+          else
+            shell_option name, val
+          end
+        end
+
+        def dependroot
+          dependname if parent&.has?('outdated', Node.ref)
         end
 
         def npmname
           packagename || project
         end
 
-        def npmnotice
+        def npmnotice(*args)
           [
-            { pat: /^(npm error )(code|\d+)(.+)$/, styles: color(:bright_cyan), index: 2 },
-            { pat: /^(npm )(error)(.*)$/, styles: color(:bright_red), index: 2 },
-            { pat: /^(npm )(notice)(.*)$/, styles: color(:bright_cyan), index: 2 },
-            { pat: /^(npm )(.+)$/, styles: :bold }
-          ]
+            opt_style(color(:bright_cyan), /^(npm error )(code|\d+)(.+)$/, 2),
+            opt_style(color(:bright_red), /^(npm )(error)(.*)$/, 2),
+            opt_style(color(:bright_cyan), /^(npm )(notice)(.*)$/, 2),
+            opt_style(:bold, /^(npm )(.+)$/)
+          ].concat(args)
         end
 
-        def dryrun?(prefix = dependbin, **)
-          super || !option('dry-run', prefix: prefix).nil?
+        def npmopts(*args)
+          OPT_NPM[:common] + args.flat_map { |name| OPT_NPM.fetch(name, []) }
+        end
+
+        def pnpmopts(*args)
+          OPT_PNPM[:common] + args.flat_map { |name| OPT_PNPM.fetch(name, []) }
+        end
+
+        def lockfile(delete = false)
+          file = basepath(if yarn?
+                            'yarn.lock'
+                          else
+                            pnpm? ? 'pnpm-lock.yaml' : 'package-lock.json'
+                          end)
+          if file.exist?
+            if delete
+              file.delete
+              return
+            end
+            file
+          elsif (file = rootpath(file.basename, ascend: dependroot)).exist?
+            file
+          end
+        rescue StandardError => e
+          log.debug e
+          file
+        end
+
+        def nolockfile?(prefix = dependbin)
+          option('package-lock', 'lockfile', prefix: prefix, equals: '0') || !option('no-lockfile', prefix: prefix).nil?
+        end
+
+        def dryrun?(prefix = dependbin)
+          super(target: @session, prefix: prefix)
         end
       end
 
@@ -8642,42 +9817,57 @@ module Squared
         DEP_PYTHON = %w[poetry.lock setup.cfg pyproject.toml setup.py requirements.txt].freeze
         DIR_PYTHON = (DEP_PYTHON + %w[README.rst]).freeze
         OPT_PYTHON = {
-          common: %w[b B d E h i I O P q s S u v x c=q m=b W=b X=q check-hash-based-pycs=b].freeze,
-          build: %w[C=bm n|no-isolation s|sdist x|skip-dependency-check v|verbose w|wheel config-setting=q installer=b
-                    o|outdir=p].freeze,
+          common: %w[b=+ B d E h i I O P q=+ s S u v=+ V=+ x c=q m=b W=b X=q check-hash-based-pycs=b].freeze,
+          build: %w[C=bm n|no-isolation s|sdist x|skip-dependency-check v|verbose w|wheel config-json=q config-setting=q
+                    installer=b o|outdir=p].freeze,
           venv: %w[clear copies symlinks system-site-packages upgrade upgrade-deps without-scm-ignore-files without-pip
                    prompt=q].freeze
         }.freeze
         OPT_PIP = {
-          common: %w[debug disable-pip-version-check isolated no-cache-dir no-color no-input no-python-version-warning
-                     q|quiet require-virtualenv v|verbose cache-dir=p cert=p client-cert=p exists-action=b log=p proxy=q
-                     python=q retries=i timeout=i trusted-host=b use-deprecated=b use-feature=b].freeze,
-          install: %w[break-system-packages check-build-dependencies compile dry-run force-reinstall I|ignore-installed
-                      ignore-requires-python no-build-isolation no-clean no-compile no-deps no-index no-warn-conflicts
-                      no-warn-script-location pre prefer-binary require-hashes U|upgrade use-pep517 user abi=b
-                      config-settings=q c|constraint=p e|editable=v extra-index-url=q f|find-links=q global-option=q
-                      implementation=b i|index-url=q no-binary=q only-binary=q platform=q prefix=p progress-bar=b
-                      python-version=q report=p r|requirement=p root=p root-user-action=b src=p t|target=p
-                      upgrade-strategy=b].freeze,
+          common: %w[debug disable-pip-version-check isolated no-cache-dir no-color no-input require-virtualenv
+                     q|quiet=+ v|verbose=+ cache-dir=p cert=p client-cert=p exists-action=b keyring-provider=b log=p
+                     proxy=q python=q resume-retries=i retries=i timeout=i trusted-host=b use-deprecated=b
+                     use-feature=b].freeze,
+          cache: %w[format=b].freeze,
+          completion: %w[b|bash f|fish p|powershell z|zsh].freeze,
+          config: %w[global user site editor=p].freeze,
+          debug: %w[abi=b implementation=b platform=b python-version=b].freeze,
+          download: %w[d|dest=p].freeze,
+          freeze: %w[all exclude-editable l|local user exclude=b path=p r|requirement=p].freeze,
+          index: %w[json].freeze,
+          inspect: %w[local user path=p].freeze,
+          install: %w[break-system-packages compile dry-run force-reinstall I|ignore-installed no-compile
+                      no-warn-conflicts no-warn-script-location U|upgrade user prefix=p report=p root=p
+                      root-user-action=b t|target=p upgrade-strategy=b].freeze,
+          install_a: %w[ignore-requires-python no-index pre extra-index-url=q f|find-links=q i|index-url=q no-binary=q
+                        only-binary=q].freeze,
+          install_b: %w[build-constraint check-build-dependencies no-build-isolation no-clean no-deps prefer-binary
+                        require-hashes use-pep517 c|constraint=p group=q progress-bar=b r|requirement=p src=p].freeze,
+          install_c: %w[C|config-settings=q e|editable=v].freeze,
+          hash: %w[a|algorithm].freeze,
+          list: %w[e|editable exclude-editable include-editable l|local no-index not-required o|outdated pre u|uptodate
+                   user exclude=b extra-index-url=q format=b f|find-links=q i|index-url=q path=p].freeze,
+          lock: %w[o|output=p].freeze,
+          show: %w[f|files].freeze,
           uninstall: %w[break-system-packages y|yes r|requirement=p root-user-action=b].freeze,
-          freeze: %w[all exclude-editable l|local user exclude=b path=p r|requirement=p].freeze
+          wheel: %w[no-verify w|wheel-dir=p].freeze
         }.freeze
         OPT_POETRY = {
-          common: %w[ansi no-ansi no-cache n|no-interaction no-plugins q|quiet v|verbose P|project=p].freeze,
+          common: %w[ansi no-ansi no-cache n|no-interaction no-plugins q|quiet=+ v|verbose=+ P|project=p].freeze,
           build: %w[clean config-settings=qq f|format=b o|output=p].freeze,
           publish: %w[build dry-run skip-existing cert=p client-cert=p dist-dir=p p|password=q r|repository=q
                       u|username=qq].freeze
         }.freeze
         OPT_PDM = {
           common: %w[I|ignore-python no-cache n|non-interactive].freeze,
-          build: %w[C=bm no-clean no-isolation no-sdist no-wheel quiet verbose config-setting=q d|dest=p p|project=p
-                    k|skip=b].freeze,
-          publish: %w[no-build no-very-ssl quiet S|sign skip-existing verbose ca-certs=p c|comment=q d|dest=p
+          build: %w[C=bm no-clean no-isolation no-sdist no-wheel q|quiet v|verbose=+ config-setting=q d|dest=p
+                    p|project=p k|skip=b].freeze,
+          publish: %w[no-build no-very-ssl q|quiet S|sign skip-existing v|verbose=+ ca-certs=p c|comment=q d|dest=p
                       i|identity=b P|password=q p|project=p r|repository=q k|skip=b u|username=qq].freeze
         }.freeze
         OPT_HATCH = {
           common: %w[color interactive no-color no-interactive cache-dir=p config=p data-dir=p e|env=b p|project=b
-                     q|quiet v|verbose].freeze,
+                     q|quiet=+ v|verbose=+].freeze,
           build: %w[clean-hooks-after ext hooks-only no-hooks c|clean t|target=b].freeze,
           publish: %w[initialize-auth n|no-prompt y|yes a|auth=q ca-cert=p client-cert=p client-key=p o|option=q
                       p|publisher=b r|repo=q u|user=q].freeze
@@ -8687,11 +9877,19 @@ module Squared
                       client-cert=p c|comment=q config-file=p i|identity=b p|password=q r|repository=b repository-url=q
                       sign-with=b u|username=qq].freeze
         }.freeze
-        private_constant :DEP_PYTHON, :DIR_PYTHON, :OPT_PYTHON, :OPT_PIP, :OPT_POETRY, :OPT_PDM, :OPT_HATCH, :OPT_TWINE
+        PASS_PYTHON = {
+          python: %w[c v V].freeze,
+          pip: {
+            debug: %w[platform].freeze,
+            install: %w[C config-settings c constraint extra-index-url no-binary only-binary platform
+                        r requirement].freeze,
+            list: %w[exclude extra-index-url].freeze
+          }.freeze
+        }.freeze
+        private_constant :DEP_PYTHON, :DIR_PYTHON, :OPT_PYTHON, :OPT_PIP, :OPT_POETRY, :OPT_PDM, :OPT_HATCH, :OPT_TWINE,
+                         :PASS_PYTHON
 
         class << self
-          def populate(*); end
-
           def tasks
             [:outdated].freeze
           end
@@ -8729,10 +9927,10 @@ module Squared
 
         subtasks({
           'venv' => %i[exec create remove show].freeze,
-          'pip' => %i[upgrade uninstall freeze].freeze,
+          'pip' => %i[upgrade uninstall wheel reinstall freeze].freeze,
           'install' => %i[user force upgrade target editable].freeze,
           'outdated' => %i[major minor patch].freeze,
-          'build' => %i[python poetry pdm hatch].freeze,
+          'build' => %i[poetry pdm hatch python].freeze,
           'publish' => %i[poetry pdm hatch twine].freeze,
           'run' => nil,
           'exec' => nil
@@ -8767,7 +9965,7 @@ module Squared
                   format_desc action, nil, "script+|#{indexchar}index+|#,pattern*"
                   task action, [:command] do |_, args|
                     found = 0
-                    %w[tool.poetry.scripts tool.pdm.scripts project.scripts].each_with_index do |table, index|
+                    %w[tool.poetry.scripts tool.pdm.scripts project.scripts].each_with_index do |table, i|
                       next if (list = read_pyproject(table)).empty?
 
                       if args.command == '#'
@@ -8776,8 +9974,8 @@ module Squared
                       else
                         args.to_a.each do |val|
                           if (n, = indexitem(val))
-                            if (script, = list[n - 1])
-                              case index
+                            if (script, = list[n.pred])
+                              case i
                               when 0
                                 script = session_output 'poetry', 'run', script
                               when 1
@@ -8791,10 +9989,10 @@ module Squared
                               indexerror n, list
                             else
                               found |= 2
-                              log.warn "run script #{n} of #{list.size} (out of range)"
+                              log.warn "run script #{n} of #{list.size}".subhint('out of range')
                             end
                           else
-                            case index
+                            case i
                             when 0
                               found |= 1
                               run(session_output('poetry', 'run', val), from: :run)
@@ -8804,38 +10002,35 @@ module Squared
                             else
                               raise_error "script: #{val}" if exception
                               found |= 2
-                              log.warn "run script \"#{val}\" (not indexed)"
+                              log.warn "run script \"#{val}\"".subhint('not indexed')
                             end
                           end
                         end
                       end
                       break
                     end
-                    unless found.anybits?(1)
-                      puts log_message(found == 0 ? Logger::INFO : Logger.WARN,
-                                       "no scripts #{found == 0 ? 'found' : 'executed'}",
-                                       subject: name, hint: pyprojectfile)
-                    end
+                    next if found.anybits?(1)
+
+                    puts log_message(found == 0 ? Logger::INFO : Logger.WARN,
+                                     "no scripts #{found == 0 ? 'found' : 'executed'}",
+                                     subject: name, hint: pyprojectfile)
                   end
                 when 'exec'
-                  format_desc action, nil, 'command|:,args*'
+                  format_desc action, nil, ':|command,args*'
                   task action do |_, args|
-                    i = (args = args.to_a).delete(':')
-                    cmd = if i && !workspace.windows?
-                            readline('Enter script', force: true, multiline: ['##', ';'])
+                    args = args.to_a
+                    cmd = if (i = args.delete(':')) && !workspace.windows?
+                            readline('Enter script', force: true, multiline: %w[## ;])
                           elsif i || args.empty?
                             readline('Enter command', force: true)
                           else
-                            if (val = command_args(args, min: 1, prefix: 'python'))
-                              args << val
-                            end
-                            args.join(' ')
+                            (args << command_args(args, min: 1, prefix: 'python')).compact.join(' ')
                           end
                     shell(cmd, name: :exec, chdir: path)
                   end
                 end
               else
-                namespace action do
+                namespace action do |ns|
                   flags.each do |flag|
                     case action
                     when 'venv'
@@ -8850,11 +10045,12 @@ module Squared
                         when :remove
                           next unless projectpath?(venv)
 
-                          format_desc action, flag, 'c|create?,d|depend?'
+                          format_desc action, flag, 'c/reate?,d/epend?,opts*'
                           task flag do |_, args|
+                            args = args.to_a
                             rm_rf(venv, verbose: true)
-                            venv_init if has_value?(%w[c create], args.to_a)
-                            depend if has_value?(%w[d depend], args.to_a)
+                            venv_init if has_value!(args, 'c', 'create')
+                            depend :force, args if has_value!(args, 'd', 'depend')
                           end
                         when :exec
                           format_desc action, flag, 'command,args*'
@@ -8862,7 +10058,7 @@ module Squared
                             args = args.to_a
                             if args.empty?
                               args = readline('Enter command', force: true).split(' ', 2)
-                            elsif args.size == 1 && !option('interactive', prefix: 'venv', equals: '0')
+                            elsif args.size == 1 && !option('interactive', equals: '0', prefix: ref)
                               args << readline('Enter arguments', force: false)
                             end
                             venv_init
@@ -8885,21 +10081,35 @@ module Squared
                       when :freeze
                         format_desc action, flag, "file?=#{DEP_PYTHON[4]},opts*"
                         task flag do |_, args|
-                          if (file = pip(flag, args.to_a)) && verbose
+                          if (file = pip(flag, opts: args.to_a, banner: true)) && !silent?
                             puts File.read(file)
                           end
                         end
                       when :uninstall
                         format_desc action, flag, 'package+,opts*'
                         task flag do |_, args|
-                          pip flag, args.to_a
+                          pip(flag, opts: args.to_a, banner: true)
+                        end
+                      when :wheel
+                        next unless pyprojectfile || setuptools?
+
+                        format_desc action, flag, 'opts*,args*'
+                        task flag do |_, args|
+                          pip(flag, opts: args.to_a, banner: true)
+                        end
+                      when :reinstall
+                        next unless venv && projectpath?(venv)
+
+                        format_desc action, flag
+                        task flag do
+                          ns['venv:remove'].invoke('depend')
                         end
                       end
                     when 'install'
                       format_desc(action, flag, 'opts*', before: case flag
                                                                  when :target then 'dir'
-                                                                 when :editable then 'path/url?'
-                                                                 when :upgrade then 'strategy?,package+'
+                                                                 when :editable then 'path/url?,opts*'
+                                                                 when :upgrade then 'strategy?,opts*,package+'
                                                                  end)
                       case flag
                       when :editable
@@ -8908,17 +10118,18 @@ module Squared
                         end
                       when :upgrade
                         task flag, [:strategy] do |_, args|
-                          args = case (strategy = args.strategy)
-                                 when 'eager', 'only-if-needed'
-                                   args.extras
-                                 when 'needed'
-                                   strategy = 'only-if-needed'
-                                   args.extras
-                                 else
-                                   strategy = nil
-                                   args.to_a
-                                 end
-                          install(flag, args, strategy: strategy)
+                          install flag, (case args.strategy
+                                         when 'eager'
+                                           'eager'
+                                         when /^only-if|needed$/
+                                           'only-if-needed'
+                                         end.yield_self do |val|
+                                           if val
+                                             args.extras << "upgrade-strategy=#{val}"
+                                           else
+                                             args.to_a
+                                           end
+                                         end)
                         end
                       when :target
                         task flag, [:dir] do |_, args|
@@ -8931,30 +10142,27 @@ module Squared
                         end
                       end
                     when 'outdated'
-                      format_desc action, flag, 'eager?,user?'
+                      format_desc(action, flag, "eager?,no-deps?,#{shortname('h', 'i', 's', 'u', 'd')}",
+                                  before: ('user?' unless venv))
                       task flag do |_, args|
                         outdated flag, args.to_a
                       end
                     when 'build'
-                      case flag
-                      when :poetry
-                        next unless build_backend == 'poetry.core.masonry.api'
-                      when :pdm
-                        next unless build_backend == 'pdm.backend'
-                      when :hatch
-                        next unless build_backend == 'hatchling.build'
-                      end
+                      next if (be = backend?(flag)) == false
+
                       format_desc(action, flag, 'opts*', after: case flag
                                                                 when :poetry then 'output?'
                                                                 when :pdm then 'dest?'
                                                                 when :hatch then 'location?'
-                                                                else 'outdir?'
+                                                                else 'outdir?,srcdir?'
                                                                 end)
                       task flag do |_, args|
                         build! flag, args.to_a
                       end
-                      break unless flag == :python
+                      break if be
                     when 'publish'
+                      next if (be = backend?(flag)) == false
+
                       format_desc(action, flag, 'test?,opts*', after: case flag
                                                                       when :hatch then 'artifacts?'
                                                                       when :twine then 'dist?'
@@ -8968,6 +10176,7 @@ module Squared
                                                     false
                                                   end)
                       end
+                      break if be
                     end
                   end
                 end
@@ -8997,84 +10206,119 @@ module Squared
                 when :force
                   cmd << '--force-reinstall'
                 end
-                append_pip(flag, opts, from: :install)
+                op = append_pip(flag, opts, from: :install)
+                op.clear
               else
                 append_global
               end
-              cmd << "-r #{DEP_PYTHON[4]}" if basepath(DEP_PYTHON[4]).exist? && !session_arg?('r', 'requirement')
+              cmd << "-r #{DEP_PYTHON[4]}" if exist?(DEP_PYTHON[4]) && !session_arg?('r', 'requirement')
               append_editable
             end
-            run(from: :depend, sync: sync)
+            run(sync: sync, from: :depend)
           end
         end
 
         def outdated(flag = nil, opts = [], sync: invoked_sync?('outdated', flag))
           cmd = pip_session 'list --outdated'
+          cmd << if flag
+                   se = has_value! opts, 's', 'select'
+                   ia = has_value!(opts, 'i', 'interactive') && !se
+                   up = has_value! opts, 'u', 'update'
+                   hide = has_value! opts, 'h', 'hide'
+                   dryrun = has_value! opts, 'd', 'dry-run'
+                   if !sync || stdin?
+                     se = false
+                     ia = false
+                   elsif se || ia
+                     up = true
+                     items = []
+                   end
+                   '--not-required' if opts.include?('no-deps')
+                 else
+                   if (up = option('u', 'update'))
+                     flag = case up
+                            when 'major', 'minor'
+                              up.to_sym
+                            else
+                              :patch
+                            end
+                   end
+                   '--not-required' unless option('not-required', equals: '0')
+                 end
+          cmd << '--local' if option('l', 'local')
           append_global
+          dryrun ||= dryrun?
           cmd = session_done cmd
           log.info cmd
           on :first, :outdated
           banner = format_banner cmd
           print_item banner if sync
-          start = 0
-          found = 0
-          major = []
-          minor = []
-          patch = []
           pwd_set(from: :outdated) do
+            tc = theme[:current]
+            start = 0
+            found = 0
+            col = 0
+            major = []
+            minor = []
+            patch = []
             buffer = []
             out = ->(val) { sync ? puts(val) : buffer << val }
             if workspace.windows?
-              (venv ? command(runenv, cmd) : `#{cmd}`).lines
+              (venv ? command(runenv, cmd) : `#{cmd}`).lines(chomp: true)
             else
-              IO.popen(runenv || {}, cmd)
+              IO.popen(runenv || {}, cmd).readlines(chomp: true)
             end.each do |line|
               next if line.match?(/^[ -]+$/)
 
               if start > 0
+                n = line.size
                 unless stdin?
                   cur, lat = line.scan(SEM_VER)
                   next unless cur && lat
 
-                  latest = lat.join
-                  current = cur.join
+                  name = line.split(' ', 2).first
+                  c = cur.join
+                  l = lat.join
                   semver cur
                   semver lat
-                  name = line.split(' ', 2).first
-                  type = if semmajor?(cur, lat)
-                           major << name
-                           2
-                         elsif cur[2] == lat[2]
-                           patch << name
-                           0
-                         else
-                           minor << name
-                           1
-                         end
-                  if type == 0
+                  case (type = semtype(cur, lat))
+                  when 1
+                    major << name
+                  when 2
+                    minor << name
+                  else
+                    patch << name
+                  end
+                  next if hide && ((flag == :patch && type < 3) || (flag == :minor && type < 2))
+
+                  if type == 3
                     styles = color(:yellow)
                   else
                     styles = color(:green)
-                    line = sub_style(line, pat: /^(\S+)(.+)$/, styles: if type == 2
-                                                                         styles << :bold
-                                                                         theme[:major]
-                                                                       else
-                                                                         theme[:active]
-                                                                       end)
+                    sub_style!(line, if type == 1
+                                       styles += [:bold]
+                                       theme[:major]
+                                     else
+                                       theme[:active]
+                                     end, pat: /^(\S+)(.+)$/)
                   end
-                  if theme[:current]
-                    line = sub_style(line, pat: /^(.+)(#{Regexp.escape(current)})(.+)$/, styles: theme[:current],
-                                           index: 2)
-                  end
-                  line = sub_style(line, pat: /^(.+)(#{Regexp.escape(latest)})(.+)$/, styles: styles, index: 2)
+                  sub_style!(line, **opt_style(tc, /^(.+)(#{Regexp.escape(c)})(.+)$/, 2)) if tc
+                  sub_style!(line, **opt_style(styles, /^(.+)(#{Regexp.escape(l)})(.+)$/, 2))
                   found += 1
                 end
-                out.call("#{start.to_s.rjust(2)}. #{line}")
+                s = '%2d. %s' % [start, line]
                 start += 1
+                if ia
+                  next unless confirm_semver(s.ljust(col + line.size - n), type)
+                elsif !se
+                  out.call(s)
+                end
+                items&.push([line, name])
               elsif line.start_with?('Package')
                 unless stdin?
-                  sub = { pat: /^(.*)(?<!\dm)(Package|Latest)(.+)$/, styles: theme[:header], index: 2 }
-                  out.call(print_footer(" #  #{line.chomp}", reverse: true, sub: [sub, sub]))
+                  col = line.size + 5
+                  sub = [opt_style(theme[:header], /^(.*)(?<!\dm)(Package|Latest)(.+)$/, 2)] * 2
+                  out.call(print_footer(" #  #{line}", reverse: true, sub: sub))
                 end
                 start += 1
               end
@@ -9084,58 +10328,71 @@ module Squared
               puts buffer
             end
             if found > 0
-              print_status(major.size, minor.size, patch.size, from: :outdated)
-              pkg = case flag
-                    when :major
-                      major + minor + patch
-                    when :minor
-                      minor + patch
-                    when :patch
-                      patch
-                    end
-              unless !pkg || pkg.empty?
-                install(:upgrade, pkg, strategy: opts.include?('eager') ? 'eager' : nil, user: opts.include?('user'))
+              items = if se
+                        choice('Select a package', items.map(&:first),
+                               multiple: true, force: false, index: true, border: true).map! { |n| items[n.pred].last }
+                      elsif ia
+                        items.map(&:last)
+                      else
+                        case flag
+                        when :major
+                          major + minor + patch
+                        when :minor
+                          minor + patch
+                        else
+                          patch
+                        end
+                      end
+              if up && !items.empty?
+                base = %w[eager no-deps]
+                base << 'user' unless venv
+                opts = (base & opts).map! { |val| val == 'eager' ? "upgrade-strategy=#{val}" : val }
+                if dryrun
+                  opts.map! { |val| fill_option(val) }
+                  print_run pip_output('install --upgrade', *opts, *items.quote!), false
+                else
+                  install(:upgrade, opts, packages: items, banner: false)
+                end
               end
-            elsif start == 0
+              print_status(major.size, minor.size, patch.size, from: :outdated)
+            elsif start == 0 || hide
               puts 'No updates were found'
             end
           end
           on :last, :outdated
         end
 
-        def install(flag, opts = [], strategy: nil, user: nil)
-          cmd = pip_session 'install'
-          out = append_pip(flag, opts, from: :install)
+        def install(flag, opts = [], packages: [], banner: true)
+          op = append_pip(flag, opts, target: pip_session('install'), from: :install)
           case flag
           when :editable
-            cmd << quote_option('e', out.pop || editable || '.')
-            option_clear out
+            op << quote_option('e', op.pop || editable || '.')
+            op.clear
           when :upgrade
-            raise_error('no packages listed', hint: flag) if out.empty?
-            cmd << '--upgrade'
-            cmd << '--user' if user
-            cmd << basic_option('upgrade-strategy', strategy) if strategy
-            append_value out
-            python_session('-m pip', *cmd.to_a.drop(1)) if workspace.windows?
+            op.concat(packages)
+            raise_error 'no packages listed', hint: flag if op.empty?
+            op << '--upgrade'
+            op.append
+            python_session('-m pip', *op.to_a.drop(1)) if workspace.windows?
           end
-          run(from: :install)
+          run(banner: banner, from: :install)
         end
 
         def build!(flag, opts = [])
-          case flag
-          when :poetry
-            cmd = poetry_session 'build'
-            list = OPT_POETRY[:build] + OPT_POETRY[:common]
-          when :pdm
-            cmd, opts = pdm_session('build', opts: opts)
-            list = OPT_PDM[:build]
-          when :hatch
-            cmd, opts = hatch_session('build', opts: opts)
-            list = OPT_HATCH[:build]
-          else
-            cmd, opts = python_session('-m build', opts: opts)
-            list = OPT_PYTHON[:build]
-          end
+          list = case flag
+                 when :poetry
+                   cmd = poetry_session 'build'
+                   OPT_POETRY[:build] + OPT_POETRY[:common]
+                 when :pdm
+                   cmd, opts = pdm_session('build', opts: opts)
+                   OPT_PDM[:build]
+                 when :hatch
+                   cmd, opts = hatch_session('build', opts: opts)
+                   OPT_HATCH[:build]
+                 else
+                   cmd, opts = python_session('-m build', opts: opts)
+                   OPT_PYTHON[:build]
+                 end
           op = OptionPartition.new(opts, list, cmd, project: self, single: singleopt(flag))
           case flag
           when :hatch
@@ -9162,24 +10419,29 @@ module Squared
         end
 
         def publish(flag, opts = [], test: false)
-          case flag
-          when :poetry
-            poetry_session 'publish'
-            list = OPT_POETRY[:publish] + OPT_POETRY[:common]
-          when :pdm
-            opts = pdm_session('publish', opts: opts).last
-            list = OPT_PDM[:publish]
-          when :hatch
-            opts = hatch_session('publish', opts: opts).last
-            list = OPT_HATCH[:publish]
-          when :twine
-            session 'twine', 'upload'
-            list = OPT_TWINE[:publish]
-          end
+          list = case flag
+                 when :poetry
+                   poetry_session 'publish'
+                   OPT_POETRY[:publish] + OPT_POETRY[:common]
+                 when :pdm
+                   opts = pdm_session('publish', opts: opts).last
+                   OPT_PDM[:publish]
+                 when :hatch
+                   opts = hatch_session('publish', opts: opts).last
+                   OPT_HATCH[:publish]
+                 else
+                   session 'twine', 'upload'
+                   OPT_TWINE[:publish]
+                 end
           op = OptionPartition.new(opts, list, @session, project: self, single: singleopt(flag))
           dist = lambda do
-            basepath('dist').tap do |dir|
-              raise_error('no source files found', hint: dir) unless dir.directory? && !dir.empty?
+            dir = basepath 'dist'
+            return dir if dir.directory? && !dir.empty?
+
+            if dir.exist?
+              raise_error 'no source to publish', hint: dir
+            else
+              raise_error Errno::ENOENT, dir, hint: 'publish'
             end
           end
           if test
@@ -9190,61 +10452,141 @@ module Squared
             end
           end
           case flag
-          when :hatch, :twine
-            if op.empty?
-              op.push("#{dist.call}/*")
-            else
-              op.map! { |val| basepath(val) }
-            end
-            op.append
-          else
-            dist.call unless op.arg?(*(flag == :poetry ? ['dist-dir'] : ['d', 'dest']))
+          when :poetry, :pdm
+            dist.call unless op.arg?(*(flag == :poetry ? ['dist-dir'] : %w[d dest]))
             op.clear(pass: false)
+          else
+            if op.empty?
+              op << "#{dist.call}/*"
+            else
+              op.add_path
+            end
           end
-          run(from: :"#{flag}:publish", interactive: "Publish #{sub_style(project, styles: theme[:active])}")
+          run(from: :"#{flag}:publish", interactive: ['Publish', 'N', project])
         end
 
-        def pip(flag, opts = [])
-          cmd = pip_session flag
-          out = append_pip(nil, opts, from: flag)
+        def python(*args, sync: true, banner: verbose?, with: nil, pass: PASS_PYTHON[:python], **kwargs)
+          op = OptionPartition.new(session_opts(with, args: args, kwargs: kwargs, pass: pass), OPT_PYTHON[:common],
+                                   session('python', path: venv.nil?),
+                                   project: self, multiple: [/^-c/], single: singleopt(:python), args: true,
+                                   stdin: true)
+          op.concat(args)
+          if op.include?('-')
+            op.exist?(add: true)
+          else
+            op.append_any { |val| OptionPartition.parse_arg!('c', val) }
+            if op.arg?('c')
+              op.clear
+            else
+              op.exist?(add: true, first: true) unless op.arg?('m')
+              op.append(escape: kwargs.fetch(:escape, false), quote: kwargs.fetch(:quote, false))
+            end
+          end
+          print_run(op, banner, **kwargs)
+          run(sync: sync, banner: banner, exception: kwargs.fetch(:exception, exception), from: :python)
+        end
+
+        def pip(flag, *args, sync: true, banner: verbose?, with: nil, pass: nil, **kwargs)
+          flag = flag.to_sym
+          pass = PASS_PYTHON[:pip].fetch(pip_install?(flag) ? :install : flag, []) + %w[v verbose] if pass.nil?
+          opts = session_opts(with, args: args, kwargs: kwargs, pass: pass)
           case flag
-          when :uninstall
-            raise_error('no packages listed', hint: flag) if out.empty?
-            cmd.merge(out)
+          when :freeze, :inspect, :list, :check, :completion, :debug
+            opts.concat(args)
+          end
+          op = append_pip(flag, opts, target: pip_session(flag), from: flag)
+          case flag
+          when :install, :uninstall, :show, :index
+            op.concat(args)
+            if op.empty?
+              case flag
+              when :install, :uninstall
+                op << '.' if installable? && !op.arg?('r', 'requirement')
+              else
+                raise_error 'no packages listed', hint: flag
+              end
+            elsif flag == :install
+              op.append_any
+            elsif flag == :index
+              op.adjoin('versions', with: 'index')
+                .add_first
+                .clear
+            else
+              op.append
+            end
           when :freeze
             venv_init
-            ret = basepath(out.shift || DEP_PYTHON[4])
-            cmd << '>' << shell_quote(ret)
-            option_clear out
+            op << '>'
+            op.add_quote(ret = basepath(op.detect { |val| op.exist?(val) } || DEP_PYTHON[4]))
+              .clear
+          when :cache
+            op.concat(args)
+            raise_error 'no subcommand', hint: flag if op.empty?
+            op << (action = op.shift)
+            case action
+            when 'dir', 'info', 'purge'
+              nil
+            when 'list', 'remove'
+              op.add_first(quote: true)
+            else
+              raise_error ArgumentError, "unrecognized args: #{action}", hint: flag
+            end
+            op.clear
+          when :config
+            op.concat(args)
+            raise_error 'no subcommand', hint: flag if op.empty?
+            op << (action = op.shift)
+            case action
+            when 'list', 'edit', 'debug'
+              nil
+            when 'get', 'unset', 'set'
+              op.add_first
+              op.add_first(quote: true, expect: true) if action == 'set'
+            else
+              raise_error ArgumentError, "unrecognized args: #{action}", hint: flag
+            end
+            op.clear
+          when :hash
+            op.append(projectmap(op.concat(args), parent: true))
+          when :wheel, :lock, :download
+            op.concat(args)
+            if !op.empty?
+              op.append
+            elsif installable? && !op.arg?('r', 'requirement')
+              op << '.'
+            end
+          else
+            op.clear
           end
-          run(from: :"pip:#{flag}")
-          ret
+          print_run(op, banner, **kwargs)
+          run(sync: sync, banner: banner, exception: kwargs.fetch(:exception, exception), from: :"pip:#{flag}")
+            .yield_self { |val| ret || val }
         end
 
-        def variable_set(key, *val, **, &blk)
+        def variable_set(key, *args, **, &blk)
           if block_given?
             case key
             when :dependfile, :venv, :editable
-              val = block_args val, &blk
+              args = block_args args, &blk
             end
           end
           case key
           when :dependfile
-            if val.first.nil?
+            if args.first.nil?
               super
             else
-              req = basepath(*val)
-              if (index = DEP_PYTHON.index(req.basename.to_s))
+              val = basepath(*args)
+              if (index = DEP_PYTHON.index(val.basename.to_s))
                 @dependindex = index
-                @dependfile = req
+                @dependfile = val
               else
-                log.warn "variable_set: @#{key}=#{req} (not supported)"
+                log.warn "variable_set: @#{key}=#{val} (not supported)"
               end
             end
           when :editable
-            editable_set val.first
+            editable_set args.first
           when :venv
-            @venv = val.empty? || val.first.nil? ? nil : basepath(*val)
+            @venv = args.empty? || args.first.nil? ? nil : basepath(*args)
           else
             super
           end
@@ -9264,13 +10606,16 @@ module Squared
           session('pip', *cmd, *preopts, path: venv.nil?)
         end
 
+        def pip_output(*cmd)
+          session_output('pip', *cmd, *preopts, path: venv.nil?)
+        end
+
         def python_session(*cmd, opts: nil)
           pre = preopts(quiet: false)
           return session('python', *pre, *cmd, path: venv.nil?) unless opts
 
           op = OptionPartition.new(opts, OPT_PYTHON[:common], project: self, single: singleopt(:python))
-          ret = session('python', *pre, *op.to_a, *cmd, path: venv.nil?)
-          [ret, op.extras]
+          [session('python', *pre, *op.to_a, *cmd, path: venv.nil?), op.extras]
         end
 
         def poetry_session(*cmd)
@@ -9291,18 +10636,28 @@ module Squared
           return session(name, *preopts, *cmd, path: venv.nil?) unless opts
 
           op = OptionPartition.new(opts, common, project: self, single: singleopt(name.to_sym))
-          ret = session(name, *preopts, *op.to_a, *cmd, path: venv.nil?)
-          [ret, op.extras]
+          [session(name, *preopts, *op.to_a, *cmd, path: venv.nil?), op.extras]
         end
 
         def append_pip(flag, opts, target: @session, from: nil)
-          unless from && !opts.empty?
-            append_global(target: target)
-            return []
+          list = OPT_PIP.fetch(from, []) + OPT_PIP[:common]
+          if pip_install?(flag) || from == :install
+            list.concat(OPT_PIP[:install_a])
+            list.concat(OPT_PIP[:install_b]) unless flag == :index
+            case flag
+            when :install, :editable, :upgrade
+              list.concat(OPT_PIP[:install_c] + OPT_PIP[:debug])
+            when :lock, :wheel
+              list.concat(OPT_PIP[:install_c])
+            when :download, :index
+              list.concat(OPT_PIP[:debug])
+            end
+            opts << 'no-build-isolation' if option('build-isolation', equals: '0')
           end
-          op = OptionPartition.new(opts, OPT_PIP[from] + OPT_PIP[:common], target, project: self, single: singleopt)
+          op = OptionPartition.new(opts, list, target, project: self, single: singleopt)
           append_global(target: target)
-          if from == :install
+          case flag
+          when :install, :lock, :wheel, :editable, :upgrade
             edit = nil
             op.each do |opt|
               if opt =~ op.values
@@ -9317,7 +10672,6 @@ module Squared
                 op.found << opt
               end
             end
-            op << '--no-build-isolation' if option('build-isolation', equals: '0')
             op.swap
             if edit
               edit = basepath(edit) unless %r{\A[a-z]+(?:\+[a-z]+)?://}i.match?(edit)
@@ -9327,22 +10681,14 @@ module Squared
                 op << quote_option('e', edit)
               end
             end
-            case flag
-            when :editable, :upgrade
-              op.extras
-            else
-              op.clear
-              []
-            end
-          else
-            op.extras
           end
+          op
         end
 
         def append_editable(target: @session)
           return if requirements? && editable == '.'
 
-          if (val = option('editable', 'e', target: target, ignore: false))
+          if (val = option('e', 'editable', target: target, ignore: false))
             OptionPartition.delete_key(target, 'e', 'editable')
             case val
             when '0', 'false'
@@ -9359,16 +10705,18 @@ module Squared
         end
 
         def append_global(target: @session)
-          option('cache-dir', target: target) do |val|
-            target << case val
-                      when '0', 'false'
-                        '--no-cache-dir'
-                      else
-                        quote_option('cache-dir', basepath(val))
-                      end
-          end
-          option('proxy', target: target) { |val| target << quote_option('proxy', val) }
-          option('python', target: target) { |val| target << quote_option('python', basepath(val)) }
+          target.merge([
+            option('cache-dir', target: target) do |val|
+              case val
+              when '0', 'false'
+                '--no-cache-dir'
+              else
+                quote_option 'cache-dir', basepath(val)
+              end
+            end,
+            option('proxy', target: target) { |val| quote_option('proxy', val) },
+            option('python', target: target) { |val| quote_option('python', basepath(val)) }
+          ])
           append_nocolor(target: target)
         end
 
@@ -9417,13 +10765,13 @@ module Squared
                       end
                     end
                   else
-                    val = case (val = data[2])
+                    val = case (ch = data[2])
                           when 'true'
                             true
                           when 'false'
                             false
                           else
-                            val.include?('.') ? val.to_f : val.to_i
+                            ch.include?('.') ? ch.to_f : ch.to_i
                           end
                   end
                   ret << [data[1], val]
@@ -9440,15 +10788,16 @@ module Squared
         end
 
         def pyprojectfile
-          return unless (ret = basepath(DEP_PYTHON[2])).exist?
-
-          ret
+          @pyprojectfile = basepath!(DEP_PYTHON[2]) || false if @pyprojectfile.nil?
+          @pyprojectfile || nil
         end
 
         def singleopt(flag = nil)
           case flag
           when :python
             /\A(?:v+|q+|b+|V+|O+)\z/
+          when :pdm
+            /\Av+\z/
           when :twine
             nil
           else
@@ -9497,20 +10846,21 @@ module Squared
         def venv_set(val)
           return unless val
 
+          write = ->(level, hint) { log.add(level, "venv: #{@venv}".subhint(hint)) }
           if val.is_a?(Array)
             val, *opts = val
             @venvopts = opts
           end
-          @venv = basepath(val)
+          @venv = basepath val
           if projectpath?(@venv)
             if @venv.exist?
-              log.debug "venv found: #{@venv}"
-            elsif @path.directory? && !@path.empty?
+              write.call(Logger::DEBUG, 'found')
+            elsif path.directory? && !path.empty?
               @venv.mkpath
-              log.info "venv mkdir: #{@venv}"
+              write.call(Logger::INFO, 'mkdir')
             end
           elsif !@venv.directory?
-            log.warn "venv invalid: #{@venv}"
+            write.call(Logger::WARN, 'invalid')
             @venv = nil
           end
         end
@@ -9518,21 +10868,38 @@ module Squared
         def venv_init
           return if !venv || (venvbin.directory? && !venvbin.empty?)
 
-          puts log_message(Logger::INFO, venv, subject: 'venv', hint: 'init')
+          puts log_message(venv, subject: 'venv', hint: 'init') unless silent?
           opts = @venvopts&.map { |val| OptionPartition.strip(val) }&.flatten
           venv_create(venv, opts || ["prompt=#{name}", 'upgrade-deps'], env: false, banner: false)
-          puts log_message(Logger::INFO, venv, subject: 'venv', hint: 'created')
+          puts log_message(venv, subject: 'venv', hint: 'created') unless silent?
         end
 
-        def venv_create(dir, opts = [], env: nil, banner: true)
+        def venv_create(dir, opts = [], env: nil, banner: banner?)
           cmd, opts = python_session('-m venv', opts: opts)
           op = OptionPartition.new(opts, OPT_PYTHON[:venv], cmd, project: self)
           status = op.append(dir, delim: true)
                      .clear(pass: false)
                      .arg?(/\A-v+\z/)
-          run(op, env, exception: true, banner: banner)
-          install(:upgrade, ['poetry']) if poetry?
-          puts(dir.directory? ? "Success: #{dir}" : 'Failed') if banner && !status
+          ret = run(op, env, exception: true, banner: banner)
+          pip(:install, 'poetry', banner: false) if poetry?
+          success?(ret, banner, !status) { |out| puts(out && dir.directory? ? "Success: #{dir}" : 'Failed') }
+        end
+
+        def pip_install?(flag)
+          %i[install download index lock wheel].include?(flag)
+        end
+
+        def backend?(flag)
+          case flag
+          when :poetry
+            build_backend == 'poetry.core.masonry.api'
+          when :pdm
+            build_backend == 'pdm.backend'
+          when :hatch
+            build_backend == 'hatchling.build'
+          when :setuptools
+            build_backend == 'setuptools.build_meta'
+          end
         end
 
         def installable?
@@ -9556,6 +10923,7 @@ module Squared
 
       class Ruby < Git
         GEMFILE = %w[Gemfile Gemfile.lock gem.deps.rb gems.rb Isolate].freeze
+        GEMNAME = /\A[A-Za-z\d][A-Za-z\d_.-]*\z/.freeze
         DIR_RUBY = (GEMFILE + Rake::Application::DEFAULT_RAKEFILES + ['README.rdoc']).freeze
         OPT_RUBY = {
           ruby: %w[0=im? a c C=pm e=q E=bm F=qm i=bm? I=pm l n p r=bm s S w W=bm? x=pm? d|debug jit rjit verbose
@@ -9563,58 +10931,153 @@ module Squared
                    internal-encoding=b parser=b].freeze,
           rake: %w[A|all B|build-all comments n|dry-run m|multitask P|prereqs q|quiet X|no-deprecation-warnings
                    N|no-search G|no-system nosearch nosystem rules s|silent g|system v|verbose backtrace=b?
-                   D|describe=q? e|execute=q E|execute-continue=q p|execute-print=q job-stats=b? j|jobs=i? I|libdir=p
-                   R|rakelib=p rakelibdir=p r|require=b suppress-backtrace=q T|tasks=q? t|trace=b? W|where=q?].freeze,
+                   D|describe=q? e|execute=q E|execute-continue=q p|execute-print=q f|rakefile=p job-stats=b? j|jobs=i?
+                   I|libdir=p R|rakelib=p rakelibdir=p r|require=b suppress-backtrace=q T|tasks=q? t|trace=b?
+                   W|where=q?].freeze,
           irb: %w[d f U w E=b I=p r=b W=im? autocomplete colorize echo echo-on-assignment extra-doc-dir inf-ruby-mode
                   inspect multiline no-pager noautocomplete nocolorize noecho noecho-on-assignment noinspect
                   nomultiline noprompt noscript nosingleline noverbose regexp-completor sample-book-mode script
                   simple-prompt single-irb singleline tracer truncate-echo-on-assignment type-completor verbose
-                  back-trace-limit=i context-mode=i prompt=b prompt-mode=b].freeze
+                  back-trace-limit=i context-mode=i prompt=b prompt-mode=b].freeze,
+          rbs: %w[I=pm r=bm no-stdlib no-collection collection=p log-level=b log-output=p repo=p].freeze,
+          rubocop: %w[D P r=bm auto-gen-config a|autocorrect A|autocorrect-all d|debug disable-pending-cops
+                      display-only-correctable display-only-fail-level-offenses display-only-failed
+                      display-only-safe-correctable S|display-style-guide display-time editor-mode enable-pending-cops
+                      E|extra-details F|fail-fast force-default-config force-exclusion x|fix-layout
+                      ignore-disable-comments ignore-parent-exclusion ignore-unrecognized-cops init l|lint
+                      L|list-target-files lsp memory no-detach only-guide-cops only-recognized-file-types
+                      no-exclude-limit profile raise-cop-error regenerate-todo restart-server safe server-status
+                      start-server stderr stop-server C|cache=b cache-root=p config=p exclude-limit=i fail-level=b
+                      f|format=b except=q only=q o|out=p plugin=p require=p show-cops=q show-docs-url=q
+                      s|stdin=p].freeze,
+          no: {
+            rubocop: %w[auto-gen-enforced-style auto-gen-only-exclude auto-gen-timestamp color display-cop-names
+                        offense-counts parallel server].freeze
+          }
         }.freeze
         OPT_BUNDLE = {
           common: %w[no-color V|verbose r|retry=i].freeze,
+          common_all: %w[all all-platforms path=p].freeze,
+          common_git: %w[branch=q git=q path=p ref=q].freeze,
+          common_version: %w[local major minor patch pre strict].freeze,
+          add: %w[optimistic quiet skip-install strict github=q glob=q g|group=q require=q s|source=q
+                  v|version=q].freeze,
+          binstubs: %w[force standalone shebang=q].freeze,
+          cache: %w[frozen no-all no-install no-prune quiet cache-path=p gemfile=p].freeze,
+          check: %w[dry-run gemfile=p path=p].freeze,
+          clean: %w[dry-run force].freeze,
+          config: %w[global local skip-parseable].freeze,
+          doctor: %w[quiet ssl gemfile=p].freeze,
+          doctor_ssl: %w[host=q tls-version=b verify-mode=b].freeze,
+          exec: %w[gemfile=p].freeze,
+          gem: %w[b|bin git no-exe rubocop ci=b e|edit=p? ext=b github-username=q linter=b t|test=b?].freeze,
+          init: %w[gemfile=p gemspec=p].freeze,
           install: %w[frozen no-cache no-prune system binstubs=p? path=p standalone=q? target-rbconfig=p trust-policy=b
                       with=q without=q].freeze,
-          install_base: %w[force full-index local quiet redownload gemfile=p j|jobs=i].freeze,
-          update: %w[all conservative local major minor patch pre ruby strict bundler=b? g|group=q source=b].freeze,
-          outdated: %w[filter-major filter-minor filter-patch filter-strict groups local parseable porcelain pre
-                       only-explicit strict update-strict group=q source=b].freeze,
-          exec: %w[gemfile=p].freeze,
-          cache: %w[all all-platforms frozen no-all no-install no-prune quiet cache-path=p gemfile=p path=p].freeze,
-          check: %w[dry-run gemfile=p path=p].freeze
+          install_a: %w[force full-index local quiet redownload gemfile=p j|jobs=i].freeze,
+          lock: %w[add-checksums conservative full-index normalize-platforms print add-platform=q bundler=b? gemfile=p
+                   lockfile=p remove-platform=p update=q?].freeze,
+          open: %w[path=p].freeze,
+          outdated: %w[filter-major filter-minor filter-patch filter-strict groups parseable porcelain only-explicit
+                       update-strict group=q source=q].freeze,
+          platform: %w[ruby].freeze,
+          plugin: %w[source=q version=q].freeze,
+          plugin_uninstall: %w[all].freeze,
+          remove: %w[install].freeze,
+          show: %w[outdated paths].freeze,
+          update: %w[all conservative local major minor patch pre ruby strict bundler=b? g|group=q source=q].freeze,
+          no: {
+            config: %w[parseable].freeze,
+            gem: %w[changelog ci coc exe linter mit test].freeze
+          }.freeze
         }.freeze
         OPT_GEM = {
           common: %w[backtrace debug q|quiet no-verbose norc silent V|verbose config-file=p].freeze,
-          install: %w[version=q].freeze,
-          install_base: %w[E f w b|both clear-sources conservative default development development-all explain
-                           ignore-dependencies l|local N|no-document r|remote vendor n|bindir=p build-root=p
-                           B|bulk-threshold=i document=b? g|file=p? p|http-proxy=q? i|install-dir=p platform=q
-                           s|source=q target-rbconfig=p? P|trust-policy=b without=q].freeze,
-          update: %w[system=b?].freeze,
-          uninstall: %w[a D I x vendor n|bindir=p i|install-dir=p platform=b v|version=q].freeze,
-          outdated: %w[b|both clear-sources l|local r|remote B|bulk-threshold=i p|http-proxy=q? platform=q
-                       source=q].freeze,
-          push: %w[attestation=p host=q p|http-proxy=q? k|key=b otp=b].freeze,
+          common_url: %w[B|bulk-threshold=i p|http-proxy=q? s|source=q].freeze,
+          common_domain: %w[b|both clear-sources l|local r|remote].freeze,
+          common_otp: %w[host=q k|key=b otp=b].freeze,
+          common_all: %w[a|all e|exact v|version=q].freeze,
           build: %w[C=p force strict o|output=p platform=q].freeze,
+          cert: %w[a|add=p b|build=q C|certificate=p d|days=i l|list=q A|key-algorithm=b K|private-key=p r|remove=q
+                   R|re-sign s|sign=p].freeze,
+          check: %w[a v|version=q].freeze,
+          cleanup: %w[D n d|dry-run].freeze,
+          contents: %w[l all s|spec-dir=q v|version=q].freeze,
+          dependency: %w[R pipe platform=q v|version=q].freeze,
           exec: %w[conservative g|gem=b v|version=q].freeze,
+          fetch: %w[clear-sources platform=q v|version=q].freeze,
+          generate_index: %w[update d|directory=p].freeze,
+          info: %w[i I].freeze,
+          install: %w[v|version=q].freeze,
+          install_a: %w[E f w conservative default development development-all explain ignore-dependencies N|no-document
+                        vendor n|bindir=p build-root=p document=b? g|file=p? i|install-dir=p platform=q
+                        target-rbconfig=p? P|trust-policy=b without=q].freeze,
+          list: %w[d i I].freeze,
+          lock: %w[s].freeze,
+          open: %w[e|editor=p v|version=q].freeze,
+          outdated: %w[platform=q].freeze,
+          owner: %w[a|add=q r|remove=q p|http-proxy=q?].freeze,
           pristine: %w[E all only-executables only-missing-extensions only-plugins n|bindir=p i|install-dir=p skip=b
                        v|version=q].freeze,
+          push: %w[attestation=p p|http-proxy=q?].freeze,
+          rdoc: %w[all v|version=q].freeze,
+          rebuild: %w[C=p diff force strict gemspec=p original=p source=q].freeze,
+          search: %w[d i I].freeze,
+          signin: %w[otp=b host=q].freeze,
+          sources: %w[f c|clear-all l|list u|update a|add=q p|http-proxy=q? r|remove=q].freeze,
+          specification: %w[all marshal ruby yaml platform=q v|version=q].freeze,
+          uninstall: %w[a D I x vendor n|bindir=p i|install-dir=p platform=q v|version=q].freeze,
+          unpack: %w[spec target=p P|trust-policy=b v|version=q],
+          update: %w[system=b?].freeze,
+          which: %w[a g].freeze,
+          yank: %w[platform=q v|version=q].freeze,
           no: {
+            check: %w[alien doctor dry-run gems].freeze,
+            cleanup: %w[check-development user-install].freeze,
+            contents: %w[lib-only prefix show-install-dir].freeze,
+            dependency: %w[http-proxy prerelease reverse-dependencies].freeze,
+            exec: %w[prerelease].freeze,
+            fetch: %w[http-proxy prerelease suggestions].freeze,
+            generate_index: %w[compact modern].freeze,
+            info: %w[http-proxy installed prerelease versions].freeze,
             install: %w[env-shebang force format-executable http-proxy lock minimal-deps post-install-message prerelease
                         suggestions user-install wrappers].freeze,
+            list: %w[details http-proxy installed prerelease versions].freeze,
+            lock: %w[strict].freeze,
+            outdated: %w[http-proxy].freeze,
+            owner: %w[http-proxy].freeze,
+            pristine: %w[env-shebang extensions].freeze,
+            push: %w[http-proxy].freeze,
+            rdoc: %w[overwrite rdoc ri].freeze,
+            search: %w[details http-proxy installed prerelease versions].freeze,
+            sources: %w[force http-proxy].freeze,
+            specification: %w[prerelease].freeze,
             uninstall: %w[abort-on-dependent all check-development executables force format-executable
                           ignore-dependencies user-install].freeze,
-            outdated: %w[http-proxy].freeze,
-            push: %w[http-proxy].freeze,
-            exec: %w[prerelease].freeze,
-            pristine: %w[env-shebang extensions].freeze
+            which: %w[all gems-first].freeze
           }.freeze
         }.freeze
-        private_constant :GEMFILE, :DIR_RUBY, :OPT_RUBY, :OPT_BUNDLE, :OPT_GEM
+        PASS_RUBY = {
+          ruby: %w[e I disable enable dump r s].freeze,
+          rake: %w[I libdir r require].freeze,
+          irb: %w[I r].freeze,
+          rbs: %w[I r repo].freeze,
+          rubocop: %w[format plugin r require].freeze,
+          gem: {
+            contents: %w[s spec-dir].freeze,
+            dependency: %w[s source].freeze,
+            install: %w[document s source without].freeze,
+            pristine: %w[skip].freeze
+          }.freeze,
+          bundle: {
+            install: %w[standalone with without].freeze,
+            lock: %w[add-platform remove-platform update].freeze,
+            update: %w[g group source].freeze
+          }.freeze
+        }.freeze
+        private_constant :GEMFILE, :GEMNAME, :DIR_RUBY, :OPT_RUBY, :OPT_BUNDLE, :OPT_GEM, :PASS_RUBY
 
         class << self
-          def populate(*); end
-
           def tasks
             [:outdated].freeze
           end
@@ -9631,22 +11094,20 @@ module Squared
         end
 
         subtasks({
-          'install' => %i[redownload local prefer-local].freeze,
-          'update' => %i[patch minor major all].freeze,
-          'outdated' => %i[patch minor major].freeze,
-          'gem' => %i[install uninstall update pristine outdated build push exec].freeze,
+          'outdated' => %i[major minor patch].freeze,
           'ruby' => %i[file script version].freeze,
-          'exec' => nil,
-          'cache' => nil,
-          'config' => nil,
-          'check' => nil,
+          'gem' => %i[install uninstall outdated update pristine build push exec command].freeze,
+          'bundle' => %i[install update cache exec config reinstall command].freeze,
           'rake' => nil,
-          'irb' => nil
+          'irb' => nil,
+          'rbs' => nil,
+          'rubocop' => nil
         })
 
         attr_reader :gemdir
 
-        def initialize(*, autodetect: false, gemspec: nil, asdf: 'ruby', **kwargs)
+        def initialize(*, autodetect: false, gemspec: nil, steep: 'Steepfile', rubocop: '.rubocop.yml', asdf: 'ruby',
+                       **kwargs)
           super
           if @pass.include?(Ruby.ref)
             initialize_ref Ruby.ref
@@ -9662,7 +11123,9 @@ module Squared
                      elsif gemspec
                        basepath(gemspec.include?('.') ? gemspec : "#{gemspec}.gemspec")
                      end
-          return if !@output[0].nil? || !@copy.nil? || version || @autodetect || !rakefile
+          @steepfile = basepath! steep if steep
+          @rubocopfile = Pathname.new(rubocop).realpath rescue basepath!(Dir.home, '.rubocop.yml') if rubocop
+          return unless rakefile && @output[0].nil? && @copy.nil? && !version && !@autodetect
 
           begin
             File.foreach(rakefile) do |line|
@@ -9677,6 +11140,10 @@ module Squared
           rescue StandardError => e
             log.error e
           end
+        end
+
+        def project=(val)
+          @project = val.dup
         end
 
         def gemdir=(val)
@@ -9704,90 +11171,227 @@ module Squared
                 when 'rake'
                   next unless rakefile
 
-                  format_desc action, nil, "task+,opts*|#{indexchar}index+|#,pattern*"
+                  format_desc action, nil, "task+|#{indexchar}index+,opts*|#,pattern*"
                   task action, [:command] do |_, args|
                     if args.command == '#'
-                      format_list(raketasks, "rake[#{indexchar}N]", 'tasks', grep: args.extras, from: rakefile,
-                                                                             each: ->(val) { val[0] + val[1].to_s })
+                      format_list(raketasks, "rake[#{indexchar}N]", 'tasks', grep: args.extras, from: rakefile, &:join)
                     else
-                      args, opts = args.to_a.partition { |val| indexitem(val) }
-                      if args.empty?
-                        rake(opts: opts)
-                      else
-                        tasks = raketasks
-                        while (n, pre = indexitem(args.shift))
-                          if (item = tasks[n - 1])
-                            cmd = pre ? "#{pre} #{item.first}" : item.first
+                      tasks = raketasks
+                      cmd = nil
+                      opts = []
+                      queue = lambda do
+                        if cmd
+                          cmd += "[#{opts.join(',')}]" unless opts.empty?
+                          rake(cmd, banner: true)
+                          cmd = nil
+                        elsif !opts.empty?
+                          rake(banner: true, opts: opts)
+                        end
+                        opts.clear
+                      end
+                      args.to_a.each do |item|
+                        if (n, pre = indexitem(item))
+                          queue.call
+                          if (item = tasks[n.pred])
+                            cmd = [pre, item.first].compact.join(' ')
                           elsif exception
                             indexerror n, tasks
                           else
                             log.warn "rake task #{n} of #{tasks.size} (out of range)"
+                            opts.clear
                             next
                           end
-                          if opts.empty?
-                            rake cmd
-                          else
-                            rake(cmd + shell_escape("[#{opts.join(',')}]"))
-                            opts.clear
-                          end
+                        else
+                          opts << item
                         end
                       end
+                      queue.call
                     end
                   end
                 when 'irb'
                   format_desc action, nil, 'opts*,args*|:'
                   task action do |_, args|
-                    args = args.to_a
-                    name = gemlib.any? { |file| basepath(file).join("#{gemname}.rb").exist? } ? gemname : nil
-                    irb(name, args, args: (readline('Enter file [arguments]', force: false) if args.delete(':')))
+                    opts = args.to_a
+                    args = Array(opts.delete(':') && readline('Enter file [arguments]', force: false))
+                    name = gemname if gemlib.any? { |file| exist?(file, "#{gemname}.rb") }
+                    irb(*args, opts: opts, name: name, verbose: false)
                   end
-                else
-                  format_desc(action, nil, 'opts*', before: case action
-                                                            when 'cache', 'check' then nil
-                                                            else 'command+'
-                                                            end)
+                when 'rbs'
+                  next unless @steepfile
+
+                  data = {}
+                  target = nil
+                  File.foreach(@steepfile) do |line|
+                    if line =~ /^\s*target(?:\s+|\(\s*)(?::(\S+)|(["'])(.+)\2)/
+                      target = [[], []]
+                      data[$1 || $3.gsub(/[: ]/, '-')] = target
+                      next
+                    end
+                    next unless target && line =~ /^\s*(check|signature)\s+(["'])(.+)\2/
+
+                    target[$1 == 'check' ? 1 : 0] << $3
+                  end
+                  next if data.empty?
+
+                  namespace 'rbs' do
+                    data.each do |key, item|
+                      sig, lib = item
+                      next if sig.empty? || lib.empty?
+
+                      format_desc action, key, 'sig?,path*'
+                      task key do |_, args|
+                        args = args.to_a
+                        list = lib.flat_map do |val|
+                          val = File.join(val, '**/*.rb') unless val.include?('*') || val.match?(/\.[a-z\d]+$/i)
+                          Dir.glob(val, base: path)
+                        end
+                        files = if args.empty?
+                                  choice_index('Select files', list, multiple: true, series: true,
+                                                                     accept: [accept_y('Generate?')])
+                                else
+                                  list.map! { |val| basepath(val).to_s }
+                                  [].tap do |out|
+                                    ret = []
+                                    args.each do |val|
+                                      if val.include?('*')
+                                        ret.concat(Dir.glob(val, base: path))
+                                      elsif !(file = basepath!(val))
+                                        print_error(val, hint: 'not found')
+                                      elsif file.directory?
+                                        ret.concat(file.glob('**/*.rb'))
+                                      else
+                                        ret << val
+                                      end
+                                    end
+                                    ret = ret.select { |val| list.include?(basepath(val).to_s) }
+                                    if ret.empty?
+                                      print_error('steep', 'no files matched', hint: "#{key}:check")
+                                      exit 1
+                                    end
+                                    out.replace(ret.uniq)
+                                  end
+                                end
+                        sig = if (n = sig.index(args.first))
+                                args.shift
+                                sig[n]
+                              elsif sig.size > 1
+                                choice_index('Select a sig', sig, series: true)
+                              else
+                                sig.first
+                              end
+                        rbs(:prototype, sig, *files)
+                      end
+                    end
+                  end
+                when 'rubocop'
+                  next unless @rubocopfile
+
+                  format_desc action, nil, 'opts*,path*/:'
                   task action do |_, args|
-                    bundle(action, *args.to_a)
+                    opts, args = args.to_a.partition do |val|
+                      next true if val.match?(/\A(?:(?:[A-Z]|[a-z-]+)=.|[a-z]+(?:-[a-z]+)*\Z)/)
+
+                      !val.include?('*') && !val.end_with?('/')
+                    end
+                    if opts.delete(':')
+                      args << (Dir.exist?('lib') ? 'lib/' : '**/*.rb') if args.empty?
+                      list = args.map! { |val| val.end_with?('/') || Dir.exist?(val) ? File.join(val, '**/*.rb') : val }
+                                 .flat_map { |val| Dir.glob(val, base: path) }
+                      args = choice_index('Select files', list, multiple: true)
+                    end
+                    rubocop(*args, opts: opts, banner: true)
                   end
                 end
               else
                 namespace action do
                   flags.each do |flag|
                     case action
-                    when 'install', 'update', 'outdated'
-                      format_desc action, flag, 'opts*'
+                    when 'outdated'
+                      format_desc action, flag, "#{shortname('i', 's', 'u', 'd')},e/xplicit,opts*"
                       task flag do |_, args|
-                        __send__ action, flag, args.to_a
+                        outdated flag, args.to_a
                       end
                     when 'gem'
                       case flag
                       when :outdated
-                        format_desc action, flag, 'major|minor|patch|interactive?,opts*'
+                        format_desc action, flag, "semver?=major|minor|patch,#{shortname('i', 's', 'u', 'd')},opts*"
                         task flag, [:semver] do |_, args|
-                          case (filter = args.semver)
-                          when 'major', 'minor', 'patch', 'interactive', 'i'
-                            filter = 'interactive' if filter == 'i'
-                            args = args.extras
-                          else
-                            filter = nil
-                            args = args.to_a
-                          end
-                          gem!(flag, args, filter: filter)
+                          opts = case (semver = args.semver)
+                                 when 'major', 'minor', 'patch'
+                                   args.extras
+                                 else
+                                   semver = nil
+                                   args.to_a
+                                 end
+                          gem(flag, opts: opts, banner: true, filter: {
+                            semver: semver,
+                            update: has_value!(opts, 'u', 'update'),
+                            interactive: has_value!(opts, 'i', 'interactive'),
+                            select: has_value!(opts, 's', 'select'),
+                            dryrun: has_value!(opts, 'd', 'dry-run')
+                          })
                         end
                       when :build, :push, :exec, :update
                         format_desc(action, flag, 'opts*', after: case flag
                                                                   when :exec then 'command,args*'
-                                                                  when :push then 'file?|:'
+                                                                  when :push then 'file/:'
                                                                   when :update then 'name*'
                                                                   end)
                         task flag do |_, args|
-                          gem! flag, args.to_a
+                          gem(flag, opts: args.to_a, banner: true)
                         end
-                      else
+                      when :install, :uninstall, :pristine
                         format_desc(action, flag, 'opts*', after: flag == :pristine ? 'name*|name?@version' : 'name*')
                         task flag do |_, args|
-                          args = param_guard(action, flag, args: args.to_a)
-                          gem! flag, args
+                          opts = param_guard(action, flag, args: args.to_a)
+                          gem(flag, opts: opts, banner: true)
+                        end
+                      when :command
+                        format_desc action, flag, 'command,opts*,args*'
+                        task flag, [:command] do |_, args|
+                          command = param_guard(action, flag, key: :command, args: args)
+                          gem(command.to_sym, opts: args.extras, banner: true)
+                        end
+                      end
+                    when 'bundle'
+                      case flag
+                      when :install, :update, :cache, :exec
+                        format_desc(action, flag, 'opts*', after: case flag
+                                                                  when :update then 'gems*'
+                                                                  when :exec then 'command,args*|:'
+                                                                  end)
+                        task flag do |_, args|
+                          bundle(flag, opts: args.to_a, banner: flag == :exec ? verbose? : true)
+                        end
+                      when :config
+                        format_desc action, flag, 'list|set|get|unset?,opts*,args*'
+                        task flag do |_, args|
+                          bundle(flag, *args.to_a, banner: true)
+                        end
+                      when :reinstall
+                        format_desc action, flag, 'f/orce?,opts*'
+                        task flag do |_, args|
+                          opts = args.to_a
+                          opts << 'redownload' if has_value!(opts, 'f', 'force')
+                          if (lock = basepath!('Gemfile.lock'))
+                            config = basepath '.bundle', 'config'
+                            if config.exist? && config.read.match?(/\bBUNDLE_FROZEN:\s+"true"/)
+                              if opts.include?('redownload')
+                                run(bundle_output('config unset frozen'), banner: false)
+                              else
+                                print_error('Gemfile.lock is frozen', subject: name, hint: flag)
+                                lock = nil
+                              end
+                            end
+                            lock&.delete
+                          end
+                          bundle(:install, opts: opts, banner: true)
+                        end
+                      when :command
+                        format_desc action, flag, 'command,opts*,args*'
+                        task flag, [:command] do |_, args|
+                          command = param_guard(action, flag, key: :command, args: args)
+                          bundle(command.to_sym, opts: args.extras, banner: true)
                         end
                       end
                     when 'ruby'
@@ -9795,30 +11399,29 @@ module Squared
                       when :file
                         format_desc action, flag, 'path,opts*,args*'
                         task flag, [:rb] do |_, args|
-                          file = args.rb
                           opts = args.extras
-                          args = if file && !file.include?('*')
-                                   ENV['RUBY_ARGS']
-                                 else
-                                   a, b, c = choice_index('Select a file', Dir.glob(file || '*.rb', base: path),
-                                                          values: (file ? [] : ['Options']).push('Arguments'),
-                                                          series: true)
-                                   if file
-                                     file = a
-                                     b
-                                   else
-                                     file = a
-                                     opts.concat(OptionPartition.strip(b))
-                                     c
-                                   end
-                                 end
-                          ruby(flag, opts, file: file, args: args)
+                          args = Array(if (file = args.rb) && !file.include?('*')
+                                         ENV['RUBY_ARGS']
+                                       else
+                                         a, b, c = choice_index('Select a file', Dir.glob(file || '*.rb', base: path),
+                                                                values: (file ? [] : ['Options']).push('Arguments'),
+                                                                series: true)
+                                         if file
+                                           file = a
+                                           b
+                                         else
+                                           file = a
+                                           opts.concat(OptionPartition.strip(b))
+                                           c
+                                         end
+                                       end)
+                          ruby(flag, *args, opts: opts, file: file)
                         end
                       when :script
                         format_desc action, flag, 'opts*'
                         task flag do |_, args|
-                          command = ENV['RUBY_E'] || readline('Enter script', force: true, multiline: ['##', ';'])
-                          ruby(flag, args.to_a, command: command)
+                          command = ENV['RUBY_E'] || readline('Enter script', force: true, multiline: %w[## ;])
+                          ruby(flag, opts: args.to_a, command: command)
                         end
                       when :version
                         format_desc action, flag
@@ -9840,17 +11443,34 @@ module Squared
           elsif outdated?
             workspace.rev_clear(name, sync: sync)
             cmd = bundle_session 'install'
+            option('binstubs') do |val|
+              next if val == '0' || val == 'false'
+
+              run(bundle_output('binstubs --all', case val
+                                                  when '1', 'true'
+                                                    nil
+                                                  else
+                                                    if val.start_with?('~')
+                                                      val = File.join(Dir.home, val == '~' ? '.bundle' : val[1..-1])
+                                                      if prod?
+                                                        config_set('binstubs', shell_quote(val), global: true)
+                                                        val = nil
+                                                      end
+                                                    else
+                                                      val = basepath val
+                                                    end
+                                                    quote_option('path', val) if val
+                                                  end), exception: false, banner: false, series: true)
+            end
             if prod? && !config_get('without')
-              if RUBY_VERSION > '3'
+              if semgte?('3')
                 config_set 'without', 'development'
               else
                 cmd << '--without=development'
               end
             end
-            if (n = option('jobs')).to_i > 0
-              cmd << "-j#{n}"
-            end
-            run_rb(from: :depend, sync: sync)
+            option('jobs') { |n| cmd << "-j#{n}" if n.to_i > 0 }
+            run_rb(sync: sync, from: :depend)
           end
         end
 
@@ -9863,9 +11483,9 @@ module Squared
             return super unless @copy.is_a?(Hash)
 
             from = @copy[:from] if @copy.key?(:from)
+            into = @copy[:into] if @copy.key?(:into)
             glob = @copy[:include] if @copy.key?(:include)
             pass = @copy[:exclude] if @copy.key?(:exclude)
-            into = @copy[:into] if @copy.key?(:into)
           end
           return unless into
 
@@ -9878,11 +11498,9 @@ module Squared
             b = dest + val
             c = glob[i] || glob.first
             log.info "cp #{a + c} #{b}"
-            begin
-              copy_dir(a, b, c, pass: pass, verbose: verbosetype > 0)
-            rescue StandardError => e
-              on_error e, :copy
-            end
+            copy_dir(a, b, c, pass: pass, verbose: !silent?)
+          rescue StandardError => e
+            on_error e, :copy
           end
           on :last, :copy
         end
@@ -9890,37 +11508,63 @@ module Squared
         def outdated(flag = nil, opts = [], sync: invoked_sync?('outdated', flag))
           cmd = bundle_output 'outdated'
           if flag
-            cmd << "--#{flag}"
-            append_bundle(opts, OPT_BUNDLE[:outdated] + OPT_BUNDLE[:common], target: cmd)
+            se = has_value!(opts, 's', 'select')
+            ia = has_value!(opts, 'i', 'interactive') && !se
+            up = has_value!(opts, 'u', 'update')
+            opts << 'only-explicit' if has_value!(opts, 'e', 'explicit')
+            dryrun = has_value!(opts, 'd', 'dry-run')
+            if !sync || stdin?
+              se = false
+              ia = false
+            elsif se || ia || up
+              items = []
+            end
+            OptionPartition.new(opts, bundleopts(:outdated), cmd << "--#{flag}", project: self)
+                           .clear
+          elsif (up = option('u', 'update', prefix: 'bundle'))
+            flag = case up
+                   when 'major', 'minor'
+                     up.to_sym
+                   else
+                     :patch
+                   end
+            items = []
           end
+          cmd << '--only-explicit' if option('only-explicit', prefix: 'bundle')
+          dryrun ||= dryrun?(prefix: 'bundle')
           log.info cmd.to_s
           on :first, :outdated
           banner = format_banner cmd.to_s
           print_item banner if sync
           pwd_set(from: :outdated) do
+            tc = theme[:current]
             start = 0
             found = 0
             major = 0
+            col = 0
             buffer = []
             out = ->(val) { sync ? puts(val) : buffer << val }
-            IO.popen(cmd.temp('--no-color')).each do |line|
+            IO.popen(cmd.temp('--no-color')).readlines(chomp: true).each do |line|
               if start > 0
+                n = line.size
                 unless stdin?
+                  line = line[0, col] if col > 0
                   data = line.scan(SEM_VER)
                   next unless (cur = data.shift) && (lat = data.shift)
 
                   semver cur
                   semver lat
+                  type = semtype cur, lat
                   c = cur.join
                   l = lat.join
                   styles = []
-                  major_set = lambda do
+                  ma = lambda do
                     styles = %i[green bold]
                     major += 1
                   end
-                  minor_set = -> { styles[0] = cur[2] == lat[2] ? :yellow : :green }
+                  mi = -> { styles[0] = type == 2 ? :yellow : :green }
                   if data.empty?
-                    semmajor?(cur, lat) ? major_set.call : minor_set.call
+                    type == 1 ? ma.call : mi.call
                   else
                     data.each do |val|
                       break unless line =~ /(>=?|=|~>|!=|<=?) (#{Regexp.escape(val.join)})/
@@ -9928,11 +11572,11 @@ module Squared
                       v = semver(val).join
                       case $1
                       when '>', '>='
-                        semmajor?(cur, lat) ? major_set.call : minor_set.call
+                        type == 1 ? ma.call : mi.call
                       when '<', '<='
                         if c <= v
-                          if semmajor?(cur, lat)
-                            major_set.call
+                          if type == 1
+                            ma.call
                           else
                             styles[0] = :yellow
                           end
@@ -9954,26 +11598,37 @@ module Squared
                       end
                     end
                   end
+                  name = line[/^\S+/, 0]
                   unless styles.empty?
                     case styles.first
                     when :green
-                      line = sub_style(line, pat: /^(\S+)(.+)$/, styles: theme[styles.last == :bold ? :major : :active])
+                      sub_style!(line, **opt_style(theme[styles.last == :bold ? :major : :active], /^(\S+)(.+)$/))
                       found += 1
                     when :yellow
                       found += 1
                     end
-                    if theme[:current]
-                      line = sub_style(line, styles: theme[:current], pat: /^(.+)(#{Regexp.escape(c)})(.+)$/, index: 2)
-                    end
-                    line = sub_style(line, *colormap(styles), pat: /^((?:\S+\s+){2})(#{Regexp.escape(l)})(.*)$/,
-                                                              index: 2)
+                    sub_style!(line, **opt_style(tc, /^(.+)(#{Regexp.escape(c)})(.+)$/, 2)) if tc
+                    sub_style!(line, **opt_style(colormap(styles), /^((?:\S+\s+){2})(#{Regexp.escape(l)})(.*)$/, 2))
                   end
                 end
-                out.call('%2d. %s' % [start, line])
+                s = '%2d. %s' % [start, line]
+                if ia
+                  unless confirm_semver(s.ljust(col + 4 + line.size - n), type)
+                    start += 1
+                    next
+                  end
+                elsif !se
+                  out.call(s)
+                end
+                items&.push([line, name])
               elsif line.start_with?('Gem')
                 unless stdin?
-                  sub = { pat: /^(.+)(?<!\dm)(Gem|Latest)(.+)$/, styles: theme[:header], index: 2 }
-                  out.call(print_footer(" #  #{line.chomp}", reverse: true, sub: [sub, sub]))
+                  if ia
+                    line.sub!(/\sGroups$/, '')
+                    col = line.size
+                  end
+                  sub = [opt_style(theme[:header], /^(.+)(?<!\dm)(Gem|Latest)(.+)$/, 2)] * 2
+                  out.call(print_footer(" #  #{line}", reverse: true, sub: sub))
                 end
               else
                 next
@@ -9985,111 +11640,96 @@ module Squared
               puts buffer
             end
             if found > 0
+              unless Array(items).empty?
+                gems = if se
+                         choice('Select a package', items.map(&:first),
+                                multiple: true, force: false, index: true, border: true).map! { |n| items[n.pred].last }
+                       else
+                         items.map(&:last)
+                       end
+                if dryrun
+                  print_run bundle_output("update --#{flag}", *gems.quote!), false
+                else
+                  bundle(:update, *gems, opts: [flag.to_s])
+                end
+              end
               begin
-                if major == 0 && dependfile.read =~ /\b(?:source\s+(["'])((?~\1))\1|remote:\s+(\S+))/
-                  status = ($2 || $3).chomp('/')
-                  right = true
+                status = nil
+                if gems
+                  status = "#{gems.size} packages were updated"
+                else
+                  File.foreach(dependfile) do |line|
+                    next unless line =~ /\b(?:source\s+(["'])((?~\1))\1|remote:\s+(\S+))/
+
+                    status = ($2 || $3).chomp('/')
+                    break
+                  end
                 end
               rescue StandardError => e
                 log.debug e
-              ensure
-                status ||= 'Updates are available'
               end
-              puts print_footer(empty_status(status, 'major', major, always: !right), right: right)
-            elsif start == 0
+              puts print_footer(status || 'Updates are available', right: status.include?('/'))
+            elsif start == 0 && banner
               puts 'No updates were found'
             end
           end
           on :last, :outdated
         end
 
-        def install(flag, opts = [])
-          bundle_session 'install', "--#{flag}"
-          op = append_bundle opts, OPT_BUNDLE[:install_base] + OPT_BUNDLE[:install] + OPT_BUNDLE[:common]
-          if op.arg?('force')
-            op.delete('--force')
-            if flag != :redownload
-              op << '--redownload'
-            elsif (lock = basepath('Gemfile.lock')).exist?
-              config = basepath '.bundle', 'config'
-              lock.delete unless config.exist? && config.read.match?(/\bBUNDLE_FROZEN:\s+"true"/)
-            end
-          end
-          run_rb(from: :install)
-        end
-
-        def update(flag, opts = [])
-          bundle_session 'update', "--#{flag}"
-          append_bundle(opts, OPT_BUNDLE[:install_base] + OPT_BUNDLE[:update] + OPT_BUNDLE[:common],
-                        append: flag == :all ? nil : /\A[a-z-]+=/)
-          run_rb(from: :update)
-        end
-
-        def ruby(flag, opts = [], file: nil, command: nil, args: nil)
-          case flag
-          when :file, :script
-            op = OptionPartition.new(opts, OPT_RUBY[:ruby], ruby_session, project: self, args: true)
-            if command
-              op << quote_option('e', command, option: false)
-            elsif file
-              op.unshift(basepath(file))
-            end
-            unless op.arg?('e')
-              op.push(args) if args
-              op.append(delim: true, escape: false, quote: false) unless op.empty?
-            end
-          when :version
+        def ruby(*args, flag: nil, sync: true, banner: verbose?, with: nil, pass: PASS_RUBY[:ruby], **kwargs)
+          flag = args.shift if !flag && args.first.is_a?(Symbol)
+          if flag == :version
             pwd_set do
               out = []
               order = { 'rbenv' => -1, 'rvm' => -1, 'asdf' => -1, 'chruby' => -1 }
               ENV.fetch('PATH', '').split(':').each_with_index do |val, index|
                 order.each_key do |key|
-                  if val.match?(%r{[/.]#{key}/})
-                    order[key] = index
-                    break
+                  next unless val.match?(%r{[/.]#{key}/})
+
+                  order[key] = index
+                  break
+                end
+              end
+              if @asdf
+                [File.join(ENV.fetch('ASDF_DATA_DIR', '$HOME/.asdf'), "installs/#{@asdf.first}")]
+              else
+                [
+                  "#{ENV.fetch('RBENV_ROOT', '$HOME/.rbenv')}/bin/rbenv",
+                  '$HOME/.rvm/bin/rvm',
+                  '/usr/bin/rbenv',
+                  '/usr/local/rvm/bin/rvm',
+                  '/usr/share/rvm/bin/rvm',
+                  '/usr/local/share/chruby/chruby.sh'
+                ].sort do |a, b|
+                  c = -1
+                  d = -1
+                  order.each do |key, val|
+                    pat = %r{/\.?#{key}}
+                    c = val if a.match?(pat)
+                    d = val if b.match?(pat)
+                  end
+                  if c == d
+                    0
+                  elsif c == -1
+                    1
+                  elsif d == -1
+                    -1
+                  else
+                    c < d ? -1 : 1
                   end
                 end
-              end
-              paths = [
-                "#{ENV.fetch('RBENV_ROOT', '$HOME/.rbenv')}/bin/rbenv",
-                '$HOME/.rvm/bin/rvm',
-                @asdf ? "#{ENV.fetch('ASDF_DATA_DIR', '$HOME/.asdf')}/installs/#{@asdf.first}" : nil,
-                '/usr/bin/rbenv',
-                '/usr/local/rvm/bin/rvm',
-                '/usr/share/rvm/bin/rvm',
-                '/usr/local/share/chruby/chruby.sh'
-              ].compact
-              paths.sort do |a, b|
-                c = -1
-                d = -1
-                order.each do |key, val|
-                  pat = %r{/\.?#{key}}
-                  c = val if a.match?(pat)
-                  d = val if b.match?(pat)
-                end
-                if c == d
-                  0
-                elsif c == -1
-                  1
-                elsif d == -1
-                  -1
-                else
-                  c < d ? -1 : 1
-                end
-              end
-              .push('')
-              .each do |val|
+                .push('')
+              end.each do |val|
                 next unless val.empty? || File.exist?(val.sub('$HOME', Dir.home))
 
-                trim = ->(s) { s[/\A\D+\d+\.\d+(?:\.\S+)?/, 0].sub(/\A([a-z]+)-/i, '\1 ') }
+                trim = ->(s) { s[/^\D+\d+\.\d+(?:\.\S+)?/, 0].sub(/^([a-z]+)-/i, '\1 ') }
                 ver = '.ruby-version'
                 out << trim.call(case (cmd = File.basename(val))
                                  when 'rvm'
                                    `rvm current`[/^\S+/, 0]
                                  when 'rbenv'
-                                   `rbenv version-name`.yield_self do |name|
-                                     name.match?(SEM_VER) ? "ruby #{name}" : name
-                                   end
+                                   name = `rbenv version-name`
+                                   name.match?(SEM_VER) ? "ruby #{name}" : name
                                  when 'chruby.sh'
                                    chruby = session_output 'source', val
                                    `#{chruby.with('ruby --version')}`
@@ -10098,7 +11738,7 @@ module Squared
                                      cmd = 'asdf'
                                      ver = '.tool-versions'
                                      opt = [@asdf.first]
-                                     opt.unshift('--no-header') unless @@asdf[1] == 15
+                                     opt.unshift('--no-header') unless @@asdf.version == 15
                                      `asdf current #{opt.join(' ')}`[/^\S+\s+\S+/, 0].sub(/\s+/, ' ')
                                    else
                                      ver = nil
@@ -10143,171 +11783,266 @@ module Squared
               end
               out.map!(&:split)
               pad = out.map(&:first).map!(&:size).max
+              print_item
               puts(out.map! { |line| '%*s %s' % [pad, line.first, line[1..-1].join(' ')] })
             end
             return
           end
-          run_rb(banner: false, from: :"ruby:#{flag}")
-        end
-
-        def gem!(flag, opts = [], filter: nil)
-          cmd = gem_session
-          case flag
-          when :outdated
-            cmd << gempwd << flag
-          else
-            cmd << flag
-          end
-          list = OPT_GEM[flag] + OPT_GEM[:common]
-          from = :"gem:#{flag}"
-          case flag
-          when :install, :update
-            list.concat(OPT_GEM[:install_base])
-          end
-          op = OptionPartition.new(opts, list, cmd, project: self, no: OPT_GEM[:no][flag])
-          op.each do |opt|
-            if !opt.match?(/\A[A-Za-z\d][A-Za-z\d_.-]*\z/) && %i[install uninstall update pristine].include?(flag)
-              op.errors << opt
+          opts = session_opts(with, args: args, kwargs: kwargs, pass: pass)
+          op = OptionPartition.new(opts, OPT_RUBY[:ruby], ruby_session, project: self, multiple: [/^-e/], args: true,
+                                                                        stdin: true)
+          if kwargs[:command]
+            op << quote_option('e', kwargs[:command])
+          elsif kwargs[:file]
+            if op.include?('-')
+              op.add_path(kwargs[:file])
             else
-              op.found << opt
+              op.unshift(basepath(kwargs[:file]))
             end
           end
-          op.swap
+          op.concat(args)
+          if op.include?('-')
+            op.exist?(add: true)
+          else
+            op.append_any { |val| OptionPartition.parse_arg!('e', val) }
+            if op.arg?('e')
+              op.clear
+            else
+              op.append(delim: true, escape: kwargs.fetch(:escape, false), quote: kwargs.fetch(:quote, false))
+            end
+          end
+          from = if flag
+                   :"ruby:#{flag}"
+                 else
+                   print_run(op, banner, **kwargs)
+                   :ruby
+                 end
+          run_rb(sync: sync, banner: banner, exception: kwargs.fetch(:exception, exception), from: from)
+        end
+
+        def gem(flag, *args, sync: true, banner: verbose?, with: nil, pass: nil, **kwargs)
+          flag = flag.to_sym
+          if pass.nil?
+            pass = case flag
+                   when :install, :update
+                     PASS_RUBY[:gem][:install]
+                   when :dependency, :fetch, :info, :list, :outdated, :search, :specification
+                     PASS_RUBY[:gem][:dependency]
+                   else
+                     PASS_RUBY[:gem].fetch(flag, [])
+                   end
+          end
+          opts = session_opts(with, args: args, kwargs: kwargs, pass: pass)
           case flag
-          when :outdated
+          when :build, :cert, :generate_index, :mirror, :outdated, :push, :server, :signin, :signout, :sources, :stale
+            opts.concat(args)
+          end
+          op = OptionPartition.new(opts, gemopts(flag), gem_session(flag),
+                                   project: self, no: OPT_GEM[:no][flag == :update ? :install : flag])
+          from = :"gem:#{flag}"
+          if flag == :outdated
+            op.adjoin(gempwd, start: 0) if gempwd
             op.clear
-            cmd = cmd.done
+            cmd = session_done op.target
             log.info cmd
             on :first, from
-            print_item format_banner(cmd)
-            major = 0
-            minor = 0
-            patch = 0
-            update = []
+            banner = format_banner(cmd)
+            print_item banner if sync
+            major = [0, 0, 0]
+            buffer = []
+            filter = kwargs.fetch(:filter, {})
+            semver = filter[:semver]
+            update = if sync && filter[:select]
+                       semver ||= 'major'
+                       items = []
+                       nil
+                     elsif sync && filter[:interactive]
+                       semver ||= 'major'
+                       ia = true
+                       []
+                     elsif filter[:update]
+                       semver ||= 'minor'
+                       []
+                     end
+            out = ->(val) { sync ? puts(val) : buffer << val }
             pwd_set(pass: !gempwd.nil?, from: from) do
-              items = [[%w[Gem Current Latest], nil]]
+              rows = [[%w[Gem Current Latest], nil]]
               IO.popen(cmd).each do |line|
                 if line =~ /^(\S+) \((\S+) < ([^)]+)\)$/
                   cur = semscan $2
                   lat = semscan $3
-                  items << [$~.to_a.drop(1), if semmajor?(cur, lat)
-                                               1
-                                             else
-                                               cur[2] == lat[2] ? 3 : 2
-                                             end]
+                  rows << [$~.to_a.drop(1), semtype(cur, lat)]
                 else
-                  puts line
+                  out.call(line)
                 end
               end
-              if items.size > 1
-                pad = [items.size.to_s.size + 1, 3].max
+              if rows.size > 1
+                pad = [rows.size.to_s.size.succ, 3].max
                 d = 0
                 e = 0
                 f = 0
                 j = 0
                 queue = nil
-                items.each do |item|
-                  a, b, c = item.first
+                rows.each do |row|
+                  a, b, c = row.first
                   d = a.size if a.size > d
                   e = b.size if b.size > e
                   f = c.size if c.size > f
                 end
-                items.each_with_index do |item, i|
+                rows.each_with_index do |row, i|
                   next if i == 0 && stdin?
 
-                  a, b, c = item.first
+                  a, b, c = row.first
+                  type = row.last
                   if i == 0
                     line = '%-*s %-*s    %*s  %*s' % [pad, ' #', d, a, e, b, f, c]
-                    n = line.size
-                    2.times do
-                      line = sub_style(line, pat: /^(.+)(?<!\dm)(#{a}|#{c})(.*)$/, styles: theme[:header], index: 2)
-                    end
-                    queue = [line, sub_style(ARG[:BORDER][1] * n, styles: borderstyle)]
+                    s = ARG[:BORDER][1] * line.size
+                    queue = if stdin?
+                              [line, s]
+                            else
+                              2.times do
+                                sub_style!(line, **opt_style(theme[:header], /^(.+)(?<!\dm)(#{a}|#{c})(.*)$/, 2))
+                              end
+                              [line, sub_style(s, borderstyle)]
+                            end
                   else
                     g = a.ljust(d)
                     pat = [/^([^.]+\.)([^.]+\..+)$/, /^([^.]+\.[^.]+\.)(.+)$/]
                     pre = b.start_with?('0.')
                     latest = [theme[:latest]]
-                    case item.last
+                    case type
                     when 1
-                      case filter
+                      case semver
                       when 'major'
-                        update << a
+                        update&.push(a)
                       when 'minor', 'patch'
                         next
                       end
-                      g = sub_style(g, styles: theme[:major])
-                      major += 1
-                      styles = %i[green bold]
-                      pat = pre ? pat.first : nil
-                      latest << :bold
+                      unless stdin?
+                        sub_style! g, theme[:major]
+                        styles = %i[green bold]
+                        pat = (pat.first if pre)
+                        latest << :bold
+                      end
+                      major[0] += 1
                     when 2
-                      case filter
+                      case semver
                       when 'major', 'minor'
-                        update << a
+                        update&.push(a)
                       when 'patch'
                         next
                       end
-                      g = sub_style(g, styles: theme[:active])
-                      minor += 1
-                      styles = %i[green]
-                      pat = pre ? pat.last : pat.first
-                    else
-                      case filter
-                      when 'major', 'minor', 'patch'
-                        update << a
+                      unless stdin?
+                        sub_style! g, theme[:active]
+                        styles = %i[green]
+                        pat = pre ? pat.last : pat.first
                       end
-                      patch += 1
-                      styles = %i[yellow]
-                      pat = pat.last
+                      major[1] += 1
+                    else
+                      case semver
+                      when 'major', 'minor', 'patch'
+                        update&.push(a)
+                      end
+                      unless stdin?
+                        styles = %i[yellow]
+                        pat = pat.last
+                      end
+                      major[2] += 1
                     end
-                    b = sub_style(b.rjust(e), *colormap(styles), pat: pat, index: 2)
-                    h = sub_style(c.rjust(f), styles: latest.flatten.compact, pat: pat, index: 2)
+                    b = b.rjust(e)
+                    h = c.rjust(f)
+                    unless stdin?
+                      sub_style!(b, **opt_style(colormap(styles), pat, 2))
+                      sub_style!(h, **opt_style(latest.flatten.compact, pat, 2))
+                    end
                     j += 1
                     if queue
-                      puts queue
+                      out.call(queue)
                       queue = nil
                     end
-                    puts '%*s %s    %s  %s' % [pad, "#{j}.", g, b, h]
-                    update << a if filter == 'interactive' && confirm_outdated(a, c, item.last)
+                    s = ('%s    %s  %s' % [g, b, h]).yield_self do |val|
+                      items&.push([val, a])
+                      '%*s %s' % [pad, "#{j}.", val]
+                    end
+                    if ia
+                      unless confirm_semver(s, type)
+                        update.delete(a)
+                        next
+                      end
+                    elsif !items
+                      out.call(s)
+                    end
                   end
                 end
               end
             end
-            if major + minor + patch == 0
+            unless sync
+              print_item banner
+              puts buffer
+            end
+            if major.sum == 0
               puts 'No updates were found'
             else
-              unless update.empty?
-                cmd = gem_output 'update', '-f'
+              if items
+                update = choice('Select a package', items.map(&:first),
+                                multiple: true, force: false, index: true, border: true).map! { |n| items[n.pred].last }
+              end
+              unless Array(update).empty?
+                opts = ['f']
                 option('document', prefix: 'gem', ignore: false) do |val|
-                  cmd << case val
-                         when '0', 'false'
-                           '--no-document'
-                         else
-                           basic_option 'document', val
-                         end
+                  opts << case val
+                          when '0', 'false'
+                            'no-document'
+                          else
+                            "document=#{val}"
+                          end
                 end
                 option('user-install', prefix: 'gem', ignore: false) do |val|
-                  cmd << case val
-                         when '0', 'false'
-                           '--no-user-install'
-                         else
-                           '--user-install'
-                         end
+                  opts << case val
+                          when '0', 'false'
+                            'no-user-install'
+                          else
+                            'user-install'
+                          end
                 end
-                cmd.merge(update)
-                run(cmd, banner: false, from: :'gem:update')
+                if filter[:dryrun]
+                  print_run gem_output('update -f', *update.quote!), false
+                else
+                  gem(:update, *update, opts: opts)
+                end
               end
-              print_status(major, minor, patch, from: :outdated)
+              print_status(*major, from: :outdated)
             end
             on :last, from
             return
+          end
+          case flag
+          when :check, :cleanup, :contents, :fetch, :info, :lock, :open, :owner, :pristine, :rdoc, :rebuild, :uninstall,
+               :unpack, :update, :yank
+            gems = true
+            op.concat(args)
+          when :dependency, :environment, :list, :search, :specification, :which
+            op.concat(args)
+          end
+          op.each do |opt|
+            if gems && !opt.start_with?('-') && !opt.match?(GEMNAME)
+              op.errors << opt
+            else
+              op.found << opt
+            end
+          end
+          op.swap do |a, b|
+            return -1 if a.start_with?('-')
+
+            b.start_with?('-') ? 1 : 0
+          end
+          case flag
           when :build
             if op.empty?
-              raise_error('gemspec not found', hint: project) unless gemfile
+              raise_error Errno::ENOENT, 'gemspec', hint: project unless gemfile
               op.add_path(gemfile)
             else
-              op.add_path(op.shift)
+              op.add_first(path: true)
                 .clear(pass: false)
             end
           when :push
@@ -10318,38 +12053,51 @@ module Squared
                                 choice_index 'Select a file', Dir.glob('*.gem', base: path)
                               end)
             else
-              file = op.shift.yield_self { |val| val.include?('.') ? val : "#{val}.gem" }
-              raise_error("unknown args: #{op.join(', ')}", hint: flag) unless op.empty?
+              file = basepath(op.shift.yield_self { |val| val.include?('.') ? val : "#{val}.gem" })
+              raise_error Errno::ENOENT, file, hint: flag unless file.exist?
+              raise_error ArgumentError, "unrecognized args: #{op.join(', ')}", hint: flag unless op.empty?
             end
-            raise_error('gem not found', hint: file) unless op.exist?(file)
             op.add_path(file)
-            run_rb(from: from, interactive: "Push #{sub_style(gemname, styles: theme[:active])}")
-            return
+            return run_rb(from: from, interactive: ['Push', 'N', gemname]) unless with || !banner
           when :exec
             min = if op.arg?('g', 'gem')
                     1
-                  elsif op.empty?
+                  elsif !op.empty?
+                    op.add_first
+                    0
+                  elsif args.empty?
                     op << basic_option('gem', gemname)
                     1
                   else
-                    op << op.shift
                     0
                   end
+            op.concat(args)
             if (args = command_args(op.extras, min: min, force: min == 1 && op.empty?))
               op.push(args)
             end
             op.append(quote: false)
           when :update
-            unless op.arg?('system')
-              if op.empty?
-                op << gemname
-              else
-                op.append
-              end
+            if !op.arg?('n', 'bindir') && (bin = config_get('bin')) && Dir.exist?(bin)
+              op << quote_option('bindir', bin)
             end
-            op.clear(errors: true)
+            if op.arg?('system')
+              op.add_first(quote: false) { |val| val if val.match?(SEM_VER) }
+            else
+              op.append
+            end
           when :install, :uninstall, :pristine
-            raise_error('missing gemname', hint: flag) if op.empty?
+            if flag == :install
+              post = if op.remove(':')
+                       op.concat(args)
+                       readline('Enter command [args]', force: true)
+                     elsif op.empty?
+                       op.concat(args)
+                       nil
+                     elsif !args.empty?
+                       args.join(' ')
+                     end
+            end
+            raise_error ArgumentError, 'missing gem name', hint: flag if op.empty?
             if op.arg?('all')
               if flag == :pristine
                 append_repeat 'skip', op.extras
@@ -10358,74 +12106,296 @@ module Squared
                 op.clear
               end
             elsif (n = op.index { |val| val.match?(/(\A|[a-z])@\d/) })
-              name = op.delete_at(n)
+              name = op.remove_at(n)
               pre, ver = if (n = name.index('@')) == 0
                            [gemname, name[1..-1]]
                          else
-                           [name[0, n], name[(n + 1)..-1]]
+                           [name[0, n], name[n.succ..-1]]
                          end
               op.adjoin(pre, basic_option('version', ver))
                 .clear
-            elsif flag == :install
+            end
+            if flag == :install
               op.append_any
             else
               op.append
             end
-            op.clear(errors: true)
-            op.delim << readline('Enter command [args]', force: true) if flag == :install && op.remove(':')
-          else
+            op.delim << post if post
+          when :check, :cleanup, :contents, :fetch, :list, :lock, :rdoc
             op.append
-          end
-          run_rb(from: from)
-        end
-
-        def bundle(flag, *args)
-          cmd = bundle_session flag
-          args = case flag
-                 when 'exec', 'cache', 'check'
-                   list = OPT_BUNDLE[flag.to_sym] + OPT_BUNDLE[:common]
-                   OptionPartition.new(args, list, cmd, project: self, args: flag == 'exec').extras
-                 else
-                   args.flatten
-                 end
-          case flag
-          when 'exec', 'config'
-            cmd << readline('Enter arguments', force: true) if args.empty?
-          when 'cache', 'check'
-            option_clear args
-            args.clear
-          end
-          cmd.merge(args)
-          run(from: :"bundle:#{flag}")
-        end
-
-        def rake(*args, opts: [])
-          op = OptionPartition.new(opts, OPT_RUBY[:rake], [(quote_option('f', rakefile) if rakefile)].compact,
-                                   project: self)
-          args.concat(op.extras)
-          if args.empty?
-            args << nil
+          when :dependency, :info, :search
+            op.add_first(quote: true, expect: case flag
+                                              when :dependency, :search then 'no pattern for gem name'
+                                              else 'missing gem name'
+                                              end)
+              .clear
+          when :environment
+            unless op.empty?
+              case (action = op.shift)
+              when 'home', 'path', 'user_gemhome', 'version', 'remotesources', 'platform', 'credentials'
+                op << action
+                op.clear
+              else
+                raise_error ArgumentError, "unrecognized arg: #{action}", hint: flag
+              end
+            end
+          when :open, :owner, :unpack, :yank
+            op.add_first(gemname)
+              .clear
+          when :rebuild
+            op.add_first(expect: 'missing gem name')
+              .add_first(expect: 'missing gem version')
+              .clear
+          when :specification
+            op.add_first(expect: 'missing gem name')
+              .add_first
+              .clear
+          when :which
+            op.splice(path: true) { |val| op.exist?(val) }
+              .clear
           else
-            args.flatten!
-          end
-          cmd = rake_output(*op.to_a)
-          args.map! { |val| cmd.temp(val) }
-          run_s(args, banner: false, from: :rake)
-        end
-
-        def irb(name = nil, opts = [], path: gemlib, args: nil)
-          op = OptionPartition.new(opts, OPT_RUBY[:irb], session('irb'), project: self, first: [/\.rb$/])
-          r = args ? [] : ['bundler/setup']
-          r << name if name
-          r.each { |val| op << shell_option('r', val, merge: true) }
-          Array(path).each { |val| op << quote_option('I', val, merge: true) }
-          if args
-            op.delim << args
             op.clear
-          else
-            op.append(delim: true)
           end
-          run(banner: false)
+          op.clear(errors: true) if gems
+          print_run(op, banner, **kwargs)
+          run_rb(sync: sync, banner: banner, exception: kwargs.fetch(:exception, exception), from: from)
+        end
+
+        def bundle(flag, *args, sync: true, banner: verbose?, with: nil, pass: nil, **kwargs)
+          flag = flag.to_sym
+          if pass.nil?
+            pass = case flag
+                   when :add, :outdated, :update
+                     PASS_RUBY[:bundle][:update]
+                   else
+                     PASS_RUBY[:bundle].fetch(flag, [])
+                   end
+          end
+          opts = session_opts(with, args: args, kwargs: kwargs, pass: pass)
+          invalid = ->(a) { raise_error ArgumentError, "unrecognized args: #{a.join(', ')}", hint: flag }
+          cmd = bundle_session(flag)
+          case flag
+          when :cache, :check, :clean, :init, :install, :lock, :pack, :package, :platform
+            pre = true
+            opts.concat(args)
+          when :config
+            if args.empty?
+              pre = true
+            else
+              case (pre = args.shift)
+              when 'list', 'get', 'set', 'unset'
+                cmd << pre
+              else
+                args.unshift(pre)
+              end
+              opts.concat(args)
+            end
+          when :doctor
+            case (pre = (val = args.shift) || opts.shift)
+            when 'diagnose', 'ssl'
+              cmd << pre
+            else
+              if val
+                args.unshift(val)
+              elsif pre
+                opts.unshift(pre)
+              end
+              pre = true
+            end
+            opts.concat(args)
+          when :plugin
+            case (plu = args.shift || opts.shift)
+            when 'install', 'uninstall', 'help', 'list'
+              cmd << plu
+            else
+              invalid.call(plu)
+            end
+          end
+          op = OptionPartition.new(opts, bundleopts(if pre == 'ssl'
+                                                      :doctor_ssl
+                                                    elsif plu
+                                                      plu == 'install' ? :plugin : :"plugin_#{plu}"
+                                                    else
+                                                      flag
+                                                    end),
+                                   cmd,
+                                   project: self, no: OPT_BUNDLE[:no][flag], args: flag == :exec || flag == :config)
+          op.concat(args) unless pre
+          output = false
+          invalid = ->(a) { raise_error ArgumentError, "unrecognized args: #{a.join(', ')}", hint: flag }
+          case flag
+          when :config
+            if pre == 'list'
+              op.clear
+            elsif !op.empty?
+              a = op.dup
+              b, c = op.slice!(0, 2)
+              d = op.arg?('global', 'local')
+              getname = -> { op << (b || readline('Enter name', force: true)) }
+              case pre
+              when 'get'
+                getname.call
+              when 'set'
+                if d
+                  op << b
+                  b = c
+                  c = op.shift
+                end
+                getname.call
+                op << (c || readline('Enter value', force: true))
+                output = true
+              when 'unset'
+                if d
+                  op << b
+                  b = c
+                end
+                getname.call
+                output = true
+              else
+                if c && !op.arg?('parseable', 'no-parseable')
+                  op.adjoin('set') << b
+                  op.add_quote(c)
+                  output = true
+                  exit 1 unless confirm_basic('Confirm?', op, 'Y')
+                elsif b
+                  op.adjoin('get') << b
+                  op.unshift(c) if c
+                else
+                  invalid.call(a)
+                end
+              end
+              op.clear
+            else
+              val = readline('Enter arguments', force: false)
+              op << (val.empty? ? 'list' : val)
+              output = val.match?(/^(un)?set/)
+            end
+          when :plugin
+            case plu
+            when 'install', 'uninstall', 'help'
+              op.append
+            else
+              op.clear
+            end
+          when :exec
+            if op.empty? || (op.remove(':') && op.append(quote: false))
+              op << readline('Enter arguments', force: true)
+            else
+              op.append(quote: false)
+            end
+          when :binstubs, :outdated, :remove, :update
+            op.append(filter: GEMNAME)
+              .clear(errors: true)
+          when :add, :open, :show
+            op.add_first(expect: 'missing gem name')
+              .clear
+          when :console, :gem
+            op.add_first
+              .clear
+          else
+            op.clear
+          end
+          print_run(op, banner, **kwargs)
+          run(sync: sync, banner: banner, exception: kwargs.fetch(:exception, exception), from: :"bundle:#{flag}")
+            .tap { |ret| success?(ret, banner, output) }
+        end
+
+        def rake(*args, sync: true, banner: verbose?, with: nil, pass: PASS_RUBY[:rake], **kwargs)
+          opts = session_opts(with, args: args, kwargs: kwargs, pass: pass)
+          op = OptionPartition.new(opts, OPT_RUBY[:rake], rake_session, project: self)
+          op.adjoin(quote_option('f', rakefile)) if rakefile && !op.arg?('f', 'rakefile')
+          op.concat(args)
+          op.append(escape: true)
+          print_run(op, banner, **kwargs)
+          var = { 'BANNER' => '0' } unless banner
+          run(op, var, sync: sync, banner: false, exception: kwargs.fetch(:exception, exception), from: :rake)
+        end
+
+        def irb(*args, banner: verbose?, with: nil, pass: PASS_RUBY[:irb], **kwargs)
+          opts = session_opts(with, args: args, kwargs: kwargs, pass: pass)
+          op = OptionPartition.new(opts, OPT_RUBY[:irb], session('irb'), project: self, first: [/\.rb$/])
+          r = []
+          r << 'bundler/setup' unless op.arg?('r')
+          r << kwargs[:name] if kwargs[:name]
+          r.each { |val| op.add_option('r', val, merge: true) }
+          Array(kwargs.fetch(:path, gemlib)).each { |val| op << quote_option('I', val, merge: true) }
+          op.concat(args)
+          op.append(delim: true)
+          print_run(op, banner, **kwargs)
+          run(banner: false, exception: kwargs.fetch(:exception, exception), from: :irb)
+        end
+
+        def rbs(flag, *args, banner: verbose?, with: nil, pass: nil, **kwargs)
+          case pass
+          when NilClass
+            pass = PASS_RUBY[:rbs]
+          when Array
+            pass += PASS_RUBY[:rbs]
+          end
+          opts = session_opts(with, args: args, kwargs: kwargs, pass: pass)
+          cmd, opts = rbs_session(opts: opts)
+          op = OptionPartition.new(opts, [], cmd << flag, project: self)
+          case flag
+          when :prototype
+            sig = args.shift
+            y = option('y', ignore: false)
+            i = 1
+            args.map! { |val| basepath(val).relative_path_from(path) }.each do |file|
+              dir = basepath sig, file.dirname
+              dir.mkpath unless dir.exist?
+              base = file.basename.to_s
+              rbs = dir + "#{base.stripext}.rbs"
+              status = if rbs.exist?
+                         case y
+                         when '0', 'false'
+                           'ignored'
+                         else
+                           next unless y || confirm_basic('Overwrite?', rbs, 'N')
+
+                           'overwrite'
+                         end
+                       end
+              unless status == 'ignored'
+                ret = run(op.target.temp(File.extname(base) == '.rbi' ? 'rbi' : 'rb', file, '>', rbs), banner: false,
+                                                                                                       series: true)
+                if !ret
+                  status = 'FAIL'
+                elsif File.empty?(rbs)
+                  status = 'empty'
+                end
+              end
+              puts "#{i.to_s.rjust(2)}. #{rbs.relative_path_from(path)}".subhint(status)
+              i += 1
+            end
+          else
+            op.clear
+              .append(*args)
+            print_run(op, banner, **kwargs)
+            run(banner: false, exception: kwargs.fetch(:exception, exception), from: :"rbs:#{flag}")
+          end
+        end
+
+        def rubocop(*args, sync: true, banner: verbose?, with: nil, pass: PASS_RUBY[:rubocop], **kwargs)
+          opts = session_opts(with, args: args, kwargs: kwargs, pass: pass)
+          op = OptionPartition.new(opts, OPT_RUBY[:rubocop], session('rubocop'), project: self,
+                                                                                 no: OPT_RUBY[:no][:rubocop])
+          if @rubocopfile && !op.arg?('c', 'config') && !rootpath('.rubocop.yml', ascend: true).exist?
+            op.add_path(@rubocopfile, option: 'c')
+          end
+          op.concat(args)
+          op.each do |val|
+            if basepath(val).file?
+              op.found << val
+            else
+              op.errors << val
+            end
+          end
+          op.swap
+            .map! { |val| basepath(val).relative_path_from(path) }
+          op.append(delim: true)
+            .clear(errors: true)
+          print_run(op, banner, **kwargs)
+          run(sync: sync, banner: banner, exception: kwargs.fetch(:exception, exception), from: :rubocop)
         end
 
         def gemspec
@@ -10435,6 +12405,12 @@ module Squared
 
         def gemname
           @gemname ||= ((spec = gemspec) ? spec.name : project)
+        end
+
+        def project
+          return @project unless @project.frozen?
+
+          @project = ((spec = gemspec) ? spec.name : @project).dup
         end
 
         def depend?
@@ -10448,68 +12424,72 @@ module Squared
 
           set = lambda do |val, path|
             base = Pathname.new(path.strip)
-            return false unless base.join(gempath(val, 'specifications')).exist?
+            dir = base + gempath
+            return false unless dir.writable? && base.join(gempath(val, 'specifications')).exist?
 
-            log.warn "using version #{val} (given #{version})" if version && version != val
+            log.warn "using version #{val}".subhint("given #{version}") if version && version != val
             self.version = val
-            self.gemdir = base + gempath
+            self.gemdir = dir
           end
           if version
             begin
               case @autodetect
               when 'rvm'
-                self.gemdir = pwd_set { `rvm info homes` }[/^\s+gem:\s+"(.+)"$/, 1]
+                pwd_set { `rvm info homes` }[/^\s+gem:\s+"(.+)"$/, 1]
               when 'rbenv'
                 if pwd_set { `rbenv which ruby` } =~ %r{^(.+[\\/]versions[\\/](\d\.\d)\.[^\\/]+)[\\/]bin[\\/]ruby$}
-                  self.gemdir = File.join($1, 'lib/ruby/gems', "#{$2}.0")
+                  File.join($1, 'lib/ruby/gems', "#{$2}.0")
                 end
               when 'asdf'
-                val = pwd_set { `asdf where ruby`.chomp }
-                self.gemdir = File.join(val, 'lib/ruby/gems', "#{$1}.0") if val =~ /(\d\.\d)\.[^.]+$/
+                pwd_set { `asdf where ruby`.chomp }.yield_self do |val|
+                  val =~ /(\d\.\d)\.[^.]+$/ && File.join(val, 'lib/ruby/gems', "#{$1}.0")
+                end
               when /bundler?/
-                path = pwd_set { `bundle env` }[/^\s+Gem Path\s+(.+)$/, 1]
-                self.gemdir = path.split(File::PATH_SEPARATOR).find { |val| Dir.exist?(val) }
+                pwd_set { `bundle env` }[/^\s+Gem Path\s+(.+)$/, 1].split(File::PATH_SEPARATOR).find do |val|
+                  Dir.exist?(File.join(val, 'gems'))
+                end
               else
-                self.gemdir = ENV['GEM_HOME'] || ENV['GEM_ROOT']
+                ENV['GEM_HOME'] || ENV['GEM_ROOT']
+              end.tap do |val|
+                return true if val && set.call(version, val)
               end
-              return true if gemdir?
             rescue StandardError => e
               log.debug e
             end
             pwd_set(pass: !gempwd.nil?) do
               out = `#{gem_output(gempwd, 'list --local -d', gemname)}`
-              if out =~ /#{Regexp.escape(gemname)}\s+\((.+)\)$/
-                split_escape($1)
-                  .unshift(version)
-                  .uniq
-                  .each do |val|
-                    next unless out =~ /(?:\(#{Regexp.escape(val)}[^)]*\)|Installed at):\s+(.+)$/
+              next unless out =~ /#{Regexp.escape(gemname)}\s+\((.+)\)$/
 
-                    return gemdir? if set.call(val, $1)
-                  end
-              end
+              split_escape($1)
+                .unshift(version)
+                .uniq
+                .each do |val|
+                  next unless out =~ /(?:\(#{Regexp.escape(val)}[^)]*\)|Installed at):\s+(.+)$/
+
+                  return gemdir? if set.call(val, $1)
+                end
             end
             self.gemdir = Pathname.new(Gem.dir) + gempath
           else
             parse = lambda do |path|
-              next unless path
+              return false unless path
 
-              lib = Regexp.new(['', 'gems', "#{gemname}-([^#{File::SEPARATOR}]+)", ''].join(File::SEPARATOR))
-              if (ver = path[lib, 1]) && (val = path[/\A(.+)#{Regexp.escape(gempath(ver))}/, 1])
+              ver = path[Regexp.new(['', 'gems', "#{gemname}-([^#{File::SEPARATOR}]+)", ''].join(File::SEPARATOR)), 1]
+              if ver && (val = path[/\A(.+)#{Regexp.escape(gempath(ver))}/, 1])
                 set.call(ver, val)
               end
             end
-            if RUBY_VERSION >= '2.6'
+            if semgte?('2.6')
               target = RUBY_VERSION.start_with?('2.6') ? RubyVM : $LOAD_PATH
               parse.call(target.resolve_feature_path(gemname)&.last)
             end
-            if !gemdir && !pwd_set { parse.call(`#{bundle_output('show', gemname)}`) }
-              raise_error 'gems directory not found'
+            unless gemdir || pwd_set { parse.call(`#{bundle_output('show', gemname)}`) }
+              raise_error Errno::ENOENT, 'gems home'
             end
           end
         rescue StandardError => e
           log.error e
-          @version = nil
+          self.version = nil
           @gemdir = nil
           @autodetect = false
         else
@@ -10526,26 +12506,6 @@ module Squared
           run(banner: !@session&.include?('--quiet'), **kwargs)
         end
 
-        def append_bundle(opts, list, target: @session, append: nil)
-          op = OptionPartition.new(opts, list, target, project: self)
-          if append
-            if append.is_a?(Regexp)
-              op.each do |opt|
-                if opt.match?(append)
-                  op.errors << opt
-                else
-                  op.found << opt
-                end
-              end
-              op.swap.clear(errors: true)
-            end
-            op.append(escape: true)
-          else
-            op.clear
-          end
-          op
-        end
-
         def ruby_session(*cmd, **kwargs)
           session('ruby', *preopts, *cmd, **kwargs)
         end
@@ -10560,6 +12520,13 @@ module Squared
 
         def rake_session(*cmd, **kwargs)
           session('rake', *preopts, *cmd, **kwargs)
+        end
+
+        def rbs_session(*cmd, opts: nil)
+          return session('rbs', *cmd) unless opts
+
+          op = OptionPartition.new(opts, OPT_RUBY[:rbs], project: self)
+          [session('rbs', *op.to_a, *cmd), op.extras]
         end
 
         def gem_output(*cmd, **kwargs)
@@ -10596,12 +12563,18 @@ module Squared
           end
         end
 
-        def config_set(key, *val)
-          run(bundle_output('config set', key, *val), banner: false, series: false)
+        def config_set(key, *val, global: false)
+          run(bundle_output('config', ('--global' if global), 'set', key, *val), banner: false, series: true)
+        end
+
+        def unpack_get(tag, ext)
+          return super unless ext == 'gem'
+
+          "https://rubygems.org/downloads/#{File.basename(tag, '.gem')}.gem"
         end
 
         def preopts
-          verbosetype > 1 ? ['--verbose'] : []
+          verbose? ? ['--verbose'] : []
         end
 
         def variables
@@ -10610,7 +12583,7 @@ module Squared
 
         def rakefile
           if @rakefile.nil?
-            file = Rake::Application::DEFAULT_RAKEFILES.find { |val| basepath(val).exist? }
+            file = Rake::Application::DEFAULT_RAKEFILES.find { |val| exist?(val) }
             @rakefile = !file.nil? && basepath(file)
           end
           @rakefile || nil
@@ -10635,6 +12608,40 @@ module Squared
           end
         end
 
+        def bundleopts(*args)
+          case args.first
+          when :install, :update
+            args << :install_a
+          when :add, :plugin
+            args << :common_git
+          when :binstubs, :cache
+            args << :common_all
+          when :lock, :outdated
+            args << :common_version
+          end
+          OPT_BUNDLE[:common] + args.flat_map { |name| OPT_BUNDLE.fetch(name, []) }
+        end
+
+        def gemopts(*args)
+          case args.first
+          when :install, :update
+            args << :common_url << :common_domain << :install_a
+          when :dependency, :info, :outdated, :search, :specification
+            args << :common_url << :common_domain
+          when :fetch, :list
+            args << :common_url
+          when :owner, :push, :yank
+            args << :common_otp
+          when :package, :pack
+            args << :cache
+          end
+          case args.first
+          when :info, :list, :search
+            args << :common_all
+          end
+          OPT_GEM[:common] + args.flat_map { |name| OPT_GEM.fetch(name, []) }
+        end
+
         def gempwd
           return unless !pwd? && semgte?(Gem::VERSION, '3.4.2')
 
@@ -10643,9 +12650,9 @@ module Squared
 
         def gemfile
           if @gemfile.nil?
-            @gemfile = [project, name].map! { |val| basepath("#{val}.gemspec") }
-                                      .concat(path.glob('*.gemspec'))
-                                      .find(&:exist?) || false
+            @gemfile = [@project, name].map { |val| basepath("#{val}.gemspec") }
+                                       .concat(path.glob('*.gemspec'))
+                                       .find(&:exist?) || false
           end
           @gemfile || nil
         end
@@ -10655,7 +12662,7 @@ module Squared
             if (spec = gemspec)
               lib.merge(spec.require_paths || [])
             end
-            lib.select { |file| basepath(file).exist? }
+            lib.select { |file| exist?(file) }
           end
         end
 
@@ -10668,7 +12675,7 @@ module Squared
         def gemdir?
           return false unless gemdir
 
-          gemdir.exist? && !gemdir.empty?
+          gemdir.exist? && !gemdir.empty? && gemdir.writable?
         end
       end
 
@@ -10691,10 +12698,11 @@ module Squared
                        sbom=q].freeze
           }.freeze,
           compose: {
-            common: %w[all-resources compatibility dry-run ansi|b env-file=p f|file=p parallel=n profile=b progress=b
+            common: %w[all-resources ansi|b compatibility dry-run env-file=p f|file=p parallel=n profile=b progress=b
                        project-directory=p p|project-name=e].freeze,
             build: %w[check no-cache print pull push with-dependencies q|quiet build-arg=qq builder=b m|memory=b
                       provenance=q sbom=q ssh=qq].freeze,
+            create: %w[build force-recreate no-build no-recreate quiet-pull remove-orphans y|yes pull=b scale=i].freeze,
             exec: %w[d|detach privileged e|env=qq index=i T|no-TTY=b? user=e w|workdir=q].freeze,
             run: %w[build d|detach no-deps q|quiet quiet-build quiet-pull remove-orphans rm P|service-ports use-aliases
                     cap-add=b cap-drop=b entrypoint=q e|env=qq env-from-file=p i|interactive=b? l|label=q name=b
@@ -10710,32 +12718,31 @@ module Squared
                        rm t|tty use-api-socket add-host=q annotation=q a|attach=b blkio-weight=i blkio-weight-device=i
                        cap-add=b cap-drop=b cgroup-parent=b cgroupns=b cidfile=p device=q device-cgroup-rule=q
                        device-read-bps=q device-read-iops=q device-write-bps=q device-write-iops=q
-                       disable-content-trust=b? dns=q dns-option=q dns-search=q domainname=b entrypoint=q e|env=qq
-                       env-file=p expose=q gpus=q group-add=b health-cmd=q health-interval=b health-retries=i
-                       health-start-interval=q health-start-period=q health-timeout=q hostname=q io-maxbandwidth=b
-                       io-maxiops=b ip=b ip6=q ipc=b isolation=b kernel-memory=b l|label=q label-file=q link=b
-                       link-local-ip=q log-driver=b log-opt=q mac-address=q m|memory=b memory-reservation=b
-                       memory-swap=n memory-swappiness=n mount=qq name=b network=b network-alias=b oom-score-adj=b
-                       pid=b pids-limit=n platform=q p|publish=q pull=b restart=b runtime=b security-opt=q shm-size=b
-                       stop-signal=b stop-timeout=i storage-opt=q sysctl=q tmpfs=q ulimit=q u|user=b userns=b uts=b
-                       v|volume=q volume-driver=b volumes-from=b w|workdir=q].freeze,
+                       dns=q dns-option=q dns-search=q domainname=b entrypoint=q e|env=qq env-file=p expose=q gpus=q
+                       group-add=b health-cmd=q health-interval=b health-retries=i health-start-interval=q
+                       health-start-period=q health-timeout=q hostname=q io-maxbandwidth=b io-maxiops=b ip=b ip6=q ipc=b
+                       isolation=b l|label=q label-file=q link=b link-local-ip=q log-driver=b log-opt=q mac-address=q
+                       m|memory=b memory-reservation=b memory-swap=n memory-swappiness=n mount=qq name=b network=b
+                       network-alias=b oom-score-adj=b pid=b pids-limit=n platform=q p|publish=q pull=b restart=b
+                       runtime=b security-opt=q shm-size=b stop-signal=b stop-timeout=i storage-opt=q sysctl=q tmpfs=q
+                       ulimit=q u|user=b userns=b uts=b v|volume=q volume-driver=b volumes-from=b w|workdir=q].freeze,
             run: %w[d|detach detach-keys=q sig-proxy=b?].freeze,
             update: %w[blkio-weight=i cpu-period=i cpu-quota=i cpu-rt-period=i cpu-rt-runtime=i c|cpu-shares=i cpus=f
-                       cpuset-cpus=b cpuset-mems=b m|memory=b memory-reservation=b memory-swap=b pids-limit=n
+                       cpuset-cpus=b cpuset-mems=b m|memory=b memory-reservation=b memory-swap=n pids-limit=n
                        restart=q].freeze,
-            exec: %w[d|detach i|interactive privileged t|tty detach-keys=q e|env=qq env-file=p user=e
+            exec: %w[d|detach i|interactive privileged t|tty detach-keys=q e|env=qq env-file=p u|user=e
                      w|workdir=q].freeze,
-            commit: %w[a|author=q c|change=q m|message=q pause=b?].freeze,
+            commit: %w[no-pause a|author=q c|change=q m|message=q pause=b?].freeze,
             inspect: %w[s|size f|format=q type=b].freeze,
             start: %w[a|attach i|interactive detach-keys=q].freeze,
-            stop: %w[s|signal=b t|time=i t|timeout=i].freeze,
-            restart: %w[s|signal=b t|time=i t|timeout=i].freeze,
+            stop: %w[s|signal=b t|timeout=i].freeze,
+            restart: %w[s|signal=b t|timeout=i].freeze,
             kill: %w[s|signal=b].freeze,
             stats: %w[a|all no-stream no-trunc format|q].freeze
           }.freeze,
           image: {
-            list: %w[a|all q|quiet digests no-trunc tree f|filter=q format=q].freeze,
-            push: %w[a|all-tags disable-content-trust=b? platform=q q|quiet].freeze,
+            ls: %w[a|all digests no-trunc q|quiet tree f|filter=q format=q].freeze,
+            push: %w[a|all-tags platform=q q|quiet].freeze,
             rm: %w[f|force no-prune platform=q].freeze,
             save: %w[o|output=p platform=q].freeze
           }.freeze,
@@ -10751,6 +12758,15 @@ module Squared
             volume: %w[volume-subpath volume-nocopy volume-opt].freeze,
             tmpfs: %w[tmpfs-size tmpfs-mode].freeze,
             image: %w[image-path].freeze
+          }.freeze,
+          ls: {
+            compose: %w[Name Image Command Service RunningFor Status Ports CreatedAt ExitCode Health ID Labels
+                        LocalVolumes Mounts Names Networks Project Publishers Size State].freeze,
+            container: %w[ID Image Command RunningFor Status Ports Names CreatedAt Labels LocalVolumes Mounts Networks
+                          Platform Size State].freeze,
+            image: %w[Repository Tag ID Containers CreatedSince Size CreatedAt Digest SharedSize UniqueSize
+                      VirtualSize].freeze,
+            network: %w[ID Name Driver Scope CreatedAt IPv4 IPv6 Internal Labels].freeze
           }.freeze
         }.freeze
         private_constant :COMPOSEFILE, :BAKEFILE, :OPT_DOCKER, :VAL_DOCKER
@@ -10769,12 +12785,13 @@ module Squared
 
         subtasks({
           'build' => %i[tag context].freeze,
-          'compose' => %i[build run exec up down].freeze,
+          'compose' => %i[build create run exec up down service].freeze,
           'bake' => %i[build check].freeze,
-          'image' => %i[list rm push tag save].freeze,
+          'image' => %i[ls rm push tag save].freeze,
           'container' => %i[run create exec update commit inspect diff start stop restart pause unpause top stats kill
                             rm].freeze,
-          'network' => %i[connect disconnect].freeze
+          'network' => %i[connect disconnect].freeze,
+          'ls' => nil
         })
 
         attr_reader :context
@@ -10807,112 +12824,163 @@ module Squared
             Docker.subtasks do |action, flags|
               next if task_pass?(action)
 
-              namespace action do
-                flags.each do |flag|
-                  case action
-                  when 'build'
-                    case flag
-                    when :tag, :context
+              if flags.nil?
+                case action
+                when 'ls'
+                  format_desc(action, nil, VAL_DOCKER[:ls].keys, after: 'a/ll?,s/tandard?,range*', arg: nil)
+                  task action, [:command] do |_, args|
+                    command = param_guard(action, 'command', args: args, key: :command)
+                    args = args.extras
+                    cmd = docker_output command, case command
+                                                 when 'image', 'container', 'network'
+                                                   'ls'
+                                                 when 'compose'
+                                                   'ps'
+                                                 else
+                                                   raise_error ArgumentError, 'unrecognized command', hint: command
+                                                 end
+                    cmd << '-a' if has_value!(args, 'a', 'all') && command != 'network'
+                    data = VAL_DOCKER[:ls][command.to_sym]
+                    cols = if has_value!(args, 's', 'standard')
+                             data.first(data.index('CreatedAt'))
+                           else
+                             [].tap do |out|
+                               args.each do |val|
+                                 if val =~ /^(\d+)$/
+                                   out << data[$1.to_i.pred]
+                                 elsif val =~ /^(\d+)(-|\.{2,3})(\d+)$/
+                                   j = $1.to_i.pred
+                                   k = $3.to_i - ($2 == '..' ? 2 : 1)
+                                   out.concat(data[j..k]) if k > j
+                                 end
+                               end
+                               next unless out.empty?
+
+                               out.replace(choice_index('Select a column', data, multiple: true, attempts: 1))
+                             end
+                           end
+                    cmd << quote_option('format', "table #{cols.map! { |val| "{{.#{val}}}" }.join("\t")}")
+                    run(cmd, banner: false, from: :ls)
+                  end
+                end
+              else
+                namespace action do
+                  flags.each do |flag|
+                    case action
+                    when 'build'
                       format_desc(action, flag, 'opts*', before: flag == :tag ? 'name' : 'dir')
                       task flag, [flag] do |_, args|
                         param = param_guard(action, flag, args: args, key: flag)
                         buildx(:build, args.extras, "#{flag}": param)
                       end
-                    end
-                  when 'bake'
-                    break unless bake?
+                    when 'bake'
+                      break unless bake?
 
-                    case flag
-                    when :build
-                      format_desc action, flag, 'opts*,target*,context?|:'
-                      task flag do |_, args|
-                        args = args.to_a
-                        if args.first == ':'
-                          choice_command :bake
-                        else
-                          buildx :bake, args
+                      case flag
+                      when :build
+                        format_desc action, flag, 'opts*,target*,context|:'
+                        task flag do |_, args|
+                          args = args.to_a
+                          if args.first == ':'
+                            choice_command :bake
+                          else
+                            buildx :bake, args
+                          end
+                        end
+                      when :check
+                        format_desc action, flag, 'target'
+                        task flag, [:target] do |_, args|
+                          target = param_guard(action, flag, args: args, key: :target)
+                          buildx :bake, ['allow=fs.read=*', 'call=check', target]
                         end
                       end
-                    when :check
-                      format_desc action, flag, 'target'
-                      task flag, [:target] do |_, args|
-                        target = param_guard(action, flag, args: args, key: :target)
-                        buildx :bake, ['allow=fs.read=*', 'call=check', target]
-                      end
-                    end
-                  when 'compose'
-                    break unless compose?
+                    when 'compose'
+                      break unless compose?
 
-                    case flag
-                    when :build, :up, :down
-                      format_desc action, flag, 'opts*,service*|:'
-                      task flag do |_, args|
-                        compose! flag, args.to_a
-                      end
-                    when :exec, :run
-                      format_desc action, flag, "service|:,command#{flag == :exec ? '' : '?'}|::,args*,opts*"
-                      task flag, [:service] do |_, args|
-                        service = param_guard(action, flag, args: args, key: :service)
-                        compose!(flag, args.extras, service: service)
-                      end
-                    end
-                  when 'container'
-                    case flag
-                    when :exec, :commit
-                      format_desc(action, flag, flag == :exec ? 'id/name,opts*,args+|:' : 'id/name,tag?,opts*')
-                      task flag, [:id] do |_, args|
-                        if flag == :exec && !args.id
-                          choice_command flag
-                        else
-                          id = param_guard(action, flag, args: args, key: :id)
-                          container(flag, args.extras, id: id)
+                      case flag
+                      when :exec, :run
+                        format_desc action, flag, "service/:,command#{'?' unless flag == :exec}/::,args*,opts*"
+                        task flag, [:service] do |_, args|
+                          service = param_guard(action, flag, args: args, key: :service)
+                          compose!(flag, args.extras, service: service)
                         end
-                      end
-                    when :run, :create
-                      format_desc action, flag, 'image,opts*,args*|:'
-                      task flag, [:image] do |_, args|
-                        if args.image
-                          container(flag, args.extras, id: args.image)
-                        else
-                          choice_command flag
+                      when :service
+                        cmds = %w[down kill pause restart rm start stop top unpause watch].freeze
+                        format_desc(action, flag, cmds, arg: nil, after: 'name+|:')
+                        task flag, [:command] do |_, args|
+                          command = param_guard(action, flag, args: args, key: :command)
+                          raise_error ArgumentError, 'unrecognized command', hint: command unless cmds.include?(command)
+                          service = args.extras
+                          if service.first == ':'
+                            choice_command flag, command
+                          else
+                            compose!(flag, [command], service: service.empty? || service)
+                          end
                         end
-                      end
-                    else
-                      format_desc action, flag, "opts*,id/name#{flag == :update ? '+' : '*'}"
-                      task flag do |_, args|
-                        container flag, args.to_a
-                      end
-                    end
-                  when 'image'
-                    case flag
-                    when :push
-                      format_desc action, flag, 'tag,registry/username?,opts*'
-                      task flag, [:tag] do |_, args|
-                        id = param_guard(action, flag, args: args, key: :tag)
-                        image(flag, args.extras, id: id)
-                      end
-                    else
-                      format_desc(action, flag, case flag
-                                                when :rm, :save then 'id*,opts*'
-                                                when :tag then 'version?'
-                                                else 'opts*,args*'
-                                                end)
-                      task flag do |_, args|
-                        args = args.to_a
-                        if args.empty? && flag != :list
-                          choice_command flag
-                        else
-                          image flag, args
-                        end
-                      end
-                    end
-                  when 'network'
-                    format_desc action, flag, 'target,opts*'
-                    task flag, [:target] do |_, args|
-                      if args.target
-                        network(flag, args.extras, target: args.target)
                       else
-                        choice_command flag
+                        format_desc action, flag, 'opts*,service*|:'
+                        task flag do |_, args|
+                          compose!(flag, args.to_a, multiple: true)
+                        end
+                      end
+                    when 'container'
+                      case flag
+                      when :exec, :commit
+                        format_desc(action, flag, flag == :exec ? 'id/name,opts*,args+|:' : 'id/name,tag?,opts*')
+                        task flag, [:id] do |_, args|
+                          if flag == :exec && !args.id
+                            choice_command flag
+                          else
+                            id = param_guard(action, flag, args: args, key: :id)
+                            container(flag, args.extras, id: id)
+                          end
+                        end
+                      when :run, :create
+                        format_desc action, flag, 'image,opts*,args*|:'
+                        task flag, [:image] do |_, args|
+                          if args.image
+                            container(flag, args.extras, id: args.image)
+                          else
+                            choice_command flag
+                          end
+                        end
+                      else
+                        format_desc action, flag, "opts*,id/name#{flag == :update ? '+' : '*'}"
+                        task flag do |_, args|
+                          container flag, args.to_a
+                        end
+                      end
+                    when 'image'
+                      case flag
+                      when :push
+                        format_desc action, flag, 'tag,registry/username?,opts*'
+                        task flag, [:tag] do |_, args|
+                          id = param_guard(action, flag, args: args, key: :tag)
+                          image(flag, args.extras, id: id)
+                        end
+                      else
+                        format_desc(action, flag, case flag
+                                                  when :rm, :save then 'id*,opts*'
+                                                  when :tag then 'version?'
+                                                  else 'opts*,args*'
+                                                  end)
+                        task flag do |_, args|
+                          args = args.to_a
+                          if !args.empty? || flag == :ls
+                            image flag, args
+                          else
+                            choice_command flag
+                          end
+                        end
+                      end
+                    when 'network'
+                      format_desc action, flag, 'target,opts*'
+                      task flag, [:target] do |_, args|
+                        if args.target
+                          network(flag, args.extras, target: args.target)
+                        else
+                          choice_command flag
+                        end
                       end
                     end
                   end
@@ -10931,7 +12999,7 @@ module Squared
         end
 
         def compose(opts, flags = nil, script: false, args: nil, from: :run, **)
-          return opts if script == false
+          return opts unless script
 
           if from == :run
             if bake?(n = filetype)
@@ -10956,10 +13024,10 @@ module Squared
           when Enumerable
             ret.merge(opts.to_a)
           end
-          [args, flags].each_with_index do |target, index|
-            if (data = append_any(target, target: []))
-              ret.merge(data.map { |arg| index == 0 ? fill_option(arg) : quote_option('build-arg', arg) })
-            end
+          [args, flags].each_with_index do |item, i|
+            next unless item && (data = append_any(item, target: []))
+
+            ret.merge(data.map! { |arg| i == 0 ? fill_option(arg) : quote_option('build-arg', arg) })
           end
           case from
           when :run
@@ -10982,18 +13050,18 @@ module Squared
             end
             append_context
           when :bake, :compose
-            option(from == :bake ? 'target' : 'service', ignore: false) do |a|
-              ret.merge(split_escape(a).map! { |b| shell_quote(b) })
-            end
+            option(from == :bake ? 'target' : 'service', ignore: false) { |val| ret.merge(split_escape(val).quote!) }
           end
           ret
         end
 
         def buildx(flag, opts = [], tag: nil, context: nil)
           cmd, opts = docker_session('buildx', opts: opts)
-          op = OptionPartition.new(opts, OPT_DOCKER[:buildx][:common], cmd, project: self)
-          op << flag
-          op.parse(OPT_DOCKER[:buildx][flag == :bake ? :bake : :build] + OPT_DOCKER[:buildx][:shared])
+          op = OPT_DOCKER[:buildx].yield_self do |data|
+            OptionPartition.new(opts, data[:common], cmd, project: self)
+                           .append(flag, quote: false)
+                           .parse(data[flag == :bake ? :bake : :build] + data[:shared])
+          end
           case flag
           when :build, :context
             append_tag(tag || option('tag', ignore: false) || self.tag)
@@ -11017,41 +13085,52 @@ module Squared
           run(from: :"buildx:#{flag}")
         end
 
-        def compose!(flag, opts = [], service: nil)
-          cmd, opts = docker_session('compose', opts: opts)
-          op = OptionPartition.new(opts, OPT_DOCKER[:compose][:common], cmd, project: self)
-          append_file filetype unless op.arg?('f', 'file')
-          op << flag
-          op.parse(OPT_DOCKER[:compose].fetch(flag, []))
-          multiple = case flag
-                     when :build, :up, :down then true
-                     else false
-                     end
-          if op.remove(':') || service == ':'
-            keys = Set.new
-            read_composefile('services', target: op.values_of('f', 'file')) { |data| keys.merge(data.keys) }
-            service = unless keys.empty?
-                        choice_index('Add services', keys, multiple: multiple, force: !multiple,
-                                                           attempts: multiple ? 1 : 5)
-                      end
-          end
-          if multiple
-            op.concat(service) if service
-            op.append(delim: true, escape: true, strip: /^:/)
+        def compose!(flag, opts = [], service: nil, multiple: false)
+          from = :"compose:#{flag}"
+          if flag == :service
+            command = opts.first
+            if service == true
+              cmd, status = filter_ps command, from
+              lines = IO.popen(cmd.temp('--services')).map(&:strip).reject(&:empty?)
+              return list_empty(hint: status) if lines.empty?
+
+              service = choice_index('Choose a service', lines, multiple: true, attempts: 1)
+            end
+            docker_session('compose', command, '--', *service)
           else
-            raise_error('no services were found', hint: flag) unless service
-            append_command(flag, service, op.extras, prompt: '::')
+            cmd, opts = docker_session('compose', opts: opts)
+            op = OptionPartition.new(opts, OPT_DOCKER[:compose][:common], cmd, project: self)
+            append_file filetype unless op.arg?('f', 'file')
+            op << flag
+            op.parse(OPT_DOCKER[:compose].fetch(flag, []))
+            if op.remove(':') || service == ':'
+              keys = Set.new
+              read_composefile('services', target: op.values_of('f', 'file')) { |data| keys.merge(data.keys) }
+              service = unless keys.empty?
+                          choice_index('Add services', keys, multiple: multiple, force: !multiple,
+                                                             attempts: multiple ? 1 : 3)
+                        end
+            end
+            if multiple
+              op.concat(service) if service
+              op.append(delim: true, escape: true, strip: /^:/)
+            else
+              raise_error ArgumentError, 'no service was selected', hint: flag unless service
+              append_command(flag, service, op.extras, prompt: '::')
+            end
           end
-          run(from: :"compose:#{flag}")
+          run(from: from)
         end
 
         def container(flag, opts = [], id: nil)
           cmd, opts = docker_session('container', flag, opts: opts)
           rc = flag == :run || flag == :create
-          list = OPT_DOCKER[:container].fetch(flag, [])
-          list += OPT_DOCKER[:container][:create] if flag == :run
-          list += OPT_DOCKER[:container][:update] if rc
-          op = OptionPartition.new(opts, list, cmd, project: self, args: rc || flag == :exec)
+          op = OPT_DOCKER[:container].yield_self do |data|
+            list = data.fetch(flag, [])
+            list += data[:create] if flag == :run
+            list += data[:update] if rc
+            OptionPartition.new(opts, list, cmd, project: self, args: rc || flag == :exec)
+          end
           from = :"container:#{flag}"
           case flag
           when :run, :create, :exec
@@ -11068,7 +13147,7 @@ module Squared
                     when 'bind', 'volume', 'image', 'tmpfs'
                       type = v
                     else
-                      raise_error("unknown type: #{v}", hint: flag)
+                      raise_error TypeError, "unknown: #{v}", hint: flag
                     end
                   elsif all.include?(k)
                     unless type
@@ -11088,22 +13167,22 @@ module Squared
                       v = shell_quote(v, option: false, force: false) if q == ''
                     end
                     args << "#{k}=#{q + v + q}"
-                  elsif verbose
-                    log_message(Logger::INFO, 'unrecognized option', subject: from, hint: k)
+                  elsif !silent?
+                    log_message('unrecognized option', subject: from, hint: k)
                   end
                 end
-                raise_error('missing type', hint: flag) unless type
+                raise_error TypeError, 'none specified', hint: flag unless type
                 cmd << "--mount type=#{type},#{args.join(',')}"
               end
             end
             append_command(flag, id || tagmain, op.extras)
           when :update
-            raise_error('missing container', hint: flag) if op.empty?
+            raise_error ArgumentError, 'missing container', hint: flag if op.empty?
             op.append(escape: true, strip: /^:/)
           when :commit
             latest = op.shift || tagmain
             cmd << id << latest
-            raise_error("unknown args: #{op.join(', ')}", hint: flag) unless op.empty?
+            raise_error ArgumentError, "unrecognized args: #{op.join(', ')}", hint: flag unless op.empty?
             return unless confirm_command(cmd.to_s, title: from, target: id, as: latest)
 
             registry = option('registry') || @registry
@@ -11118,42 +13197,16 @@ module Squared
                     else
                       '--disable-content-trust'
                     end
-            opts << '--quiet' unless verbose
+            opts << '--quiet' if silent?
             return image(:push, opts, id: latest, registry: registry)
           else
             if op.empty?
-              status = []
-              no = true
-              case flag
-              when :inspect, :diff
-                no = false
-              when :start
-                status = %w[created exited]
-                no = false
-              when :stop, :pause
-                status = %w[running restarting]
-              when :restart
-                status = %w[running paused exited]
-              when :unpause
-                status << 'paused'
-                no = false
-              when :top, :stats
-                status << 'running'
-                cmd << '--no-stream' if flag == :stats
-                no = false
-              when :kill
-                status = %w[running restarting paused]
-              when :rm
-                status = %w[created exited dead]
-              end
-              ps = docker_output('ps -a', *status.map { |s| quote_option('filter', "status=#{s}") })
-              list_image(flag, ps, no: no, hint: "status: #{status.join(', ')}", from: from) do |img|
-                run(cmd.temp(img), from: from)
-              end
+              ps, status, no = filter_ps flag, from
+              cmd << '--no-stream' if flag == :stats
+              list_image(flag, ps, no: no, hint: status, from: from) { |img| run(cmd.temp(img), from: from) }
               return
-            else
-              op.append(escape: true, strip: /^:/)
             end
+            op.append(escape: true, strip: /^:/)
           end
           run(from: from)
         end
@@ -11161,16 +13214,22 @@ module Squared
         def image(flag, opts = [], sync: true, id: nil, registry: nil)
           cmd, opts = docker_session('image', flag, opts: opts)
           op = OptionPartition.new(opts, OPT_DOCKER[:image].fetch(flag, []), cmd, project: self)
-          exception = @exception
+          exception = self.exception
           banner = true
           from = :"image:#{flag}"
           case flag
-          when :list
+          when :ls
             if opts.size == op.size
               index = 0
               name = nil
-              opts.reverse_each { |opt| break opts.delete(opt) if (name = opt[/^name=["']?(.+?)["']?$/, 1]) }
-              list_image(:run, cmd << '-a', from: from) do |val|
+              opts.reverse_each do |val|
+                next unless (arg = OptionPartition.parse_arg!('name', val))
+
+                name = arg[1]
+                opts.delete(val)
+                break
+              end
+              list_image(:run, from: from) do |val|
                 container(:run, if name
                                   opts.dup << "name=#{index == 0 ? name : "#{name}-#{index}"}"
                                 else
@@ -11179,19 +13238,12 @@ module Squared
                 index += 1
               end
               return
-            else
-              op.clear
             end
+            op.clear
           when :rm
-            if id
-              op << id
-              if option('y')
-                exception = false
-                banner = false
-              end
-            else
+            unless id
               if op.empty?
-                list_image(:rm, docker_output('image ls -a'), from: from) do |val|
+                list_image(:rm, from: from) do |val|
                   image(:rm, opts, sync: sync, id: val)
                 end
               else
@@ -11199,8 +13251,13 @@ module Squared
               end
               return
             end
+            op << id
+            if option('y')
+              exception = false
+              banner = false
+            end
           when :tag, :save
-            list_image(flag, docker_output('image ls -a'), from: from) do |val|
+            list_image(flag, from: from) do |val|
               op << val
               if flag == :tag
                 op << tagname("#{project}:#{op.first}")
@@ -11210,8 +13267,14 @@ module Squared
           when :push
             id ||= option('tag', ignore: false) || tagmain
             registry ||= op.shift || option('registry') || @registry
-            raise_error(id ? "unknown args: #{op.join(', ')}" : 'no id/tag given', hint: flag) unless id && op.empty?
-            raise_error('username/registry not provided', hint: flag) unless registry
+            unless id && op.empty?
+              if id
+                raise_error ArgumentError, "unrecognized args: #{op.join(', ')}", hint: flag
+              else
+                raise_error 'no id/tag', hint: flag
+              end
+            end
+            raise_error ArgumentError, 'username/registry not specified', hint: flag unless registry
             registry.chomp!('/')
             uri = shell_quote "#{registry}/#{id}"
             op << uri
@@ -11223,17 +13286,18 @@ module Squared
             exception = true
             banner = false
           end
-          ret = run(cmd, sync: sync, exception: exception, banner: banner, from: from)
-          print_success if success?(ret, flag == :tag || flag == :save)
+          run(cmd, sync: sync, exception: exception, banner: banner, from: from).tap do |ret|
+            success?(ret, flag == :tag || flag == :save)
+          end
         end
 
         def network(flag, opts = [], target: nil)
           cmd, opts = docker_session('network', flag, opts: opts)
-          op = OptionPartition.new(opts, OPT_DOCKER[:network].fetch(flag, []), cmd, project: self)
-          op.clear
+          OptionPartition.new(opts, OPT_DOCKER[:network].fetch(flag, []), cmd, project: self)
+                         .clear
           from = :"network:#{flag}"
           list_image(flag, docker_output('ps -a'), from: from) do |img|
-            print_success if success?(run(cmd.temp(target, img), from: from))
+            success?(run(cmd.temp(target, img), from: from))
           end
         end
 
@@ -11260,10 +13324,10 @@ module Squared
         def dockerfile(val = nil)
           if val
             @file = if val.is_a?(Array)
-                      val = val.select { |file| basepath(file).exist? }
+                      val = val.select { |file| exist?(file) }
                       val.size > 1 ? val : val.first
                     elsif val == true
-                      DIR_DOCKER.find { |file| basepath(file).exist? }
+                      DIR_DOCKER.find { |file| exist?(file) }
                     elsif val != 'Dockerfile'
                       val
                     end
@@ -11292,8 +13356,7 @@ module Squared
           return session('docker', *cmd) unless opts
 
           op = OptionPartition.new(opts, OPT_DOCKER[:common], project: self)
-          ret = session('docker', *op.to_a, *cmd)
-          [ret, op.extras]
+          [session('docker', *op.to_a, *cmd), op.extras]
         end
 
         def docker_output(*cmd, **kwargs)
@@ -11303,8 +13366,8 @@ module Squared
         def append_command(flag, val, list, target: @session, prompt: ':')
           if list.delete(prompt)
             list << readline('Enter command [args]', force: flag == :exec)
-          elsif (args = env('DOCKER_ARGS'))
-            list << args
+          else
+            env('DOCKER_ARGS') { |args| list << args }
           end
           case flag
           when :run
@@ -11312,7 +13375,7 @@ module Squared
               target << basic_option('name', dnsname("#{name}_%s" % rand_s(6)))
             end
           when :exec
-            raise_error('no command args', hint: flag) if list.empty?
+            raise_error ArgumentError, 'nothing to execute', hint: flag if list.empty?
           end
           target << val << list.shift
           target << list.join(' && ') unless list.empty?
@@ -11326,7 +13389,7 @@ module Squared
             when 2, 4
               return
             when 3
-              return unless COMPOSEFILE.select { |val| basepath(val).exist? }.size > 1
+              return unless COMPOSEFILE.select { |val| basepath!(val) }.size > 1
             end
           end
           files = Array(@file).map { |val| quote_option('file', basepath(val)) }
@@ -11347,34 +13410,58 @@ module Squared
         end
 
         def append_tag(val, target: @session)
+          ver = option('version', target: target, ignore: false)
           case val
           when String
             split_escape val
-          when Array
-            val
           else
-            []
-          end.yield_self do |list|
-            ver = option('version', target: target, ignore: false)
-            list.each do |s|
-              s = "#{s}:#{ver}" if ver && (!s.include?(':') || s.delete_suffix!(':latest'))
-              target << basic_option('tag', tagname(s))
-            end
-            target
+            Array(val)
+          end.each do |s|
+            s = "#{s}:#{ver}" if ver && (!s.include?(':') || s.delete_suffix!(':latest'))
+            target << basic_option('tag', tagname(s))
           end
+          target
         end
 
-        def list_image(flag, cmd, hint: nil, no: true, from: nil)
+        def filter_ps(flag, from = :'container:ps')
+          no = false
+          status = case flag.to_sym
+                   when :start
+                     %w[created exited]
+                   when :stop, :pause
+                     no = true
+                     %w[running restarting]
+                   when :restart
+                     no = true
+                     %w[running paused exited]
+                   when :unpause
+                     %w[paused]
+                   when :top, :stats, :watch
+                     %w[running]
+                   when :kill
+                     no = true
+                     %w[running paused restarting]
+                   when :rm
+                     no = true
+                     %w[created exited dead]
+                   else
+                     []
+                   end
+          cmd = docker_output("#{from.to_s.split(':').first} ps -a",
+                              *status.map { |s| quote_option('filter', "status=#{s}") })
+          [cmd, status, no]
+        end
+
+        def list_image(flag, cmd = docker_output('image ls -a'), hint: nil, no: true, from: nil)
           pwd_set(from: from) do
-            found = false
-            index = 0
+            index = 1
             all = option('all', prefix: 'docker')
             y = from == :'image:rm' && option('y', prefix: 'docker')
             pat = /\b(?:#{dnsname(name)}|#{tagname(project)}|#{tagmain.split(':', 2).first})\b/
-            IO.popen(session_done(cmd << '--format=json')).each do |line|
+            IO.popen(cmd.temp('--format=json')).each do |line|
               data = JSON.parse(line)
               id = data['ID']
-              rt = [data['Repository'], data['Tag']].reject { |val| val == '<none>' }.join(':')
+              rt = [data['Repository'], data['Tag']].reject { |val| val.to_s.empty? || val == '<none>' }.join(':')
               rt = nil if rt.empty?
               aa = data['Names'] || (if rt && data['Repository']
                                        dd = true
@@ -11386,16 +13473,16 @@ module Squared
               next unless all || ee.match?(pat) || aa.match?(pat)
 
               unless y
-                bb = index.succ.to_s
-                cc = bb.size + 1
-                a = sub_style(ee, styles: theme[:inline])
-                b = "Execute #{sub_style(flag, styles: theme[:active])} on #{a}#{ee == id ? '' : " (#{id})"}"
+                bb = index.to_s
+                cc = bb.size.succ
+                a = sub_style ee, theme[:inline]
+                b = "Execute #{sub_style(flag, theme[:active])} on #{a.subhint(ee == id ? nil : id)}"
                 e = time_format(time_since(data['CreatedAt']), pass: ['ms'])
-                f = sub_style(ARG[:BORDER][0], styles: theme[:inline])
-                g = ' ' * (cc + 1)
-                h = "#{sub_style(bb.rjust(cc), styles: theme[:current])} #{f} "
-                puts unless index == 0
-                puts "#{h + sub_style(aa, styles: theme[:subject])} (created #{e} ago)"
+                f = sub_style ARG[:BORDER][0], theme[:inline]
+                g = ' ' * cc.succ
+                h = "#{sub_style(bb.rjust(cc), theme[:current])} #{f} "
+                puts unless index == 1
+                puts (h + sub_style(aa, theme[:subject])).subhint("created #{e} ago")
                 cols = %w[Tag Status Ports]
                 cols << case flag
                         when :connect, :disconnect
@@ -11409,19 +13496,23 @@ module Squared
                   puts "#{g + f} #{key}: #{Array(data[key]).join(', ')}" unless data[key].to_s.empty?
                 end
                 w = 9 + flag.to_s.size + 4 + ee.size
-                puts g + sub_style(ARG[:BORDER][6] + (ARG[:BORDER][1] * w), styles: theme[:inline])
-                found = true
+                puts g + sub_style(ARG[:BORDER][6] + (ARG[:BORDER][1] * w), theme[:inline])
                 index += 1
-                next unless confirm("#{h + b}?", no ? 'N' : 'Y', timeout: 60)
+                next unless confirm("#{h + b}?", no ? 'N' : 'Y')
 
                 puts if printfirst?
               end
               yield id
             end
-            puts log_message(Logger::INFO, 'none detected', subject: name, hint: hint || from) if !found && !y
+            list_empty(hint: hint || from) if index == 1 && !y
           end
         rescue StandardError => e
           on_error e, from
+        end
+
+        def list_empty(subject: name, hint: nil, **kwargs)
+          hint = "status: #{hint.join(', ')}" if hint.is_a?(Array)
+          puts log_message('none detected', subject: subject, hint: hint, **kwargs)
         end
 
         def confirm_command(*args, title: nil, target: nil, as: nil)
@@ -11430,69 +13521,75 @@ module Squared
           puts unless printfirst?
           t = title.to_s.split(':')
           emphasize(args, title: message(t.first.upcase, *t.drop(1)), border: borderstyle, sub: [
-            { pat: /\A(\w+(?: => \w+)+)(.*)\z/, styles: theme[:header] },
-            { pat: /\A(.+)\z/, styles: theme[:caution] }
+            opt_style(theme[:header], /\A(\w+(?: => \w+)+)(.*)\z/),
+            opt_style(theme[:caution], /\A(.+)\z/)
           ])
           printsucc
-          a = t.last.capitalize
-          b = sub_style(target, styles: theme[:subject])
-          c = as && sub_style(as, styles: theme[:inline])
-          confirm("#{a} #{b}#{c ? " as #{c}" : ''}?", 'N', timeout: 60)
+          s = t.last.capitalize
+          confirm "#{s} #{sub_style(target, theme[:subject])}#{" as #{sub_style(as, theme[:inline])}" if as}?", 'N'
         end
 
-        def choice_command(flag)
-          msg, cmd, index = case flag
-                            when :exec
-                              ['Choose a container', 'ps -a', 0]
-                            when :bake
-                              ['Choose a target', 'buildx bake --list=type=targets', 0]
-                            when :connect, :disconnect
-                              ['Choose a network', 'network ls', 0]
-                            else
-                              ['Choose an image', 'images -a', 2]
-                            end
+        def choice_command(flag, *action)
+          msg, cmd = case flag
+                     when :exec
+                       ['Choose a container', 'ps -a']
+                     when :bake
+                       ['Choose a target', 'buildx bake --list=type=targets']
+                     when :connect, :disconnect
+                       ['Choose a network', 'network ls']
+                     when :service
+                       ['Choose a service',
+                        'compose ps -a ' \
+                        "--format='table {{.Service}}\t{{.Name}}\t{{.Image}}\t{{.Command}}\t{{.Status}}\t{{.Ports}}'"]
+                     else
+                       ['Choose an image',
+                        'images -a ' \
+                        "--format='table {{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.CreatedSince}}\t{{.Size}}'"]
+                     end
           lines = `#{docker_output(cmd)}`.lines
-          header = lines.shift
-          if lines.empty?
-            puts log_message(Logger::INFO, 'none found', subject: name, hint: "docker #{cmd}")
-          else
-            puts " #  #{header}"
-            multiple = false
-            parse = ->(val) { val.split(/\s+/)[index] }
-            ctx = flag.to_s
-            case flag
-            when :run, :exec
-              values = [['Options', flag == :run], ['Arguments', flag == :exec]]
-            when :rm, :bake
-              values = ['Options']
-              multiple = true
-              ctx = flag == :rm ? 'image rm' : "buildx bake -f #{shell_quote(dockerfile)}"
-            when :save
-              values = [['Output', true], 'Platform']
-              multiple = true
-            when :connect, :disconnect
-              values = ['Options', ['Container', true]]
-              ctx = "network #{flag}"
-            end
-            out, opts, args = choice_index(msg, lines, multiple: multiple, values: values)
-            cmd = docker_output ctx
-            case flag
-            when :tag
-              args = tagjoin @registry, tag
-            when :save
-              opts = "#{opts}.tar" unless opts.end_with?('.tar')
-              cmd << quote_option('output', File.expand_path(opts))
-              if args
-                cmd << basic_option('platform', args)
-                args = nil
-              end
-            else
-              cmd << opts << '--'
-            end
-            cmd.merge(Array(out).map! { |val| parse.call(val) })
-            cmd << args
-            print_success if success?(run(cmd), ctx.start_with?(/network|tag|save/))
+          if lines.size <= 1
+            puts log_message('none found', subject: name, hint: "docker #{cmd.split(' ', 3)[0, 2].join(' ')}")
+            return
           end
+          puts " #  #{lines.shift}"
+          multiple = false
+          ctx = flag.to_s
+          case flag
+          when :run, :exec
+            values = [['Options', flag == :run], ['Arguments', flag == :exec]]
+          when :rm, :bake
+            values = ['Options']
+            multiple = true
+            ctx = flag == :rm ? 'image rm' : "buildx bake -f #{shell_quote(dockerfile)}"
+          when :save
+            values = [['Output', true], 'Platform']
+            multiple = true
+          when :service
+            values = []
+            multiple = true
+            ctx = 'compose'
+          when :connect, :disconnect
+            values = ['Options', ['Container', true]]
+            ctx = "network #{flag}"
+          end
+          out, opts, args = choice_index(msg, lines, multiple: multiple, values: values)
+          cmd = docker_output(ctx, *action)
+          case flag
+          when :tag
+            args = tagjoin @registry, tag
+          when :save
+            opts = "#{opts}.tar" unless opts.end_with?('.tar')
+            cmd << quote_option('output', File.expand_path(opts))
+            if args
+              cmd << basic_option('platform', args)
+              args = nil
+            end
+          else
+            cmd << opts << '--'
+          end
+          cmd.merge(Array(out).map! { |val| val.split(/\s+/, 2).first })
+          cmd << args
+          success?(run(cmd), ctx.start_with?(/network|tag|save/))
         end
 
         def filetype(val = dockerfile)
@@ -11515,16 +13612,14 @@ module Squared
         end
 
         def tagjoin(*args, char: '/')
-          args.compact!
-          args.join(char) unless args.empty?
+          args.join(char) unless (args = args.compact).empty?
         end
 
         def tagname(val)
           val = val.split(':').map! { |s| charname(s.sub(/^\W+/, '')) }
-          val.join(':').yield_self do |s|
-            s = val.first if val.size > 1 && s.size > 128
-            s[0..127]
-          end
+          ret = val.join(':')
+          ret = val.first if val.size > 1 && ret.size > 128
+          ret[0..127]
         end
 
         def dnsname(val)
@@ -11624,9 +13719,9 @@ module Squared
                       ['path not found', realpath]
                     else
                       @required = true
-                      project ? [project, 'not found'] : %w[name missing]
+                      project ? [project, 'missing'] : %w[name missing]
                     end
-        warn log_message(Logger::WARN, msg, subject: self.class, hint: hint)
+        warn log_warn(msg, subject: self.class, hint: hint)
       end
 
       def build
@@ -11644,7 +13739,7 @@ module Squared
                   next unless (data = Viewer.parse(type, type.upcase, ext))
                 end
                 obj, ext = data
-                target = file || target? ? file || realpath : nil
+                target = file || (realpath if target?)
 
                 task_desc(command, *ext, target: target)
                 task type, [:keys] do |_, args|
@@ -11743,7 +13838,7 @@ module Squared
 
       def read_keys(reader, type, file, keys, ext: [type], opts: {})
         if file && (mime = mimetype(file)) && basepath(file).exist?
-          raise_error(file, mime, hint: 'invalid') unless ext.include?(mime)
+          raise_error file, mime, hint: 'invalid' unless ext.include?(mime)
         else
           if ext.include?(mime)
             alt = file
@@ -11758,7 +13853,7 @@ module Squared
             args = { hint: 'no keys' }
           end
           unless file
-            args ||= { hint: 'not found', kind: LoadError }
+            args ||= { kind: Errno::ENOENT }
             raise_error(reader.name, "#{File.basename(alt, '.*')}.#{ext.first}", **args)
           end
         end
@@ -11772,25 +13867,19 @@ module Squared
               end
         return unless (lines = print_keys(type, doc, keys, file: file, opts: opts))
 
-        title = Pathname.new(file)
-                        .realpath
-                        .to_s
-                        .sub(/\A#{Regexp.escape(File.join(Dir.pwd, ''))}/, '')
+        title = File.realpath(file)
+                    .sub(/^#{Regexp.escape(File.join(Dir.pwd, ''))}/, '')
         emphasize(lines, title: title, sub: unless stdin?
                                               [
-                                                { pat: /\A((?:[^:]|(?<! ):(?! ))+)\z/, styles: theme[:banner] },
-                                                { pat: /\A(.*?)(<[^>]+>)(.+)\z/m, styles: theme[:undefined], index: 2 },
-                                                { pat: /\A((?~ : ))( : (?!undefined).+)\z/m, styles: theme[:key] },
-                                                { pat: /\A((?~: ): )(-?[\d.]+)(\s*)\z/m, styles: theme[:number],
-                                                  index: 2 },
-                                                { pat: /\A((?~: ): ")(.+)("\s*)\z/m, styles: theme[:string], index: 2 },
-                                                { pat: /\A((?~: ): \{)(.+)(}\s*)\z/m, styles: theme[:hash], index: 2 },
-                                                { pat: /\A((?~: ): \[)(.+)(\]\s*)\z/m, styles: theme[:array],
-                                                  index: 2 },
-                                                { pat: /\A((?~: ): )(true|false)(\s*)\z/m, styles: theme[:boolean],
-                                                  index: 2 },
-                                                { pat: /\A((?~: ): (?!undefined))([^"\[{].*)\z/m, styles: theme[:value],
-                                                  index: 2 }
+                                                opt_style(theme[:banner], /\A((?:[^:]|(?<! ):(?! ))+)\z/),
+                                                opt_style(theme[:undefined], /\A(.*?)(<[^>]+>)(.+)\z/m, 2),
+                                                opt_style(theme[:key], /\A((?~ : ))( : (?!undefined).+)\z/m),
+                                                opt_style(theme[:number], /\A((?~: ): )(-?[\d.]+)(\s*)\z/m, 2),
+                                                opt_style(theme[:string], /\A((?~: ): ")(.+)("\s*)\z/m, 2),
+                                                opt_style(theme[:hash], /\A((?~: ): \{)(.+)(\}\s*)\z/m, 2),
+                                                opt_style(theme[:array], /\A((?~: ): \[)(.+)(\]\s*)\z/m, 2),
+                                                opt_style(theme[:boolean], /\A((?~: ): )(true|false)(\s*)\z/m, 2),
+                                                opt_style(theme[:value], /\A((?~: ): (?!undefined))([^"\[{].*)\z/m, 2)
                                               ]
                                             end, border: theme[:border])
       end
@@ -11813,7 +13902,7 @@ module Squared
               end
             end
           rescue StandardError
-            log&.warn "#{Viewer}(#{type}) => #{file && "#{file} "}{#{key}: undefined}"
+            log&.warn "#{Viewer}(#{type}) => #{"#{file} " if file}{#{key}: undefined}"
             val = Regexp.escape($!.message)
             key = key.sub(/(#{val})\.|\.(#{val})|(#{val})/) do
               s = "<#{$3 || $2 || $1}>"
@@ -11847,7 +13936,7 @@ module Squared
       def task_desc(command, *ext, target: nil)
         return unless Rake::TaskManager.record_task_metadata
 
-        val = "#{ext.first}[#{target ? '' : "file?=#{File.basename(main)}.#{ext.last},"}keys+]"
+        val = "#{ext.first}[#{"file?=#{File.basename(main)}.#{ext.last}," if target}keys+]"
         args = *name.split(':').push(command, val)
         if project
           project.workspace.task_desc(*args)
@@ -11892,6 +13981,20 @@ module Squared
 
         project.basepath(*args)
       end
+    end
+  end
+end
+
+unless defined?(Readline)
+  if RUBY_ENGINE == 'ruby' && RUBY_VERSION < '2.7'
+    require 'readline'
+  else
+    begin
+      require 'reline'
+      Object.send(:remove_const, :Readline) if Object.const_defined?(:Readline)
+      Readline = Reline
+    rescue LoadError
+      require 'readline'
     end
   end
 end
