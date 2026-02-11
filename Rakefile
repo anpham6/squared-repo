@@ -1,13 +1,13 @@
 # frozen_string_literal: true
 
-require 'set'
-require 'pathname'
-require 'logger'
-require 'rake'
-require 'shellwords'
-require 'time'
 require 'forwardable'
 require 'json'
+require 'logger'
+require 'pathname'
+require 'rake'
+require 'set'
+require 'shellwords'
+require 'time'
 
 module Squared
   VERSION = '0.6.9'
@@ -5143,8 +5143,10 @@ module Squared
           args
         end
 
-        def confirm_basic(msg, target, default = 'Y', style: :inline, **kwargs)
-          confirm("#{msg} [#{sub_style(target.to_s, style.is_a?(Symbol) ? theme[style] : style)}]", default, **kwargs)
+        def confirm_basic(msg, hint, default = 'Y', style: :inline, target: @session, prefix: nil, **kwargs)
+          return true if prefix ? option('y', prefix: prefix) : target && option('y', target: target)
+
+          confirm("#{msg} [#{sub_style(hint.to_s, style.is_a?(Symbol) ? theme[style] : style)}]", default, **kwargs)
         end
 
         def confirm_outdated(pkg, ver, type, cur = nil, lock: false, col0: 0, col1: 0, col2: nil, col3: 0, col4: 0,
@@ -7536,8 +7538,9 @@ module Squared
             opts << format if format
           end
           list = OPT_GIT[:show] + OPT_GIT[:diff][:show] + OPT_GIT[:log][:diff] + OPT_GIT[:log][:diff_context]
-          op = OptionPartition.new(opts, list, cmd, project: self, pass: [:base],
-                                                    no: OPT_GIT[:no][:show] + collect_hash(OPT_GIT[:no][:log]))
+          op = OptionPartition.new(opts, list, cmd,
+                                   project: self,
+                                   no: OPT_GIT[:no][:show] + collect_hash(OPT_GIT[:no][:log], pass: [:base]))
           op.append(delim: true)
           source(exception: false, banner: flag != :oneline)
         end
@@ -9695,7 +9698,7 @@ module Squared
 
         def remove_modules(prefix = dependbin)
           modules = basepath 'node_modules'
-          return false unless modules.directory? && (option('y', prefix: prefix) || confirm_basic('Remove?', modules))
+          return false unless modules.directory? && confirm_basic('Remove?', modules, prefix: prefix)
 
           modules.rmtree
         rescue Timeout::Error => e
@@ -10059,7 +10062,7 @@ module Squared
                             if args.empty?
                               args = readline('Enter command', force: true).split(' ', 2)
                             elsif args.size == 1 && !option('interactive', equals: '0', prefix: ref)
-                              args << readline('Enter arguments', force: false)
+                              args << readline('Enter arguments', force: false) unless args.first.include?(' ')
                             end
                             venv_init
                             run args.join(' ')
@@ -12024,6 +12027,7 @@ module Squared
           when :dependency, :environment, :list, :search, :specification, :which
             op.concat(args)
           end
+          ia = op.remove(':')
           op.each do |opt|
             if gems && !opt.start_with?('-') && !opt.match?(GEMNAME)
               op.errors << opt
@@ -12087,7 +12091,7 @@ module Squared
             end
           when :install, :uninstall, :pristine
             if flag == :install
-              post = if op.remove(':')
+              post = if ia
                        op.concat(args)
                        readline('Enter command [args]', force: true)
                      elsif op.empty?
@@ -12105,14 +12109,14 @@ module Squared
               else
                 op.clear
               end
-            elsif (n = op.index { |val| val.match?(/(\A|[a-z])@\d/) })
+            elsif (n = op.index { |val| val.match?(/(\A|[\w.-])@\d/) })
               name = op.remove_at(n)
               pre, ver = if (n = name.index('@')) == 0
                            [gemname, name[1..-1]]
                          else
                            [name[0, n], name[n.succ..-1]]
                          end
-              op.adjoin(pre, basic_option('version', ver))
+              op.adjoin(pre, quote_option('version', ver))
                 .clear
             end
             if flag == :install
@@ -12960,14 +12964,18 @@ module Squared
                         end
                       else
                         format_desc(action, flag, case flag
-                                                  when :rm, :save then 'id*,opts*'
-                                                  when :tag then 'version?'
+                                                  when :rm, :save then 'id,opts*'
+                                                  when :tag then 'version'
                                                   else 'opts*,args*'
-                                                  end)
+                                                  end, before: 'pattern?')
                         task flag do |_, args|
                           args = args.to_a
+                          n = args.size
+                          if (n > 1 || (flag == :ls && n > 0)) && OptionPartition.pattern?(args.first)
+                            filter = args.shift
+                          end
                           if !args.empty? || flag == :ls
-                            image flag, args
+                            image(flag, args, filter: filter)
                           else
                             choice_command flag
                           end
@@ -12993,8 +13001,8 @@ module Squared
         def clean(*, sync: invoked_sync?('clean'), **)
           if runnable?(@clean)
             super
-          else
-            image(:rm, sync: sync)
+          elsif sync || option('y', prefix: 'docker')
+            image :rm
           end
         end
 
@@ -13211,7 +13219,7 @@ module Squared
           run(from: from)
         end
 
-        def image(flag, opts = [], sync: true, id: nil, registry: nil)
+        def image(flag, opts = [], sync: true, id: nil, registry: nil, filter: nil)
           cmd, opts = docker_session('image', flag, opts: opts)
           op = OptionPartition.new(opts, OPT_DOCKER[:image].fetch(flag, []), cmd, project: self)
           exception = self.exception
@@ -13229,7 +13237,7 @@ module Squared
                 opts.delete(val)
                 break
               end
-              list_image(:run, from: from) do |val|
+              list_image(:run, filter: filter, from: from) do |val|
                 container(:run, if name
                                   opts.dup << "name=#{index == 0 ? name : "#{name}-#{index}"}"
                                 else
@@ -13243,9 +13251,7 @@ module Squared
           when :rm
             unless id
               if op.empty?
-                list_image(:rm, from: from) do |val|
-                  image(:rm, opts, sync: sync, id: val)
-                end
+                list_image(:rm, filter: filter, from: from) { |val| image(:rm, opts, sync: sync, id: val) }
               else
                 op.each { |val| run(cmd.temp(val), sync: sync, from: from) }
               end
@@ -13257,13 +13263,16 @@ module Squared
               banner = false
             end
           when :tag, :save
-            list_image(flag, from: from) do |val|
+            found = false
+            list_image(flag, filter: filter, from: from) do |val|
               op << val
+              found = true
               if flag == :tag
                 op << tagname("#{project}:#{op.first}")
                 break
               end
             end
+            raise_error ArgumentError, 'target not specified', hint: flag unless found
           when :push
             id ||= option('tag', ignore: false) || tagmain
             registry ||= op.shift || option('registry') || @registry
@@ -13452,12 +13461,20 @@ module Squared
           [cmd, status, no]
         end
 
-        def list_image(flag, cmd = docker_output('image ls -a'), hint: nil, no: true, from: nil)
+        def list_image(flag, cmd = docker_output('image ls -a'), filter: nil, hint: nil, no: true, from: nil)
           pwd_set(from: from) do
             index = 1
             all = option('all', prefix: 'docker')
             y = from == :'image:rm' && option('y', prefix: 'docker')
-            pat = /\b(?:#{dnsname(name)}|#{tagname(project)}|#{tagmain.split(':', 2).first})\b/
+            filter = env('DOCKER_FILTER', filter).to_s
+            pat = if OptionPartition.pattern?(filter)
+                    Regexp.new(filter)
+                  elsif filter.match?(/[:_-]$/)
+                    /\b#{Regexp.escape(filter)}/
+                  else
+                    filter = filter.empty? ? '(?:[:_-]|$)' : "[:_-]#{filter}"
+                    /\b(?:#{dnsname(name)}|#{tagname(project)}|#{tagmain.split(':', 2).first})#{filter}/
+                  end
             IO.popen(cmd.temp('--format=json')).each do |line|
               data = JSON.parse(line)
               id = data['ID']
@@ -14017,21 +14034,21 @@ Workspace::Application
   .with(:node, :python) { clean ['build/'] }
   .with(:node, lint: [nil, Project::Node.prod? ? 'lint' : 'lint:fix'], pass: 'bump') do
     add('e-mc', 'emc', copy: { from: 'publish', scope: '@e-mc', also: %i[pir pir2 express] }) do
-      add('publish/*', group: 'emc', pass: %w[install update package], exclude: :base)
+      add('publish/*', group: 'emc', pass: %w[install update package bump], exclude: :base)
       revbuild(include: 'src/')
       inject(Viewer, dump: 'json')
 
       chain('all', :refresh, step: 1)
     end
     add('pi-r', 'pir', graph: 'emc', copy: { from: 'publish', scope: '@pi-r', also: :pir2 }) do
-      add('publish/*', group: 'pir', pass: %w[install update package], exclude: :base)
+      add('publish/*', group: 'pir', pass: %w[install update package bump], exclude: :base)
       revbuild(include: 'src/')
       inject(Viewer, dump: 'json')
 
       chain('all', :refresh, after: 'emc')
     end
     add('pi-r2', 'pir2', graph: %w[pir emc], copy: { from: 'publish', workspace: true }) do
-      add('publish/*', group: 'pir2', pass: %w[install update package], exclude: :base)
+      add('publish/*', group: 'pir2', pass: %w[install update package bump], exclude: :base)
       revbuild(include: 'src/')
       inject(Viewer, dump: 'json')
 
@@ -14078,7 +14095,7 @@ Workspace::Application
     chain('all', :doc, with: 'emc')
     banner(:path, styles: %i[blue bold], border: 'blue')
   end
-  .with(:docker, run: (false unless ENV['SSH_AUTH_SOCK'] && ENV['GITHUB_TOKEN']), pass: %i[windows? docker?]) do
+  .with(:docker, run: (false unless ENV['SSH_AUTH_SOCK'] && ENV['GITHUB_TOKEN']), hide: %i[windows? docker?]) do
     add('squared', 'docker', file: ENV['DOCKER_FILE'] ? "#{ENV['DOCKER_FILE']}.Dockerfile" : 'Dockerfile', args: '--ssh=default', secrets: 'id=github,env=GITHUB_TOKEN', pass: 'unpack')
     add('squared', 'docker-test', file: 'docker-bake.hcl', args: '--allow=ssh --allow=fs.read=/tmp --allow=fs.read=/run/user', clean: false, only: %w[build bake])
     add('squared', 'docker-run', file: 'compose.yaml', clean: false, only: %w[build compose])
