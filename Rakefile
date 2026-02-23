@@ -1,16 +1,16 @@
 # frozen_string_literal: true
 
-require 'forwardable'
-require 'json'
-require 'logger'
-require 'pathname'
-require 'rake'
 require 'set'
+require 'pathname'
+require 'logger'
+require 'rake'
 require 'shellwords'
 require 'time'
+require 'forwardable'
+require 'json'
 
 module Squared
-  VERSION = '0.6.9'
+  VERSION = '0.6.10'
 
   module Common
     PATH = {}
@@ -8374,7 +8374,7 @@ module Squared
     module Project
       class Node < Git
         OPT_NPM = {
-          common: %w[dry-run=!? loglevel=b include-workspace-root=!? workspaces=!? w|workspace=v].freeze,
+          common: %w[dry-run=!? force=!? loglevel=b include-workspace-root=!? workspaces=!? w|workspace=v].freeze,
           install: %w[package-lock-only=!? prefer-dedupe=!? E|save-exact=!? before=q cpu=b libc=b os=b].freeze,
           install_a: %w[audit=! bin-links=! foreground-scripts=!? fund=! ignore-scripts=!? install-links=!?
                         package-lock=! strict-peer-deps=!? include=b install-strategy=b omit=b].freeze,
@@ -9842,14 +9842,16 @@ module Squared
           install: %w[break-system-packages compile dry-run force-reinstall I|ignore-installed no-compile
                       no-warn-conflicts no-warn-script-location U|upgrade user prefix=p report=p root=p
                       root-user-action=b t|target=p upgrade-strategy=b].freeze,
-          install_a: %w[ignore-requires-python no-index pre extra-index-url=q f|find-links=q i|index-url=q no-binary=q
-                        only-binary=q].freeze,
-          install_b: %w[build-constraint check-build-dependencies no-build-isolation no-clean no-deps prefer-binary
-                        require-hashes use-pep517 c|constraint=p group=q progress-bar=b r|requirement=p src=p].freeze,
+          install_a: %w[ignore-requires-python no-index pre prefer-binary all-releases=b extra-index-url=q
+                        f|find-links=q i|index-url=q no-binary=q only-binary=q only-final=b uploaded-prior-to=q].freeze,
+          install_b: %w[build-constraint check-build-dependencies no-build-isolation no-clean no-deps
+                        require-hashes use-pep517 c|constraint=p group=q progress-bar=b r|requirement=p
+                        requirements-from-script=p src=p].freeze,
           install_c: %w[C|config-settings=q e|editable=v].freeze,
           hash: %w[a|algorithm].freeze,
-          list: %w[e|editable exclude-editable include-editable l|local no-index not-required o|outdated pre u|uptodate
-                   user exclude=b extra-index-url=q format=b f|find-links=q i|index-url=q path=p].freeze,
+          list: %w[e|editable exclude-editable include-editable l|local no-index not-required o|outdated pre
+                   prefer-binary u|uptodate user all-releases=b exclude=b extra-index-url=q format=b f|find-links=q
+                   i|index-url=q no-binary=q only-binary=q only-final=b path=p].freeze,
           lock: %w[o|output=p].freeze,
           show: %w[f|files].freeze,
           uninstall: %w[break-system-packages y|yes r|requirement=p root-user-action=b].freeze,
@@ -9886,7 +9888,7 @@ module Squared
             debug: %w[platform].freeze,
             install: %w[C config-settings c constraint extra-index-url no-binary only-binary platform
                         r requirement].freeze,
-            list: %w[exclude extra-index-url].freeze
+            list: %w[exclude extra-index-url no-binary only-binary].freeze
           }.freeze
         }.freeze
         private_constant :DEP_PYTHON, :DIR_PYTHON, :OPT_PYTHON, :OPT_PIP, :OPT_POETRY, :OPT_PDM, :OPT_HATCH, :OPT_TWINE,
@@ -9912,7 +9914,8 @@ module Squared
           end
         end
 
-        attr_reader :venv, :editable
+        attr_reader :venv
+        attr_accessor :editable
 
         def initialize(*, editable: '.', asdf: 'python', **kwargs)
           super
@@ -11108,6 +11111,7 @@ module Squared
         })
 
         attr_reader :gemdir
+        attr_accessor :autodetect
 
         def initialize(*, autodetect: false, gemspec: nil, steep: 'Steepfile', rubocop: '.rubocop.yml', asdf: 'ruby',
                        **kwargs)
@@ -11120,7 +11124,7 @@ module Squared
             initialize_env(**kwargs)
           end
           dependfile_set GEMFILE
-          @autodetect = autodetect
+          self.autodetect = autodetect
           @gemfile = if gemspec == false
                        false
                      elsif gemspec
@@ -11128,7 +11132,7 @@ module Squared
                      end
           @steepfile = basepath! steep if steep
           @rubocopfile = Pathname.new(rubocop).realpath rescue basepath!(Dir.home, '.rubocop.yml') if rubocop
-          return unless rakefile && @output[0].nil? && @copy.nil? && !version && !@autodetect
+          return unless rakefile && @output[0].nil? && @copy.nil? && !version && !self.autodetect
 
           begin
             File.foreach(rakefile) do |line|
@@ -12424,7 +12428,7 @@ module Squared
         def copy?
           return true if @copy.is_a?(Hash) ? copy[:into] : super
           return gemdir? if gemdir
-          return false unless @autodetect
+          return false unless autodetect
 
           set = lambda do |val, path|
             base = Pathname.new(path.strip)
@@ -12437,7 +12441,7 @@ module Squared
           end
           if version
             begin
-              case @autodetect
+              case autodetect
               when 'rvm'
                 pwd_set { `rvm info homes` }[/^\s+gem:\s+"(.+)"$/, 1]
               when 'rbenv'
@@ -12495,7 +12499,7 @@ module Squared
           log.error e
           self.version = nil
           @gemdir = nil
-          @autodetect = false
+          self.autodetect = false
         else
           gemdir?
         end
