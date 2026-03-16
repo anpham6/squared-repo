@@ -10,7 +10,7 @@ require 'forwardable'
 require 'json'
 
 module Squared
-  VERSION = '0.6.10'
+  VERSION = '0.6.11'
 
   module Common
     PATH = {}
@@ -2406,10 +2406,10 @@ module Squared
               ret.map! do |val|
                 next val if opt?(val)
 
-                if quote || val.is_a?(Pathname)
-                  shell_quote(val, force: force, double: double)
-                elsif escape
+                if !(pa = val.is_a?(Pathname)) && escape
                   shell_escape(val, quote: quote, double: double)
+                elsif quote || pa
+                  shell_quote(val, force: force, double: double)
                 else
                   val
                 end
@@ -2694,7 +2694,7 @@ module Squared
                   push opt
                   skip = true if args
                 end
-                skip = true if first&.any? { |s| s.is_a?(Regexp) ? opt.match?(s) : !opt.include?(s) }
+                skip = true if first&.any? { |pat| pat.is_a?(Regexp) ? opt.match?(pat) : !opt.include?(pat) }
               end
             end
             @values = @values.empty? ? /\A\s+\z/ : /\A(#{@values.join('|')})#{sep}(.+)\z/m
@@ -2719,7 +2719,8 @@ module Squared
             self
           end
 
-          def append_any(*args, escape: false, quote: true, **kwargs)
+          def append_any(*args, escape: false, **kwargs)
+            quote = kwargs.fetch(:quote, true)
             (args.empty? ? extras : args.flatten).each do |val|
               if block_given?
                 temp = val
@@ -2727,7 +2728,7 @@ module Squared
                 if val.is_a?(Array)
                   found << temp
                   k, v, q = val
-                  add_option(k, v, escape: escape, quote: quote, double: q == '"', merge: q == true, **kwargs)
+                  add_option(k, v, escape: escape, double: q == '"', merge: q == true, **kwargs)
                   next
                 end
               end
@@ -2735,10 +2736,10 @@ module Squared
 
               if exist?(val)
                 add_path(val, **kwargs)
-              elsif quote
-                add_quote(val, **kwargs)
               elsif escape
                 add shell_escape(val, **kwargs)
+              elsif quote
+                add_quote(val, **kwargs)
               else
                 add val
               end
@@ -2852,7 +2853,7 @@ module Squared
 
           def add_path(*args, option: nil, force: true, double: false, **kwargs)
             if args.empty?
-              args = select { |val| val.is_a?(String) }
+              args = grep(String)
               found.concat(args)
               args.map! { |val| path + val } if path
               append(args, force: force, **kwargs)
@@ -2868,6 +2869,7 @@ module Squared
           end
 
           def add_quote(*args, **kwargs)
+            kwargs.delete(:quote)
             merge(args.compact
                       .map! { |val| val == '--' || OptionPartition.opt?(val) ? val : shell_quote(val, **kwargs) })
             self
@@ -2878,8 +2880,8 @@ module Squared
             self
           end
 
-          def add_first(fallback = nil, prefix: nil, path: false, escape: false, quote: false, reverse: false,
-                        expect: false, **kwargs)
+          def add_first(fallback = nil, prefix: nil, path: false, escape: false, reverse: false, expect: false,
+                        **kwargs)
             val = (reverse ? pop : shift) || fallback
             if val
               temp = val
@@ -2887,10 +2889,10 @@ module Squared
               unless block_given? && !(val = yield val).is_a?(String)
                 if path
                   add_path(val, **kwargs)
-                elsif quote
-                  add_quote(val, **kwargs)
                 elsif escape
                   add shell_escape(val, **kwargs)
+                elsif kwargs[:quote]
+                  add_quote(val, **kwargs)
                 else
                   add val
                 end
@@ -3068,7 +3070,7 @@ module Squared
           def multiple=(val)
             case val
             when Enumerable
-              @multiple.concat(val.to_a.map { |val| val.is_a?(Regexp) ? val : val.to_s })
+              @multiple.concat(val.to_a.map { |pat| pat.is_a?(Regexp) ? pat : pat.to_s })
             when String, Symbol, Pathname
               @multiple << val.to_s
             when Regexp
@@ -3476,7 +3478,7 @@ module Squared
                    print_error e
                  end
           log[:progname] ||= @name
-          env('LOG_LEVEL', ignore: false) { |val| log[:level] = val.start_with?(/\d/) ? log_sym(val.to_i) : val }
+          env('LOG_LEVEL', ignore: false) { |s| log[:level] = s.start_with?(/\d/) ? log_sym(s.to_i) : s }
           log.delete(:file)
           @log = [file, log]
         end
@@ -3746,7 +3748,7 @@ module Squared
             args[0] = instance_eval(&blk) || f
             return unless args.first
           end
-          if args.all? { |val| val.is_a?(Array) }
+          if args.all?(Array)
             cmd = []
             var = {}
             args.each do |val|
@@ -4066,7 +4068,7 @@ module Squared
           ensure
             if dir
               remove_entry dir
-            elsif delete && file&.exist?
+            elsif delete && file.exist?
               file.unlink
             end
           end
@@ -4548,17 +4550,17 @@ module Squared
                            s += "#{indent || (last && data[final].last == context) ? ' ' : a}   "
                            k += 1
                          end
-                         s += "#{j ? d : c}#{b * 3} #{tag.call(proj)}"
+                         s + "#{j ? d : c}#{b * 3} #{tag.call(proj)}"
                        end
               end
               if order
                 n = order.size
                 order[name] ||= if proj.parent
-                                  if order[s = proj.parent.name]
-                                    order[s] += 1
+                                  if order[key = proj.parent.name]
+                                    order[key] += 1
                                     n.pred
                                   else
-                                    order[s] = n.succ
+                                    order[key] = n.succ
                                     n
                                   end
                                 else
@@ -5485,7 +5487,7 @@ module Squared
             ret = []
             if data[:command]
               ret[0] = data[:command]
-              ret[1] = data[:opts] unless diso
+              ret[1] = data[:opts] unless noopt
               ret[3] = data[:args]
             elsif data[:script]
               ret[1] = data[:script]
@@ -5494,7 +5496,7 @@ module Squared
             else
               ret[0] = false
             end
-            ret[2] = data[:env] unless dise
+            ret[2] = data[:env] unless noenv
             ret
           end
           self.global = global
@@ -5502,7 +5504,7 @@ module Squared
           when Hash
             @output = parse.call(data)
           when Enumerable
-            @output = if cmd.all? { |data| data.is_a?(Hash) }
+            @output = if cmd.all?(Hash)
                         noopt = false
                         noenv = false
                         cmd.map { |data| parse.call(data) }
@@ -6217,7 +6219,7 @@ module Squared
                                    end
                           if squash
                             found = false
-                            git_spawn(git_output('log --format=%h'), stdout: false).each do |val|
+                            git_spawn('log --format=%h', stdout: false).each do |val|
                               if found
                                 squash = val.chomp
                                 break
@@ -7679,22 +7681,22 @@ module Squared
           if io && banner == false
             from = nil
             banner = nil
+            args = false
           else
-            if banner
-              banner = nil unless banner? && !multiple
-              args = true
-            end
             if from == false
               from = nil
             elsif !from && cmd.respond_to?(:drop)
               from = cmd.drop(1).find { |val| val.match?(/\A[a-z]{1,2}[a-z-]*\z/) }
               from &&= :"git:#{from}"
             end
-            banner &&= cmd.temp { |val| val.start_with?(/--(?:work-tree|git-dir)/) } if cmd.respond_to?(:temp)
+            if banner
+              banner = cmd.temp { |val| val.start_with?(/--(work-tree|git-dir)/) } if cmd.respond_to?(:temp)
+              args = true
+            end
           end
           cmd = session_done cmd
-          log&.info cmd
-          banner = if banner
+          log&.info cmd unless args == false
+          banner = if banner && banner? && !multiple
                      format_banner(banner.is_a?(String) ? banner : cmd, hint: hint, strip: true)
                    end
           on :first, from
@@ -7913,9 +7915,7 @@ module Squared
 
         def append_message(val = nil, target: @session)
           val = messageopt if val.to_s.empty?
-          return unless val
-
-          target << quote_option('message', val)
+          target << quote_option('message', val) if val
         end
 
         def append_head(val = nil, target: @session)
@@ -8898,31 +8898,36 @@ module Squared
               run(target.temp(*remove).sub!(/ (?:add|install) /, ' remove '), from: :remove, sync: sync)
             end
             if (yarn = dependtype(:yarn)) > 0
-              cmd = session('yarn', flag || 'install')
-              append_loglevel
-              if yarn == 1
-                cmd << '--ignore-engines' unless option('ignore-engines', equals: '0')
-                cmd << '--ignore-scripts' if option('ignore-scripts')
-                cmd << '--force' if option('force')
+              if !flag && yarn > 1 && prod?
+                cmd = session 'yarn', 'workspaces focus --all --production'
               else
-                cmd << '--mode=skip-build' if option('ignore-scripts')
-                cmd << '--check-cache' if !flag && option('force')
-              end
-              if nolockfile?('yarn')
-                cmd << '--no-lockfile'
-              elsif option('ci')
+                cmd = session('yarn', flag || 'install')
                 if yarn == 1
-                  cmd << '--frozen-lockfile'
-                elsif !flag
-                  cmd << '--immutable' << '--refresh-lockfile'
+                  cmd << '--production' if prod?
+                  cmd << '--ignore-engines' unless option('ignore-engines', equals: '0')
+                  cmd << '--ignore-scripts' if option('ignore-scripts')
+                  cmd << '--force' if option('force')
+                else
+                  cmd << '--mode=skip-build' if option('ignore-scripts')
+                  cmd << '--check-cache' if !flag && option('force')
+                end
+                if nolockfile?('yarn')
+                  cmd << '--no-lockfile'
+                elsif option('ci')
+                  if yarn == 1
+                    cmd << '--frozen-lockfile'
+                  elsif !flag
+                    cmd << '--immutable' << '--refresh-lockfile'
+                  end
+                end
+                if add
+                  cmd << '-W' if yarn == 1 && !option('w', 'ignore-workspace-root-check', equals: '0')
+                  rm.call(cmd)
+                  om.call(cmd)
+                  cmd << '--exact' if exact
                 end
               end
-              if add
-                cmd << '-W' if yarn == 1 && !option('w', 'ignore-workspace-root-check', equals: '0')
-                rm.call(cmd)
-                om.call(cmd)
-                cmd << '--exact' if exact
-              end
+              append_loglevel
             elsif pnpm?
               cmd = session('pnpm', flag || 'install')
               append_nocolor
@@ -8933,6 +8938,7 @@ module Squared
                 cmd << '--save-exact' if exact
                 option('allow-build') { |val| cmd << quote_option('allow-build', val) }
               else
+                cmd << '--prod' if prod?
                 append_platform
               end
               option('public-hoist-pattern') do |val|
@@ -8957,6 +8963,8 @@ module Squared
               if omit
                 cmd << "--omit=#{save || omit}"
                 save = nil
+              elsif !add && prod?
+                cmd << '--include=prod'
               end
               unless ci
                 if add
@@ -10887,7 +10895,11 @@ module Squared
                      .clear(pass: false)
                      .arg?(/\A-v+\z/)
           ret = run(op, env, exception: true, banner: banner)
-          pip(:install, 'poetry', banner: false) if poetry?
+          if poetry?
+            pip(:install, 'poetry', banner: false)
+          elsif setuptools?
+            pip(:install, 'setuptools', 'wheel', banner: false)
+          end
           success?(ret, banner, !status) { |out| puts(out && dir.directory? ? "Success: #{dir}" : 'Failed') }
         end
 
@@ -11736,7 +11748,7 @@ module Squared
                                    `rvm current`[/^\S+/, 0]
                                  when 'rbenv'
                                    name = `rbenv version-name`
-                                   name.match?(SEM_VER) ? "ruby #{name}" : name
+                                   (name =~ SEM_VER) == 0 ? "ruby #{name}" : name
                                  when 'chruby.sh'
                                    chruby = session_output 'source', val
                                    `#{chruby.with('ruby --version')}`
@@ -12578,7 +12590,7 @@ module Squared
         def unpack_get(tag, ext)
           return super unless ext == 'gem'
 
-          "https://rubygems.org/downloads/#{File.basename(tag, '.gem')}.gem"
+          "https://rubygems.org/downloads/#{tag.sub_ext('.gem')}"
         end
 
         def preopts
