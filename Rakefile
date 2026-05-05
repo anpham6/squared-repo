@@ -11,7 +11,7 @@ require 'time'
 require 'timeout'
 
 module Squared
-  VERSION = '0.7.5'
+  VERSION = '0.7.6'
 
   module Common
     PATH = {}
@@ -2100,7 +2100,7 @@ module Squared
         log_console(*args, pipe: kwargs[:pipe] || pipe)
       end
 
-      def script_command(task, val, group, ref, on, &blk)
+      def script_command(task, val, group, ref, on = nil, &blk)
         if block_given?
           val = Struct::RunData.new(val, blk)
         elsif !val
@@ -2111,7 +2111,7 @@ module Squared
           as_a group, :to_sym
         else
           label = :ref
-          as_a ref, :to_sym
+          as_a(ref || :_, :to_sym)
         end.each do |name|
           @script[label][name][task] = val
           @events[label][name][task] = on if on.is_a?(Hash)
@@ -2164,6 +2164,8 @@ module Squared
           nil
         elsif ref && target[:ref].key?(ref)
           target[:ref][ref]
+        else
+          target[:ref][:_]
         end
       end
 
@@ -4844,7 +4846,7 @@ module Squared
           else
             if series?(obj)
               obj.each(&:call)
-            elsif obj.is_a?(Array) && obj.none?(String)
+            elsif obj.is_a?(Array) && obj.any? { |val| val.nil? || !val.is_a?(String) }
               build(*obj, **kwargs)
             elsif obj
               run_s(*Array(obj), **kwargs)
@@ -5050,8 +5052,8 @@ module Squared
 
         def session(*cmd, prefix: cmd.first, main: true, path: true, options: true)
           prefix = prefix.to_s.stripext
-          if path && (val = shell_bin(prefix))
-            cmd[0] = shell_quote(val, force: false)
+          if path && (bin = shell_bin(prefix))
+            cmd[0] = shell_quote(bin, force: false)
           end
           ret = JoinSet.new(cmd)
           if options
@@ -5115,7 +5117,7 @@ module Squared
             args.unshift(*a)
             OptionPartition.uniq!(args, pass) if pass
           end
-          kwargs&.update(b) { |_, val| val }
+          kwargs&.update(b) { |_, obj| obj }
           nil
         end
 
@@ -5283,7 +5285,7 @@ module Squared
           workspace.format_desc([@desc, action, flag].compact, opts, **kwargs)
         end
 
-        def format_banner(cmd, banner: true, hint: nil, strip: nil, quote: false)
+        def format_banner(cmd, banner: true, hint: nil, strip: nil, quote: false, command: true)
           return unless banner && banner?
 
           if (data = workspace.banner_get(*@ref, group: group))
@@ -5296,15 +5298,17 @@ module Squared
           if verbose
             out = []
             if data.command
-              if cmd =~ /\A(?:"((?:[^"]|(?<=\\)")+)"|'((?:[^']|(?<=\\)')+)'|(\S+))( |\z)/
-                arg = $3 || $2 || $1
-                cmd = cmd.sub(arg, data.command == 0 ? arg.stripext : arg.stripext.upcase)
+              if command
+                if cmd =~ /\A(?:"((?:[^"]|(?<=\\)")+)"|'((?:[^']|(?<=\\)')+)'|(\S+))( |\z)/
+                  arg = $3 || $2 || $1
+                  cmd = cmd.sub(arg, data.command == 0 ? arg.stripext : arg.stripext.upcase)
+                end
+                if strip || (strip.nil? && data.order.include?(:path))
+                  cmd = cmd.gsub(/(?:#{s = Regexp.escape(File.join(path, ''))}?(?=["'])|#{s})/, '')
+                           .gsub(/(?: -[^ ])? (?:""|'')/, '')
+                end
+                cmd.gsub!(/(?<= )(["'])([\w.-]+)\1(?= |\z)/, '\2') unless quote
               end
-              if strip || (strip.nil? && data.order.include?(:path))
-                cmd = cmd.gsub(/(?:#{s = Regexp.escape(File.join(path, ''))}?(?=["'])|#{s})/, '')
-                         .gsub(/(?: -[^ ])? (?:""|'')/, '')
-              end
-              cmd.gsub!(/(?<= )(["'])([\w.-]+)\1(?= |\z)/, '\2') unless quote
               out << cmd.subhint(hint)
             end
             data.order.each do |val|
@@ -5886,7 +5890,7 @@ module Squared
           return if from == false
 
           require 'timeout'
-          unless (path.to_s == Dir.pwd || pass == true) && (workspace.mri? || !workspace.windows?)
+          unless (path.to_s == Dir.pwd || pass) && (workspace.mri? || !workspace.windows?)
             pwd = Dir.pwd
             Dir.chdir(path)
           end
@@ -7331,7 +7335,7 @@ module Squared
           cmd, opts = git_session('rebase', opts: opts)
           case flag
           when :branch
-            return unless upstream
+            raise ArgumentError, 'no upstream branch' unless upstream
 
             op = OptionPartition.new(opts, OPT_GIT[:rebase], cmd, project: self, strict: strict?,
                                                                   no: OPT_GIT[:no][:rebase])
@@ -7339,7 +7343,7 @@ module Squared
             append_head op.shift&.delete_prefix(':')
             op.clear(pass: false)
           when :onto
-            return unless upstream
+            raise ArgumentError, 'no base branch/commit' unless upstream
 
             cmd << '--interactive' if option('interactive', 'i')
             cmd << shell_option('onto', commit) if commit
@@ -8162,7 +8166,7 @@ module Squared
                                                            end)
           case flag
           when :blame
-            raise Errno::ENOENT, 'no file target' unless (n = op.index { |s| basepath(s).file? })
+            raise Errno::ENOENT, 'no file target' unless (n = op.index { |val| basepath(val).file? })
 
             op.append(basepath(op.remove_at(n)), delim: true)
               .clear
@@ -8170,7 +8174,7 @@ module Squared
             if op.arg?(*VAL_GIT[:rebase][:send])
               op.clear
             elsif op.empty?
-              raise 'no commit target'
+              raise ArgumentError, 'no commit target'
             else
               append_commit(*op.extras)
             end
@@ -8309,7 +8313,7 @@ module Squared
           if size == 0
             puts empty_status("No #{type} were #{action}", 'grep', grep.join(', '))
           elsif stdout?
-            styles = theme.fetch(:banner, []).reject { |s| s.to_s.end_with?('!') }
+            styles = theme.fetch(:banner, []).reject { |val| val.to_s.end_with?('!') }
             styles << :bold if styles.size <= 1
             puts print_footer("#{size} #{size == 1 ? type.sub(/(?:(?<!l)e)?s\z/, '') : type}",
                               sub: opt_style(styles, /^(\d+)(.+)$/))
@@ -8359,7 +8363,7 @@ module Squared
           glob = kwargs.fetch(:include, [])
           pass = kwargs.fetch(:exclude, [])
           status_data(*args).map(&:first).each_with_object({}) do |file, out|
-            next if !glob.empty? && glob.none? { |val| File.fnmatch?(val, file, File::FNM_DOTMATCH) }
+            next unless glob.empty? || glob.any? { |val| File.fnmatch?(val, file, File::FNM_DOTMATCH) }
             next if pass.any? { |val| File.fnmatch?(val, file, File::FNM_DOTMATCH) }
 
             out[file] = algorithm.hexdigest(File.read(basepath(file)))
@@ -8435,12 +8439,10 @@ module Squared
             if !files.empty?
               target << '--' << files.join(' ')
               true
+            elsif expect.is_a?(String)
+              raise expect
             elsif expect
-              raise(if expect.is_a?(String)
-                      expect
-                    else
-                      kwargs[:parent] ? 'pathspec not present' : 'pathspec not within worktree'
-                    end)
+              raise(kwargs[:parent] ? 'pathspec not present' : 'pathspec not within worktree')
             else
               false
             end
@@ -8483,13 +8485,15 @@ module Squared
         end
 
         def foreachref(path, *args, format: nil, chomp: true)
-          path = Array(path).map { |val| "refs/#{val}" }
           format &&= quote_option('format', format)
-          ret = git_spawn('for-each-ref', format, *args, *path, stdout: workspace.windows?)
+          ret = git_spawn('for-each-ref', format, *args.concat(Array(path).map { |val| "refs/#{val}" }),
+                          stdout: workspace.windows?)
           if ret.is_a?(String)
             ret.lines(chomp: chomp)
+          elsif chomp
+            ret.readlines(chomp: chomp)
           else
-            chomp ? ret.readlines(chomp: chomp) : ret
+            ret
           end
         end
 
@@ -8533,11 +8537,10 @@ module Squared
         end
 
         def repotrack(origin, branch, quote: true)
-          unless origin && branch && (i = origin.index('/'))
-            raise_error(ArgumentError, "missing #{origin ? 'branch' : 'remote'} name", hint: origin)
-          end
-          branch = "#{branch}:#{origin[i.succ..-1]}" unless origin.end_with?("/#{branch}")
-          ret = [origin[0..i.pred], branch]
+          n = origin&.index('/')
+          raise_error "missing #{origin ? 'branch' : 'remote'} name", hint: origin unless n && branch
+          branch = "#{branch}:#{origin[n.succ..-1]}" unless origin.end_with?("/#{branch}")
+          ret = [origin[0..n.pred], branch]
           ret.quote! if quote
           ret
         end
@@ -8557,7 +8560,7 @@ module Squared
         end
 
         def matchhead(val)
-          val =~ /^(?:(?:HEAD|@)([~^]\d*)?|H(\d+))$/ ? $2 || $1 || '' : nil
+          $2 || $1 || '' if val =~ /^(?:(?:HEAD|@)([~^]\d*)?|H(\d+))$/
         end
 
         def matchpathspec
@@ -9137,7 +9140,7 @@ module Squared
           'package' => %i[install add update dedupe rebuild reinstall].freeze,
           'outdated' => %i[major minor patch].freeze,
           'bump' => %i[version major minor patch].freeze,
-          'publish' => %i[latest tag].freeze,
+          'publish' => %i[latest tag verify].freeze,
           'tsc' => %i[project build].freeze,
           'add' => nil,
           'run' => nil,
@@ -9190,11 +9193,10 @@ module Squared
                     depend(:add, packages: packages, save: save)
                   end
                 when 'run'
-                  next if scripts.empty?
-
                   format_desc action, nil, "script,opts*|#{indexchar}index+|#,pattern*"
                   task action, [:script] do |_, args|
-                    list = scripts.to_a
+                    next if (list = scripts.to_a).empty?
+
                     if args.script == '#'
                       format_list(list, "run[#{indexchar}N]", 'scripts', grep: args.extras, from: dependfile)
                     else
@@ -9315,21 +9317,34 @@ module Squared
                         end
                       end
                     when 'publish'
-                      format_desc(action, flag, 'otp?,p/ublic|r/estricted?,d/ry-run?', before: ('tag' if flag == :tag))
-                      task flag do |_, args|
-                        args = args.to_a
-                        access = if has_value!(args, 'r', 'restricted')
-                                   'restricted'
-                                 elsif has_value!(args, 'p', 'public')
-                                   'public'
-                                 end
-                        dryrun = has_value!(args, 'd', 'dry-run')
-                        if flag == :latest
-                          otp = args.first
-                        else
-                          tag, otp = param_guard(action, flag, args: args)
+                      if flag == :verify
+                        format_desc action, flag, 'version?,ext*'
+                        task flag, [:version] do |_, args|
+                          ext = args.extras
+                          if (version = args.version)&.match?(/^\.?[a-z]+$/i)
+                            ext.unshift(version)
+                            version = nil
+                          end
+                          publish(flag, version: version, ext: ext)
                         end
-                        publish(flag, otp: otp, tag: tag, access: access, dryrun: dryrun)
+                      else
+                        format_desc(action, flag, 'otp?,p/ublic|r/estricted?,d/ry-run?',
+                                    before: ('tag' if flag == :tag))
+                        task flag do |_, args|
+                          args = args.to_a
+                          access = if has_value!(args, 'r', 'restricted')
+                                     'restricted'
+                                   elsif has_value!(args, 'p', 'public')
+                                     'public'
+                                   end
+                          dryrun = has_value!(args, 'd', 'dry-run')
+                          if flag == :latest
+                            otp = args.first
+                          else
+                            tag, otp = param_guard(action, flag, args: args)
+                          end
+                          publish(flag, otp: otp, tag: tag, access: access, dryrun: dryrun)
+                        end
                       end
                     when 'tsc'
                       break unless @tsfile
@@ -9863,47 +9878,122 @@ module Squared
           package(:update, from: :update)
         end
 
-        def publish(flag = nil, *, sync: invoked_sync?('publish', flag), otp: nil, tag: nil, access: nil, dryrun: nil)
+        def publish(flag = nil, *, sync: invoked_sync?('publish', flag), otp: nil, tag: nil, access: nil, dryrun: nil,
+                    version: nil, ext: [], workspace: false)
           if read_package('private')
+            return if workspace
+
             ws = children.select { |proj| proj.ref?(Node.ref) }
             if ws.empty?
               print_error('nothing to publish', subject: name, hint: 'private')
-            elsif confirm_basic('Publish workspace?', ws.map(&:name).join(', '), 'N')
-              ws.each { |proj| proj.publish(flag, sync: sync, otp: otp, tag: tag, access: access, dryrun: dryrun) }
-            end
-            return
-          end
-          return print_error("version: #{dependname}", subject: name, hint: 'not found') unless version
-
-          cmd = session 'npm', 'publish'
-          cmd << basic_option('otp', otp) if otp ||= option('otp')
-          cmd << basic_option('tag', tag.tr(' ', '-')) if tag ||= option('tag')
-          case access || option('access')
-          when 'p', 'public'
-            cmd << '--access=public'
-          when 'r', 'restricted'
-            cmd << '--access=restricted'
-          end
-          dryrun ||= dryrun?('npm')
-          if dryrun
-            cmd << '--dry-run'
-          else
-            from = :'npm:publish'
-            log.info cmd.to_s
-          end
-          if sync
-            run(sync: sync, from: from, interactive: !dryrun && ['Publish', 'N', npmname])
-          else
-            require 'open3'
-            on :first, from
-            pwd_set(cmd, dryrun: dryrun) do
-              cmd = session_done cmd
-              Open3.popen2e(cmd) do |_, out|
-                write_lines(out, banner: format_banner(cmd),
-                                 sub: npmnotice(opt_style(color(:bright_blue), /^(.+)(Tarball .+)$/, 2)))
+            elsif confirm_basic("#{flag == :verify ? 'Verify' : 'Publish'} workspace?", ws.map(&:name).join(', '), 'N')
+              ws.each do |proj|
+                proj.publish(flag, sync: sync, otp: otp, tag: tag, access: access, dryrun: dryrun, version: version,
+                                   ext: ext, workspace: true)
               end
             end
-            on :last, from
+          elsif version ||= self.version
+            if flag == :verify
+              require 'open-uri'
+              require 'digest'
+              ext = ext.map { |val| val[0] == '.' ? val : ".#{val}" }
+              url = "https://unpkg.com/#{read_package('name')}@#{version}?meta"
+              print_item format_banner(url, command: false)
+              URI.open(url) do |f|
+                doc = JSON.parse(f.read)
+                n = doc['prefix'].size
+                i = 0
+                j = doc['files'].size
+                pad = j.to_s.size
+                m = 0
+                c = 0
+                e = 0
+                doc['files'].each do |item|
+                  path = item['path'][n..-1]
+                  js = File.extname(path)
+                  next unless ext.empty? || ext.any? { |val| val == js }
+
+                  begin
+                    raise unless (file = basepath!(path)) && item['integrity'] =~ /^(sha\d+)-(.+)$/
+
+                    hash = case $1
+                           when 'sha384'
+                             Digest::SHA384
+                           when 'sha512'
+                             Digest::SHA512
+                           else
+                             Digest::SHA256
+                           end
+                           .base64digest(file.read)
+                    status = if hash == $2
+                               m += 1
+                               sub_style 'match', color(:green)
+                             else
+                               c += 1
+                               sub_style 'check', theme[:caution]
+                             end
+                  rescue
+                    status = sub_style 'error', theme[:warn]
+                    e += 1
+                  end
+                  i += 1
+                  puts "#{i.to_s.rjust(pad)}. #{status} #{path}"
+                end
+                if i == 0
+                  puts("No files #{ext.empty? ? 'found' : "matched: #{ext.join(', ')}"}")
+                else
+                  total = ["match #{m}"]
+                  total << "check #{c}" unless c == 0
+                  total << "error #{e}" unless e == 0
+                  unless i == j
+                    s = "in #{j}"
+                    if total.size == 1
+                      total[0] += " #{s}"
+                    else
+                      total << s
+                    end
+                  end
+                  puts print_footer(total.join(' / '), right: true, sub: [
+                    opt_style(color(:green), /^(.*)(match)(.+)$/, 2),
+                    opt_style(theme[:caution], /^(.+)(check)(.+)$/, 2),
+                    opt_style(theme[:warn], /^(.+)(error)(.+)$/, 2)
+                  ])
+                end
+              end
+            else
+              cmd = session 'npm', 'publish'
+              cmd << basic_option('otp', otp) if otp ||= option('otp')
+              cmd << basic_option('tag', tag.tr(' ', '-')) if tag ||= option('tag')
+              case access || option('access')
+              when 'p', 'public'
+                cmd << '--access=public'
+              when 'r', 'restricted'
+                cmd << '--access=restricted'
+              end
+              dryrun ||= dryrun?('npm')
+              if dryrun
+                cmd << '--dry-run'
+              else
+                from = :'npm:publish'
+                log.info cmd.to_s
+              end
+              if sync
+                run(sync: sync, from: from, interactive: !dryrun && ['Publish', 'N', npmname])
+              else
+                require 'open3'
+                on :first, from
+                pwd_set(cmd, dryrun: dryrun) do
+                  cmd = session_done cmd
+                  Open3.popen2e(cmd) do |_, out|
+                    write_lines(out, banner: format_banner(cmd),
+                                     sub: npmnotice(opt_style(color(:bright_blue), /^(.+)(Tarball .+)$/, 2)))
+                  end
+                end
+                on :last, from
+              end
+            end
+          elsif !workspace
+            print_error("version: #{dependname}", subject: name, hint: 'not found')
           end
         end
 
@@ -10712,7 +10802,7 @@ module Squared
                     end
                     next if found.anybits?(1)
 
-                    puts log_message(found == 0 ? Logger::INFO : Logger.WARN,
+                    puts log_message(found == 0 ? Logger::INFO : Logger::WARN,
                                      "no scripts #{found == 0 ? 'found' : 'executed'}",
                                      subject: name, hint: pyprojectfile)
                   end
@@ -11098,7 +11188,7 @@ module Squared
             op.clear
           when :user, :upgrade
             op.concat(packages)
-            raise_error 'no packages listed', hint: flag if op.empty?
+            raise_error ArgumentError, 'no packages listed', hint: flag if op.empty?
             op << "--#{flag}"
             op.append
             python_session('-m pip', *op.to_a.drop(1)) if workspace.windows?
@@ -11255,7 +11345,7 @@ module Squared
               when :install, :uninstall
                 op << '.' if installable? && !op.arg?('r', 'requirement')
               else
-                raise_error 'no packages listed', hint: flag
+                raise_error ArgumentError, 'no packages listed', hint: flag
               end
             elsif flag == :install
               op.append_any
@@ -12353,8 +12443,8 @@ module Squared
                           end
                           pwd_set do
                             out = []
-                            tool = args.name || (args.local && !SEM_VER.match?(args.local) ? args.local : 'ruby')
-                            trim = ->(s) { s[/^\D+\d+\.\d+(?:\.\S+)?/, 0].sub(/^([a-z]+)-/i, '\1 ') }
+                            tool = args.name || (s && !SEM_VER.match?(s) ? s : 'ruby')
+                            trim = ->(val) { val[/^\D+\d+\.\d+(?:\.\S+)?/, 0].sub(/^([a-z]+)-/i, '\1 ') }
                             vm, bin = vmname(bin: true)
                             out << trim.call(case vm
                                              when 'rvm'
@@ -12440,10 +12530,16 @@ module Squared
                                                    .lines
                                                    .map { |line| line.sub(/#.*$/, '').strip }
                                                    .reject(&:empty?)
+                                                   .yield_self do |data|
+                                                     target = data.find { |line| line.include?(tool) }
+                                                     target ? [target] : data
+                                                   end
                                                    .join(', ')
                                              end
                                       append.call(file, hint)
-                                      throw :found if hint&.include?(out.first[/^(?:j|truffle)?ruby ([\d.]+)/, 1])
+                                      if hint&.include?(out.first[/^(?:(?:j|truffle)?ruby|#{tool}) ([\d.]+)/, 1])
+                                        throw :found
+                                      end
                                     rescue
                                       nil
                                     end
@@ -13390,6 +13486,9 @@ module Squared
 
         def serve(root, *, bind: nil, port: 3000, **kwargs)
           require 'webrick'
+        rescue LoadError => e
+          print_error(e, pass: true)
+        else
           config = kwargs.merge({ DocumentRoot: root })
           config[:BindAddress] = bind if bind
           config[:Port] = port if port
