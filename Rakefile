@@ -15294,8 +15294,8 @@ Common::ARG.update({ PIPE: 'PIPE_STD', OUT: 'PIPE_OUT', FAIL: 'PIPE_FAIL', HOME:
 Workspace::Application
   .new(main: 'squared')
   .repo(
-    'https://github.com/anpham6/squared-repo', Project::Node.prod? ? 'prod' : 'nightly', doc: !ENV['DOCS'].nil?,
-    script: %w[build:dev prod], dev: /^(build:)?dev(:|$)/, ref: %i[base node python]
+    'https://github.com/anpham6/squared-repo', Project::Node.prod? ? 'prod' : 'nightly',
+    doc: !ENV['DOCS'].nil?, script: %w[build:dev prod], dev: /^(build:)?dev(:|$)/, ref: %i[base node python]
   )
   .with(:node, :python) { clean ['build/'] }
   .with(:node, lint: [nil, Project::Node.prod? ? 'lint' : 'lint:fix'], pass: 'bump') do
@@ -15313,15 +15313,8 @@ Workspace::Application
 
       chain('all', :refresh, after: 'emc')
     end
-    add('pi-r2', 'pir2', graph: %w[pir emc], copy: { from: 'publish', scope: '@pi-r2' }) do
-      add('publish/*', group: 'pir2', pass: %w[install update package bump], exclude: :base)
-      revbuild(include: 'src/')
-      inject(Viewer, dump: 'json')
-
-      chain('all', :refresh, with: 'squared')
-    end
     add('squared-express', 'express', graph: 'emc', copy: false) do
-      add('publish', 'express-prod', group: 'express', only: %w[bump publish pack], exclude: :base)
+      add('publish', 'express-prod', only: %w[bump publish pack], exclude: :base)
       revbuild(include: 'src/')
       inject(Viewer, dump: 'json')
 
@@ -15351,7 +15344,7 @@ Workspace::Application
     pass('publish') { parent.nil? }
     banner(:path, styles: %i[yellow bold], border: 'blue')
     banner(:path, styles: %i[magenta bold], border: 'blue', group: 'ruby')
-    banner([:name, ': ', :version], styles: %i[magenta bold], border: 'blue', group: %w[emc pir pir2 express squared sqd])
+    banner([:name, ': ', :version], styles: %i[magenta bold], border: 'blue', group: %w[emc pir pir2 squared sqd])
   end
   .with(:python, venv: '.venv', serve: 'build/html', script: false, editable: false) do
     doc(windows? ? '.\make.bat html' : 'make html')
@@ -15362,8 +15355,10 @@ Workspace::Application
     banner(:path, styles: %i[blue bold], border: 'blue')
   end
   .with(:docker, run: (false unless ENV['SSH_AUTH_SOCK'] && ENV['GITHUB_TOKEN']), hide: %i[windows? docker?]) do
-    add('squared', 'docker', file: ENV['DOCKER_FILE'] ? "#{ENV['DOCKER_FILE']}.Dockerfile" : 'Dockerfile', args: '--ssh=default', secrets: 'id=github,env=GITHUB_TOKEN', pass: 'unpack')
-    add('squared', 'docker-test', file: 'docker-bake.hcl', args: '--allow=ssh --allow=fs.read=/tmp --allow=fs.read=/run/user', clean: false, only: %w[build bake])
+    add('squared', 'docker', file: ENV['DOCKER_FILE'] ? "#{ENV['DOCKER_FILE']}.Dockerfile" : 'Dockerfile',
+                             args: '--ssh=default', secrets: 'id=github,env=GITHUB_TOKEN', pass: 'unpack')
+    add('squared', 'docker-test', file: 'docker-bake.hcl', clean: false, only: %w[build bake],
+                                  args: '--allow=ssh --allow=fs.read=/tmp --allow=fs.read=/run/user')
     add('squared', 'docker-run', file: 'compose.yaml', clean: false, only: %w[build compose])
     banner(:path, styles: %i[cyan bold], border: 'blue')
   end
@@ -15372,7 +15367,7 @@ Workspace::Application
     status = lambda do |val|
       ws = Workspace.expect(scope).workspace
       ws.task_desc(*scope.split(':'), val)
-    rescue StandardError
+    rescue
       desc 'inactive'
     end
 
@@ -15383,8 +15378,8 @@ Workspace::Application
 
       args = args.to_a
       find = ->(*ext, first) { args.find { |val| ext.include?(val.downcase) } || (first && ext.first) }
-      dist = exp.path + 'dist'
-      src = dist + 'serve.js'
+      dist = exp.basepath('dist')
+      src = dist.join('serve.js')
       dest = ws.homepath("serve.#{find.call('cjs', 'js', true)}")
       exp.build(sync: true) if find.call('build', false) || !src.exist?
       cp(src, dest, verbose: ws.verbose)
