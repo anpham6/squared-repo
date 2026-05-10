@@ -15295,18 +15295,18 @@ Workspace::Application
   .new(main: 'squared')
   .repo(
     'https://github.com/anpham6/squared-repo', Project::Node.prod? ? 'prod' : 'nightly',
-    doc: !ENV['DOCS'].nil?, script: %w[build:dev prod], dev: /^(build:)?dev(:|$)/, ref: %i[base node python]
+    doc: !ENV['DOCS'].to_s.empty?, script: %w[build:dev prod], dev: /^(build:)?dev(:|$)/, ref: %i[base node python]
   )
   .with(:node, :python) { clean ['build/'] }
   .with(:node, lint: [nil, Project::Node.prod? ? 'lint' : 'lint:fix'], pass: 'bump') do
-    add('e-mc', 'emc', copy: { from: 'publish', scope: '@e-mc', also: %i[pir pir2 express] }) do
+    add('e-mc', 'emc', copy: { from: 'publish', scope: '@e-mc', also: %i[pir express] }) do
       add('publish/*', group: 'emc', pass: %w[install update package bump], exclude: :base)
       revbuild(include: 'src/')
       inject(Viewer, dump: 'json')
 
       chain('all', :refresh, step: 1)
     end
-    add('pi-r', 'pir', graph: 'emc', copy: { from: 'publish', scope: '@pi-r', also: :pir2 }) do
+    add('pi-r', 'pir', graph: 'emc', copy: { from: 'publish', scope: '@pi-r' }) do
       add('publish/*', group: 'pir', pass: %w[install update package bump], exclude: :base)
       revbuild(include: 'src/')
       inject(Viewer, dump: 'json')
@@ -15314,7 +15314,7 @@ Workspace::Application
       chain('all', :refresh, after: 'emc')
     end
     add('squared-express', 'express', graph: 'emc', copy: false) do
-      add('publish', 'express-prod', only: %w[bump publish pack], exclude: :base)
+      add('publish', 'express-prod', group: 'express', only: %w[bump publish pack], exclude: :base)
       revbuild(include: 'src/')
       inject(Viewer, dump: 'json')
 
@@ -15344,7 +15344,7 @@ Workspace::Application
     pass('publish') { parent.nil? }
     banner(:path, styles: %i[yellow bold], border: 'blue')
     banner(:path, styles: %i[magenta bold], border: 'blue', group: 'ruby')
-    banner([:name, ': ', :version], styles: %i[magenta bold], border: 'blue', group: %w[emc pir pir2 squared sqd])
+    banner([:name, ': ', :version], styles: %i[magenta bold], border: 'blue', group: %w[emc pir express squared sqd])
   end
   .with(:python, venv: '.venv', serve: 'build/html', script: false, editable: false) do
     doc(windows? ? '.\make.bat html' : 'make html')
@@ -15359,7 +15359,7 @@ Workspace::Application
                              args: '--ssh=default', secrets: 'id=github,env=GITHUB_TOKEN', pass: 'unpack')
     add('squared', 'docker-test', file: 'docker-bake.hcl', clean: false, only: %w[build bake],
                                   args: '--allow=ssh --allow=fs.read=/tmp --allow=fs.read=/run/user')
-    add('squared', 'docker-run', file: 'compose.yaml', clean: false, only: %w[build compose])
+    add('squared', 'docker-run', file: 'compose.yaml', run: false, clean: false, only: %w[compose])
     banner(:path, styles: %i[cyan bold], border: 'blue')
   end
   .compose('express') do |ns|
