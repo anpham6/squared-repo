@@ -11,7 +11,7 @@ require 'time'
 require 'timeout'
 
 module Squared
-  VERSION = '0.7.6'
+  VERSION = '0.7.8'
 
   module Common
     PATH = {}
@@ -631,15 +631,22 @@ module Squared
       def shell_quote(val, option: true, force: true, double: false, preserve: true, pass: false, override: false)
         val = val.to_s
         return val if (!force && !val.include?(' ')) || val.empty?
+        return val if option && val.match?(/\A(?:-[^=\s-](?:=|\s+)?|(--)?[^=\s-][^=\s]*(?(1)(?:=|\s+)|=))(["']).+\2\z/m)
 
-        if option
-          pat = /\A(?:-[^=\s-](?:=|\s+)?|(--)?[^=\s-][^=\s]*(?(1)(?:=|\s+)|=))(["']).+\2\z/m
-          return val if val.match?(pat)
-        end
         if val =~ QUOTE_VALUE
-          return val if pass || ($1 == '"' && Rake::Win32.windows? && val.match?(/(?:[#{File::SEPARATOR} ]|\\")/o))
-
-          base = $2 unless preserve
+          if pass == '"' || pass == "'"
+            return val if pass == $1
+          elsif pass || ($1 == '"' && Rake::Win32.windows? && val.match?(/(?:[#{File::SEPARATOR} ]|\\")/o))
+            return val
+          end
+          case preserve
+          when false
+            base = $2
+          when '"'
+            base = $2 if $1 == "'"
+          when "'"
+            base = $2 if $1 == '"'
+          end
         end
         q = -> { (base || val).gsub("'\\\\''", "'") }
         if double || Rake::Win32.windows? || (ARG[:QUOTE] == '"' && !override)
@@ -1813,11 +1820,7 @@ module Squared
         if group && @banner.group.key?(group = group.to_sym)
           @banner.group[group]
         else
-          ref.reverse_each do |val|
-            next unless @banner.ref.key?(val)
-
-            return @banner.ref[val]
-          end
+          ref.reverse_each { |val| return @banner.ref[val] if @banner.ref.key?(val) }
           @banner.ref[:_] if @banner.ref.key?(:_)
         end
       end
@@ -2516,7 +2519,7 @@ module Squared
             include Prompt
 
             def append(target, *args, delim: false, escape: false, quote: true, strip: nil, force: true, double: false,
-                       filter: nil, pass: nil, **)
+                       filter: nil, pass: nil, preserve: true, **)
               return if (ret = args.flatten(1)).empty?
 
               target << '--' if delim && !target.include?('--')
@@ -2547,7 +2550,7 @@ module Squared
                 if !(pa = val.is_a?(Pathname)) && escape
                   shell_escape(val, quote: quote, double: double)
                 elsif quote || pa
-                  shell_quote(val, force: force, double: double)
+                  shell_quote(val, force: force, double: double, preserve: preserve)
                 else
                   val
                 end
@@ -2890,10 +2893,10 @@ module Squared
             self
           end
 
-          def append(*args, clear: false, **kwargs, &blk)
+          def append(*args, clear: false, preserve: '"', **kwargs, &blk)
             args = clear ? extras.dup.tap { extras.clear } : extras if args.empty?
             pass = kwargs[:pass] ||= []
-            OptionPartition.append(target, *args, **kwargs, &blk)
+            OptionPartition.append(target, *args, preserve: preserve, **kwargs, &blk)
             errors.concat(pass)
             self
           end
@@ -3520,7 +3523,7 @@ module Squared
         VAR_SET = %i[parent global script index envname desc dependfile dependname dependindex theme archive env graph
                      dev prod timeout pass only exclude serve asdf].freeze
         BLK_SET = %i[run depend doc lint test copy clean].freeze
-        SEM_VER = /\b(\d+)(?:(\.)(\d+))?(?:(\.)(\d+))?[-.]?(\S+)?\b/.freeze
+        SEM_VER = /\b(\d+)(?:(\.)(\d+))?(?:(\.)(\d+))?(?:([-.])?(\S+))?\b/.freeze
         URI_SCHEME = %r{\A([a-z][a-z\d+-.]*)://[^@:\[\]\\^<>|\s]}i.freeze
         TASK_METADATA = Rake::TaskManager.record_task_metadata
         private_constant :OPTIONS, :VAR_SET, :BLK_SET, :SEM_VER, :URI_SCHEME, :TASK_METADATA
@@ -4846,7 +4849,7 @@ module Squared
           else
             if series?(obj)
               obj.each(&:call)
-            elsif obj.is_a?(Array) && obj.any? { |val| val.nil? || !val.is_a?(String) }
+            elsif obj.is_a?(Array) && obj.any? { |val| !val.is_a?(String) }
               build(*obj, **kwargs)
             elsif obj
               run_s(*Array(obj), **kwargs)
@@ -5071,7 +5074,9 @@ module Squared
                             command = :"#{prefix}_#{$1}"
                             cache[1][command] || @timeout[command]
                           end || cache[1][prefix.to_sym] || @timeout[prefix.to_sym]
-          main ? @session = ret : ret
+          return ret unless main
+
+          @session = ret
         end
 
         def session_timeout(cmd)
@@ -5133,7 +5138,7 @@ module Squared
           return cmd.to_s unless cmd.respond_to?(:done)
 
           raise_error 'no command added', hint: cmd.first unless cmd.size > 1
-          @session = nil if cmd == @session
+          @session = nil if cmd.equal?(@session)
           cmd.done
         end
 
@@ -5150,12 +5155,14 @@ module Squared
           args.each do |key|
             next unless (ret = env(env_key(prefix.to_s.stripext, key), **kwargs)) && (!pat || ret.match?(pat))
 
-            if path
-              target << quote_option(key, basepath(ret))
-            elsif quote
-              target << quote_option(key, ret)
-            elsif escape
-              target << shell_option(key, ret)
+            if target
+              if path
+                target << quote_option(key, basepath(ret))
+              elsif quote
+                target << quote_option(key, ret)
+              elsif escape
+                target << shell_option(key, ret)
+              end
             end
             return block_given? ? yield(ret) : ret
           end
@@ -5307,7 +5314,7 @@ module Squared
                   cmd = cmd.gsub(/(?:#{s = Regexp.escape(File.join(path, ''))}?(?=["'])|#{s})/, '')
                            .gsub(/(?: -[^ ])? (?:""|'')/, '')
                 end
-                cmd.gsub!(/(?<= )(["'])([\w.-]+)\1(?= |\z)/, '\2') unless quote
+                cmd = cmd.gsub(/(?<= )(["'])([\w.-]+)\1(?= |\z)/, '\2') unless quote
               end
               out << cmd.subhint(hint)
             end
@@ -5324,7 +5331,7 @@ module Squared
                     __send__ meth
                   end
                 end
-                val = val.compact.join(s)
+                val = val.reject { |item| !item || item == true }.join(s)
                 next unless found && !val.empty?
               elsif (val = __send__(val)).nil?
                 next
@@ -5728,9 +5735,9 @@ module Squared
 
           a, b = [a.first, b.first].map do |c|
             d = begin
-              Integer(c[5]).to_s
+              Integer(c[6]).to_s
             rescue
-              c[5] ? '-1' : '0'
+              c[6] ? '-1' : '0'
             end
             [c[0], c[2], c[4] || '0', d]
           end
@@ -5773,7 +5780,7 @@ module Squared
         end
 
         def semmajor?(cur, want)
-          (cur[0] == '0' && want[0] == '0' ? cur[2] != want[2] : cur[0] != want[0]) && !want[5]
+          (cur[0] == '0' && want[0] == '0' ? cur[2] != want[2] : cur[0] != want[0]) && !want[6]
         end
 
         def semgte?(val, other = nil)
@@ -5901,11 +5908,7 @@ module Squared
             yield
           end
         rescue Timeout::Error => e
-          if cmd
-            print_error(Logger::ERROR, cmd, subject: name, hint: e)
-          else
-            print_error(Logger::ERROR, e, subject: name)
-          end
+          print_error(Logger::ERROR, e, subject: name, hint: cmd)
           exit 1 unless exception?(Logger::DEBUG, Logger::INFO)
         rescue => e
           on_error(e, from, **kwargs)
@@ -6168,7 +6171,7 @@ module Squared
                 when true, false
                   run
                 else
-                  $?.success?
+                  $?&.success?
                 end
           if cond.none? { |val| val == false }
             if block_given?
@@ -6193,7 +6196,7 @@ module Squared
         end
 
         def stdout?
-          !!verbose && !stdin?
+          !silent? && !stdin?
         end
 
         def verbose?
@@ -6577,7 +6580,7 @@ module Squared
         end
 
         subtasks({
-          'branch' => %i[create track delete move copy list current].freeze,
+          'branch' => %i[create track delete move copy list all current].freeze,
           'checkout' => %i[commit branch track detach path].freeze,
           'commit' => %i[add all amend amend-orig fixup].freeze,
           'diff' => %i[head branch files view between contain].freeze,
@@ -6975,12 +6978,7 @@ module Squared
                       task flag do |_, args|
                         branch flag, args.to_a
                       end
-                    when :current
-                      format_desc action, flag
-                      task flag do
-                        branch flag
-                      end
-                    else
+                    when :move, :copy
                       format_desc action, flag, 'branch,oldbranch?'
                       task flag, [:branch, :oldbranch] do |_, args|
                         if (branch = args.branch)
@@ -6990,6 +6988,11 @@ module Squared
                                                           values: [['Enter new branch name', true]])
                         end
                         branch(flag, refs: [oldbranch, branch])
+                      end
+                    else
+                      format_desc action, flag
+                      task flag do
+                        branch flag
                       end
                     end
                   when 'switch'
@@ -7414,7 +7417,7 @@ module Squared
           option('no-tags') { opts[:'no-tags'] = true }
           opts.delete(:'recurse-submodules') || opts.delete(:'no-recurse-submodules') if append_submodules(from: :clone)
           append_hash opts
-          cmd << '--quiet' if option('quiet') || !verbose
+          cmd << '--quiet' if quiet? || option('quiet')
           append_value(data[0], path, delim: true)
           source(sync: sync, banner: sync && !quiet?, multiple: !sync || quiet?)
         end
@@ -7725,6 +7728,7 @@ module Squared
           append_pathspec op.extras
           source(exception: false)
         end
+        alias log_ log!
 
         def diff(flag, opts = [], refs: [], branch: nil, range: [], index: [], from: :diff)
           cmd, opts = git_session(from, opts: opts)
@@ -7855,7 +7859,7 @@ module Squared
           elsif flag == :'amend-orig' || option('edit', equals: '0')
             co << '--no-edit'
           end
-          pu << '--force-with-lease' if amend
+          pu << (option('f', 'force') ? '--force' : '--force-with-lease') if amend
           pu.merge(repotrack(origin, branch))
           adding = git_spawn 'diff --name-only --no-color'
           source op
@@ -7936,7 +7940,7 @@ module Squared
             end
           when :delete
             remote&.each { |val| source git_output('push --delete', *val.split('/', 2).quote!) }
-            force, list = refs.partition { |val| val.start_with?('~', '^') }
+            force, list = refs.partition { |val| val.start_with?(/[~^]/) }
             force.each do |val|
               r = '-r' if val.delete!('~')
               source git_output('branch', val.delete!('^') ? '-D' : '-d', r, shell_quote(val))
@@ -8246,6 +8250,10 @@ module Squared
 
         def source(cmd = @session, exception: true, io: false, sync: true, stdout: false, stderr: false, banner: true,
                    multiple: false, hint: nil, from: nil, timeout: nil, send: :system, **kwargs)
+          unless cmd
+            print_error('no git session started', subject: project, hint: from, pass: true)
+            return
+          end
           cmd = cmd.target if cmd.is_a?(OptionPartition)
           if io && banner == false
             from = nil
@@ -8404,7 +8412,7 @@ module Squared
           end
           op << '--verbose' if (flag || from == :fetch) && stdout? && !op.arg?('quiet')
           if remote
-            op.append(remote, delim: true)
+            op.append(remote)
             if (val = option('refspec', target: target, strict: true))
               op.append(split_escape(val))
             else
@@ -8527,9 +8535,9 @@ module Squared
         end
 
         def quiet?(*, target: @session, **)
-          return false unless target
+          return silent? unless target
 
-          target.include?('--quiet') || (target.include?('-q') && target.first.stripext == 'git')
+          silent? || target.include?('--quiet') || (target.include?('-q') && target.first.stripext == 'git')
         end
 
         def gitpath(*args)
@@ -8837,7 +8845,7 @@ module Squared
                   opts << "--#{val}"
                 when /^(fetch-)?submodules$/
                   opts << '--fetch-submodules' if repo_submodules?(true, **envargs)
-                when /^(fail-)?fail$/
+                when /^(fail-)?fast$/
                   opts << '--fail-fast'
                 when /^no-(manifest-)?update$/
                   opts << '--no-manifest-update'
@@ -8845,7 +8853,9 @@ module Squared
                   opts << '--auto-gc'
                 end
               end
-              opts << "-j#{ENV.fetch('REPO_JOBS', Rake::CpuCounter.count)}" unless opts.any?(/^--?j(obs)?$/)
+              if (jobs = ENV['REPO_JOBS']) || opts.none?(/^--?j(obs)?$/)
+                opts << "-j#{jobs || Rake::CpuCounter.count}"
+              end
               opts << '--fetch-submodules' if repo_submodules?(**envargs)
               begin
                 repo_run('sync', opts, exception: opts.include?('--fail-fast'), options: stage != 'init')
@@ -8990,15 +9000,18 @@ module Squared
       class Node < Git
         OPT_NPM = {
           common: %w[dry-run=!? force=!? loglevel=b include-workspace-root=!? workspaces=!? w|workspace=v].freeze,
+          common_scripts: %w[dangerously-allow-all-scripts=!? strict-allow-scripts=!? allow-scripts=q].freeze,
           install: %w[package-lock-only=!? prefer-dedupe=!? E|save-exact=!? before=q cpu=b libc=b os=b].freeze,
           install_a: %w[audit=! bin-links=! foreground-scripts=!? fund=! ignore-scripts=!? install-links=!?
                         package-lock=! strict-peer-deps=!? include=b install-strategy=b omit=b].freeze,
           install_b: %w[no-save B|save-bundle D|save-dev O|save-optional save-peer P|save-prod g|global=!?
                         S|save=!?].freeze,
+          install_c: %w[allow-directory=b? allow-file=b? allow-git=b? allow-remote=b?].freeze,
           run: %w[foreground-scripts=!? if-present=!? ignore-scripts=!? script-shell=p].freeze,
           exec: %w[c|call=q package=b].freeze,
           pack: %w[ignore-scripts=!? json=!? pack-destination=p].freeze,
           rebuild: %w[bin-links=! foreground-scripts=!? global=!? ignore-scripts=!? install-links=!?].freeze,
+          'approve-scripts': %w[a|all allow-scripts-pending allow-scripts-pin=!? no-allow-scripts-pin json].freeze,
           no: {
             install: %w[audit bin-links fund package-lock].freeze
           }.freeze
@@ -9010,15 +9023,16 @@ module Squared
           common_filter: %w[fail-if-no-match changed-files-ignore-pattern=q filter=q filter-prod=q
                             test-pattern=q].freeze,
           install: %w[fix-lockfile force ignore-pnpmfile ignore-workspace lockfile-only merge-git-branch-lockfiles
-                      optimistic-repeat-install no-hoist no-lockfile no-optional prefer-frozen-lockfile resolution-only
-                      shamefully-hoist side-effects-cache side-effects-cache-readonly s|silent strict-peer-dependencies
-                      use-running-store-server use-store-server child-concurrency=i hoist-pattern=q lockfile-dir=p
-                      modules-dir=p network-concurrency=i package-import-method=b public-hoist-pattern=q
-                      reporter=b].freeze,
+                      optimistic-repeat-install no-hoist no-lockfile no-optional no-runtime prefer-frozen-lockfile
+                      resolution-only shamefully-hoist side-effects-cache side-effects-cache-readonly s|silent
+                      strict-peer-dependencies trust-lockfile use-running-store-server use-store-server
+                      child-concurrency=i hoist-pattern=q lockfile-dir=p modules-dir=p network-concurrency=i
+                      package-import-method=b public-hoist-pattern=q reporter=b trust-policy=b trust-policy-exclude=q
+                      trust-policy-ignore-after=i].freeze,
           install_a: %w[dangerously-allow-all-builds global-dir ignore-scripts offline prefer-offline store-dir=p
                         virtual-store-dir=p].freeze,
           install_b: %w[D|dev no-optional P|prod].freeze,
-          add: %w[allow-build config g|global save-catalog D|save-dev O|save-optional save-peer P|save-prod
+          add: %w[allow-build config g|global registry=q save-catalog D|save-dev O|save-optional save-peer P|save-prod
                   save-catalog-name=b].freeze,
           update: %w[g|global i|interactive L|latest depth=i].freeze,
           dedupe: %w[check].freeze,
@@ -9137,7 +9151,7 @@ module Squared
         end
 
         subtasks({
-          'package' => %i[install add update dedupe rebuild reinstall].freeze,
+          'package' => %i[install add update dedupe approve deny rebuild reinstall].freeze,
           'outdated' => %i[major minor patch].freeze,
           'bump' => %i[version major minor patch].freeze,
           'publish' => %i[latest tag verify].freeze,
@@ -9182,7 +9196,7 @@ module Squared
                 when 'add'
                   format_desc action, nil, 'save?=[=-]prod|dev|optional|peer|bundle,(-)name+'
                   task action, [:save] do |_, args|
-                    packages = if args.save =~ /\A([=-]*)?(prod|dev|optional|peer|bundle)\z/
+                    packages = if args.save =~ /^([=-]*)(prod|dev|optional|peer|bundle)$/
                                  save = [$2, $1.include?('='), $1.include?('-')]
                                  args.extras
                                else
@@ -9205,7 +9219,7 @@ module Squared
                         if (n, extra = indexitem(val))
                           if (item = list[n.pred])
                             run compose([item.first, extra].compact.join(' '), script: true)
-                          elsif exception
+                          elsif exception?
                             indexerror n, list
                           else
                             log.warn "run script #{n} of #{list.size}".subhint('out of range')
@@ -9241,7 +9255,7 @@ module Squared
                               list = pnpmopts :exec, :common_filter
                               session 'pnpm', pre.call('r'), pre.call('c'), 'exec'
                             else
-                              list = npmopts :exec
+                              list = npmopts :exec, :common_scripts
                               session 'npm', 'exec'
                             end
                       op = OptionPartition.new(args, list, cmd, project: self, strict: strict?)
@@ -9528,7 +9542,6 @@ module Squared
             end
             save, exact, omit = save if save.is_a?(Array)
             ws = env('NODE_WORKSPACES', equals: '0')
-            ci = option('ci')
             om = lambda do |cmd|
               if omit
                 save = case save
@@ -9566,7 +9579,7 @@ module Squared
                 end
                 if nolockfile?('yarn')
                   cmd << '--no-lockfile'
-                elsif ci
+                elsif option('ci')
                   if yarn == 1
                     cmd << '--frozen-lockfile'
                   elsif !flag
@@ -9602,13 +9615,27 @@ module Squared
                        '--force'
                      elsif nolockfile?('pnpm')
                        '--no-lockfile'
-                     elsif ci
+                     elsif option('ci')
                        '--frozen-lockfile'
                      end
               cmd << '--ignore-scripts' if option('ignore-scripts')
               cmd << '--dangerously-allow-all-builds' if option('approve-builds')
             else
-              cmd = session('npm', ci ? 'ci' : 'install')
+              cmd = session 'npm'
+              cmd << (ci = option('ci') ? 'ci' : 'install')
+              option('approve-scripts') do |val|
+                cmd = npm_output 'approve-scripts'
+                cmd << case val
+                       when '1'
+                         '--all --no-allow-scripts-pin'
+                       when 'true', 'all'
+                         '--all'
+                       else
+                         val.split(/\s+/).quote!.join(' ')
+                       end
+                print_run cmd, silent?
+                run(cmd, banner: false)
+              end
               cmd << '--workspaces=false' if ws
               cmd << '--force' if option('force')
               append_nocolor
@@ -9722,7 +9749,7 @@ module Squared
                         when :patch
                           a == c && b == d && f[4] != w[4]
                         end
-              if upgrade && !w[5]
+              if upgrade && !w[6]
                 next if file == want
 
                 found << [key, file, want, if a != c
@@ -10000,7 +10027,8 @@ module Squared
         def package(flag, opts = [], packages: [], from: nil)
           workspace.rev_clear(name)
           yarn = dependtype(:yarn)
-          if yarn > 0 && !(yarn == 1 && ((flag == :update && !packages.empty?) || flag == :rebuild))
+          if yarn > 0 && !(yarn == 1 && ((flag == :update && !packages.empty?) || %i[approve deny
+                                                                                     rebuild].include?(flag)))
             cmd = session 'yarn', case flag
                                   when :update
                                     if yarn == 1
@@ -10036,66 +10064,77 @@ module Squared
               op << '--ignore-engines' if option('ignore-engines')
             end
           else
+            flags = []
             args = if pnpm?
-                     case flag
-                     when :install, :update
-                       opts << 'no-lockfile' if nolockfile?('pnpm')
-                       spec = 0 if flag == :update
-                     when :add
-                       spec = 1
-                     when :reinstall
-                       opts << 'force'
-                       flag = :install
-                     end
-                     flags = [flag]
-                     flags << :install_a unless flag == :rebuild
-                     unless flag == :dedupe
-                       flags << :common_filter
-                       unless flag == :add
-                         flags << :install_b
-                         flags << :common_cpu unless flag == :update
+                     if flag == :approve || flag == :deny
+                       opts.map! { |val| val.start_with?('!') ? val : "!#{val}" } if flag == :deny
+                       flag = :'approve-builds'
+                       spec = true
+                     else
+                       case flag
+                       when :install, :update
+                         opts << 'no-lockfile' if nolockfile?('pnpm')
+                         spec = 0 if flag == :update
+                       when :add
+                         spec = 1
+                       when :reinstall
+                         opts << 'force'
+                         flag = :install
                        end
+                       flags << :install_a unless flag == :rebuild
+                       unless flag == :dedupe
+                         flags << :common_filter
+                         unless flag == :add
+                           flags << :install_b
+                           flags << :common_cpu unless flag == :update
+                         end
+                       end
+                       no = OPT_PNPM[:no][flag]
                      end
-                     no = OPT_PNPM[:no][flag]
                      [
                        opts,
-                       pnpmopts(*flags),
+                       pnpmopts(flag, *flags),
                        session('pnpm', flag)
                      ]
                    else
-                     case flag
-                     when :install, :update
-                       opts.unshift('package-lock=false', 'save=false') if nolockfile?('npm')
-                       spec = flag == :install ? 0 : 2
-                     when :add
-                       spec = 1
-                       flag = :install
-                     when :reinstall
-                       remove_modules 'npm' if opts.delete('force')
-                       opts.unshift('package-lock=false') if lockfile(true)
-                       flag = :install
-                     end
-                     flags = [flag]
-                     unless flag == :rebuild
-                       flags << :install_a
-                       unless flag == :dedupe
-                         %w[save ignore-scripts strict-peer-deps].each do |key|
-                           option(key, prefix: 'npm', ignore: false) do |val|
-                             opts << basic_option(key, case val
-                                                       when '0', 'false'
-                                                         false
-                                                       else
-                                                         true
-                                                       end)
-                           end
-                         end
-                         flags << :install_b
+                     if flag == :approve || flag == :deny
+                       flag = :"#{flag}-scripts"
+                       spec = true
+                     else
+                       case flag
+                       when :install, :update
+                         opts.unshift('package-lock=false', 'save=false') if nolockfile?('npm')
+                         spec = flag == :install ? 0 : 2
+                       when :add
+                         spec = 1
+                         flag = :install
+                       when :reinstall
+                         remove_modules 'npm' if opts.delete('force')
+                         opts.unshift('package-lock=false') if lockfile(true)
+                         flag = :install
                        end
-                       no = OPT_NPM[:no][:install]
+                       unless flag == :rebuild
+                         flags << :install_a
+                         unless flag == :dedupe
+                           %w[save ignore-scripts strict-peer-deps].each do |key|
+                             option(key, prefix: 'npm', ignore: false) do |val|
+                               opts << basic_option(key, case val
+                                                         when '0', 'false'
+                                                           false
+                                                         else
+                                                           true
+                                                         end)
+                             end
+                           end
+                           flags << :install_b << :common_scripts
+                         end
+                         flags << :install_c unless flag == :update
+                         no = OPT_NPM[:no][:install]
+                       end
                      end
                      [
                        opts,
-                       npmopts(*flags),
+                       npmopts(flag, *flags),
                        session('npm', flag)
                      ]
                    end
@@ -10123,6 +10162,8 @@ module Squared
 
             op.append(quote: true)
               .clear(errors: true)
+          when true
+            op.append(quote: true)
           else
             op.clear
           end
@@ -10363,6 +10404,10 @@ module Squared
         end
 
         private
+
+        def npm_output(*cmd, **kwargs)
+          session_output('npm', *cmd, **kwargs)
+        end
 
         def read_package(key = 'packageManager', update: false)
           unless !update && @pm.key?(key)
@@ -10775,7 +10820,7 @@ module Squared
                               end
                               found |= 1
                               run(script, from: :run)
-                            elsif exception
+                            elsif exception?
                               indexerror n, list
                             else
                               found |= 2
@@ -10790,7 +10835,7 @@ module Squared
                               found |= 1
                               run(pdm_session('run', val), from: :run)
                             else
-                              raise "script: #{val}" if exception
+                              raise "script: #{val}" if exception?
 
                               found |= 2
                               log.warn "run script \"#{val}\"".subhint('not indexed')
@@ -11259,6 +11304,7 @@ module Squared
             run(from: from)
           end
         end
+        alias build_ build!
 
         def publish(flag, opts = [], test: false)
           list = case flag
@@ -11849,7 +11895,7 @@ module Squared
         GEMNAME = /\A[A-Za-z\d][A-Za-z\d_.-]*\z/.freeze
         DIR_RUBY = (GEMFILE + Rake::Application::DEFAULT_RAKEFILES + ['README.rdoc']).freeze
         OPT_RUBY = {
-          ruby: %w[0=im? a c C=pm e=q E=bm F=qm i=bm? I=pm l n p r=bm s S w W=bm? x=pm? d|debug jit rjit verbose
+          ruby: %w[a c l n p s S w 0=im? C=pm e=q E=bm F=qm i=bm? I=pm r=bm W=bm? x=pm? d|debug jit rjit verbose
                    y|yydebug backtrace-limit=i crash-report=q disable=q dump=q enable=q encoding=b external-encoding=b
                    internal-encoding=b parser=b].freeze,
           rake: %w[A|all B|build-all comments n|dry-run m|multitask P|prereqs q|quiet X|no-deprecation-warnings
@@ -11857,14 +11903,14 @@ module Squared
                    D|describe=q? e|execute=q E|execute-continue=q p|execute-print=q f|rakefile=p job-stats=b? j|jobs=i?
                    I|libdir=p R|rakelib=p rakelibdir=p r|require=b suppress-backtrace=q T|tasks=q? t|trace=b?
                    W|where=q?].freeze,
-          irb: %w[d f U w E=b I=p r=bm W=im? autocomplete colorize echo echo-on-assignment extra-doc-dir inf-ruby-mode
+          irb: %w[d f U w E=b I=pm r=bm W=im? autocomplete colorize echo echo-on-assignment extra-doc-dir inf-ruby-mode
                   inspect multiline no-pager noautocomplete nocolorize noecho noecho-on-assignment noinspect
                   nomultiline noprompt noscript nosingleline noverbose regexp-completor sample-book-mode script
                   simple-prompt single-irb singleline tracer truncate-echo-on-assignment type-completor verbose
                   back-trace-limit=i context-mode=i prompt=b prompt-mode=b].freeze,
           rdbg: %w[no-color no-rc no-sigint-hook c|command n|nonstop stop-at-load cookie=q e=q host=q x|init-script=p
                    O|open=q? port=i port-range=b session-name=q sock-path=q util=q].freeze,
-          rbs: %w[I=pm r=bm no-stdlib no-collection collection=p log-level=b log-output=p repo=p].freeze,
+          rbs: %w[I=pm r=bm no-collection no-stdlib collection=p log-level=b log-output=p repo=p].freeze,
           rubocop: %w[D P r=bm auto-gen-config a|autocorrect A|autocorrect-all d|debug disable-pending-cops
                       display-only-correctable display-only-fail-level-offenses display-only-failed
                       display-only-safe-correctable S|display-style-guide display-time editor-mode enable-pending-cops
@@ -11875,8 +11921,8 @@ module Squared
                       start-server stderr stop-server C|cache=b cache-root=p config=p exclude-limit=i fail-level=b
                       f|format=b except=q only=q o|out=p plugin=p require=p show-cops=q show-docs-url=q
                       s|stdin=p].freeze,
-          pry: %w[f I=pm no-color no-history no-multiline no-pager no-plugins simple-prompt c|context=q
-                  d|disable-plugin=q e=q gem=b r|require=bm s|select-plugin=q].freeze,
+          pry: %w[f e=q I=pm no-color no-history no-multiline no-pager no-plugins simple-prompt c|context=q
+                  d|disable-plugin=q gem=b r|require=bm s|select-plugin=q].freeze,
           no: {
             rubocop: %w[auto-gen-enforced-style auto-gen-only-exclude auto-gen-timestamp color display-cop-names
                         offense-counts parallel server].freeze
@@ -11910,7 +11956,7 @@ module Squared
           plugin: %w[source=q version=q].freeze,
           plugin_uninstall: %w[all].freeze,
           show: %w[paths].freeze,
-          update: %w[all conservativepre ruby strict bundler=b? g|group=q source=q].freeze,
+          update: %w[all conservative pre ruby strict bundler=b? g|group=q source=q].freeze,
           v3: {
             binstubs: %w[all].freeze,
             cache: %w[all frozen no-prune].freeze,
@@ -12053,7 +12099,8 @@ module Squared
         attr_reader :gemdir
         attr_accessor :autodetect
 
-        def initialize(*, autodetect: false, steep: 'Steepfile', rubocop: '.rubocop.yml', asdf: 'ruby', **kwargs)
+        def initialize(*, autodetect: false, exec: false, steep: 'Steepfile', rubocop: '.rubocop.yml', asdf: 'ruby',
+                       **kwargs)
           super
           if @pass.include?(Ruby.ref)
             initialize_ref Ruby.ref
@@ -12066,6 +12113,7 @@ module Squared
           serve_set kwargs[:serve]
           gemfile_set kwargs[:gemspec]
           self.autodetect = autodetect
+          @bundle = { exec: exec.is_a?(String) ? basepath!(exec) : false }
           @steepfile = basepath! steep if steep
           @rubocopfile = Pathname.new(rubocop).realpath rescue basepath!(Dir.home, '.rubocop.yml') if rubocop
           @rubygems = kwargs.fetch(:rubygems, 0)
@@ -12138,7 +12186,7 @@ module Squared
                           queue.call
                           if (item = tasks[n.pred])
                             cmd = [pre, item.first].compact.join(' ')
-                          elsif exception
+                          elsif exception?
                             indexerror n, tasks
                           else
                             log.warn "rake task #{n} of #{tasks.size}".subhint('out of range')
@@ -12444,7 +12492,7 @@ module Squared
                           pwd_set do
                             out = []
                             tool = args.name || (s && !SEM_VER.match?(s) ? s : 'ruby')
-                            trim = ->(val) { val[/^\D+\d+\.\d+(?:\.\S+)?/, 0].sub(/^([a-z]+)-/i, '\1 ') }
+                            trim = ->(val) { val =~ /^\D+\d+\.\d+(?:\.\S+)?/ ? $&.sub(/^([a-z]+)-/i, '\1 ') : val }
                             vm, bin = vmname(bin: true)
                             out << trim.call(case vm
                                              when 'rvm'
@@ -13464,8 +13512,8 @@ module Squared
 
         def rubocop(*args, sync: true, banner: verbose?, with: nil, pass: PASS_RUBY[:rubocop], **kwargs)
           opts = session_opts(with, args: args, kwargs: kwargs, pass: pass)
-          op = OptionPartition.new(opts, OPT_RUBY[:rubocop], session('rubocop'), project: self, strict: strict?,
-                                                                                 no: OPT_RUBY[:no][:rubocop])
+          op = OptionPartition.new(opts, OPT_RUBY[:rubocop], session(*bundle_args('rubocop')),
+                                   project: self, strict: strict?, no: OPT_RUBY[:no][:rubocop])
           if @rubocopfile && !op.arg?('c', 'config') && !rootpath('.rubocop.yml', ascend: true).exist?
             op.add_path(@rubocopfile, option: 'c')
           end
@@ -13500,7 +13548,7 @@ module Squared
         end
 
         def vmname(bin: false)
-          order = { 'rbenv' => -1, 'rvm' => -1, 'chruby' => -1, 'mise' => -1 }
+          order = { 'rbenv' => -1, 'rvm' => -1, 'chruby' => -1, 'asdf' => -1, 'mise' => -1 }
           ENV.fetch('PATH', '').split(':').each_with_index do |val, index|
             order.each_key do |key|
               next unless val.match?(%r{[/.]#{key}/})
@@ -13509,36 +13557,40 @@ module Squared
               break
             end
           end
+          items = [
+            "#{ENV.fetch('RBENV_ROOT', '$HOME/.rbenv')}/bin/rbenv",
+            '$HOME/.rvm/bin/rvm',
+            '$HOME/.local/bin/mise',
+            '/usr/bin/rbenv',
+            '/usr/bin/mise',
+            '/usr/local/rvm/bin/rvm',
+            '/usr/share/rvm/bin/rvm',
+            '/usr/local/share/chruby/chruby.sh'
+          ]
           if @asdf
-            [File.join(ENV.fetch('ASDF_DATA_DIR', '$HOME/.asdf'), "installs/#{@asdf.first}")]
-          else
-            [
-              "#{ENV.fetch('RBENV_ROOT', '$HOME/.rbenv')}/bin/rbenv",
-              '$HOME/.rvm/bin/rvm',
-              '$HOME/.local/bin/mise',
-              '/usr/bin/rbenv',
-              '/usr/bin/mise',
-              '/usr/local/rvm/bin/rvm',
-              '/usr/share/rvm/bin/rvm',
-              '/usr/local/share/chruby/chruby.sh'
-            ]
-            .sort do |a, b|
-              c = -1
-              d = -1
-              order.each do |key, val|
-                pat = %r{/\.?#{key}}
-                c = val if a.match?(pat)
-                d = val if b.match?(pat)
-              end
-              if c == d
-                0
-              elsif c == -1
-                1
-              elsif d == -1
-                -1
-              else
-                c < d ? -1 : 1
-              end
+            dir = File.join(ENV.fetch('ASDF_DATA_DIR', '$HOME/.asdf'), "installs/#{@asdf.first}")
+            if @@asdf.version == 16
+              items = [dir]
+            else
+              items << dir
+            end
+          end
+          items.sort do |a, b|
+            c = -1
+            d = -1
+            order.each do |key, val|
+              pat = %r{/\.?#{key}}
+              c = val if a.match?(pat)
+              d = val if b.match?(pat)
+            end
+            if c == d
+              0
+            elsif c == -1
+              1
+            elsif d == -1
+              -1
+            else
+              c < d ? -1 : 1
             end
           end
           .each do |val|
@@ -13661,8 +13713,8 @@ module Squared
         private
 
         def run_repl(*args, opts:, banner:, from:, delim: true, **kwargs)
-          op = OptionPartition.new(opts, OPT_RUBY[from], session(from), project: self, strict: strict?,
-                                                                        first: [/\.rb$/])
+          op = OptionPartition.new(opts, OPT_RUBY[from], session(*bundle_args(from)), project: self, strict: strict?,
+                                                                                      first: [/\.rb$/])
           r = []
           r << 'bundler/setup' if !op.arg?('r') && bundle_load
           r.concat(Array(kwargs[:name])) if kwargs[:name]
@@ -13689,14 +13741,15 @@ module Squared
         end
 
         def rake_session(*cmd, **kwargs)
-          session('rake', *preopts, *cmd, **kwargs)
+          session(*bundle_args('rake'), *preopts, *cmd, **kwargs)
         end
 
         def rbs_session(*cmd, opts: nil)
-          return session('rbs', *cmd) unless opts
+          args = bundle_args 'rbs'
+          return session(*args, *cmd) unless opts
 
           op = OptionPartition.new(opts, OPT_RUBY[:rbs], project: self, strict: strict?)
-          [session('rbs', *op.to_a, *cmd), op.extras]
+          [session(*args, *op.to_a, *cmd), op.extras]
         end
 
         def gem_output(*cmd, **kwargs)
@@ -13712,7 +13765,15 @@ module Squared
         end
 
         def rake_output(*cmd, **kwargs)
-          session_output('rake', *cmd, **kwargs)
+          session_output(*bundle_args('rake'), *cmd, **kwargs)
+        end
+
+        def bundle_args(*args)
+          if (val = @bundle[:exec])
+            args.unshift(quote_option('gemfile', val)) unless val == true
+            args.unshift('bundle', 'exec')
+          end
+          args
         end
 
         def bundle_load
@@ -14334,9 +14395,15 @@ module Squared
           when :bake
             append_file(0, index: 3) unless from || op.arg?('f', 'file') || !anypath?(*COMPOSEFILE)
             unless op.empty?
-              context = op.pop if Dir.exist?(op.last) && projectpath?(op.last)
+              if !context && op.size > 1 && exist?(op.last, type: 'd')
+                pat = /\btarget\s+"#{Regexp.escape(op.last)}"/
+                context = op.pop if op.values_of('f', 'file').none? { |f| basepath!(f)&.read&.match?(pat) }
+              end
+              if context
+                context = basepath context
+                op.each { |name| op.add_option('set', "#{name}.context=#{context}", escape: false) }
+              end
               op.append(escape: true, strip: /^:/, clear: true)
-              contextdir context if context
             end
           end
           op.clear(pass: false)
@@ -14387,6 +14454,7 @@ module Squared
           end
           run(from: from)
         end
+        alias compose_ compose!
 
         def container(flag, opts = [], id: nil)
           cmd, opts = docker_session('container', flag, opts: opts)
