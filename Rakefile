@@ -11,7 +11,7 @@ require 'time'
 require 'timeout'
 
 module Squared
-  VERSION = '0.7.8'
+  VERSION = '0.7.9'
 
   module Common
     PATH = {}
@@ -1063,11 +1063,19 @@ module Squared
       end
 
       def env_pipe(key, default = 1, root: nil, **kwargs)
+        out = 1
         case key
         when ::String
           case (ret = env_value(key, **kwargs))
           when '0', '1', '2'
             return ret.to_i
+          else
+            out = default if default.is_a?(::Numeric)
+            if ret.include?(File::SEPARATOR)
+              default = ret
+            elsif key.include?(File::SEPARATOR)
+              default = key
+            end
           end
         when ::Numeric
           return key if key.between?(0, 2)
@@ -1078,7 +1086,7 @@ module Squared
           (root ? Pathname.new(root) + default : Pathname.new(default)).realdirpath
         rescue => e
           warn e
-          1
+          out
         end
       end
 
@@ -1272,7 +1280,13 @@ module Squared
         @stage = Support.hashlist
         self.home = home
         self.exception = env_bool exception
-        self.pipe = $DEBUG ? 2 : env_pipe(pipe, (ARG[:OUT] && env(ARG[:OUT])) || 1, root: home)
+        self.pipe = if $DEBUG
+                      2
+                    elsif (out = ARG[:OUT]) && out.include?(File::SEPARATOR)
+                      env_pipe(out, pipe, root: home)
+                    else
+                      env_pipe(pipe, (out && env(out)) || 1, root: home)
+                    end
         self.verbose = if $VERBOSE.nil?
                          false
                        elsif verbose.nil?
@@ -3471,13 +3485,29 @@ module Squared
             end
           end
 
-          def matchmap(list, prefix = nil)
-            list.map do |val|
-              next val if val.is_a?(Regexp)
-
-              val = ".*#{val}" if prefix && !val.sub!(/\A(\^|\\A)/, '')
-              Regexp.new("#{prefix}#{val == '*' ? '.+' : val}")
+          def matchmap(list, prefix = nil, negate: false)
+            ret = negate ? [[], []] : []
+            list.each do |val|
+              unless val.is_a?(Regexp)
+                val = val.dup
+                n = 1 if negate && val.delete_prefix!('!')
+                if prefix
+                  a = nil
+                  val.sub!(/\A(\^|\\A)/) do |s|
+                    a = s
+                    nil
+                  end
+                  val = ".*#{val}" unless a
+                end
+              end
+              pat = Regexp.new("#{a}#{prefix}#{val == '*' ? '.+' : val}")
+              if negate
+                ret[n || 0] << pat
+              else
+                ret << pat
+              end
             end
+            ret
           end
 
           def matchany?(list, *args, empty: true)
@@ -5190,7 +5220,13 @@ module Squared
             ret += 1
             break out if first
           end
-          print_item banner, lines if banner && (ret > 0 || (!pass && !first))
+          if banner && (ret > 0 || (!pass && !first))
+            if banner.empty?
+              print_item(*lines)
+            else
+              print_item(banner, *lines)
+            end
+          end
           ret
         end
 
@@ -5216,7 +5252,7 @@ module Squared
         end
 
         def print_run(cmd, banner = true, verbose: nil, **)
-          return if banner || !stdout? || verbose == false || env('BANNER', equals: '0')
+          return if banner || !stdout? || verbose == false || env('BANNER', equals: %w[0 false])
 
           puts "\n> #{cmd}"
           printsucc
@@ -5225,7 +5261,7 @@ module Squared
         def print_item(*val, series: false)
           puts unless printfirst?
           printsucc unless series
-          puts val unless val.empty? || (val.size == 1 && !val.first)
+          puts val unless val.empty? || (val.size == 1 && (!val.first || val.first.empty?))
         end
 
         def print_banner(*lines, client: false, styles: theme[:banner], border: borderstyle)
@@ -6184,7 +6220,12 @@ module Squared
         end
 
         def banner?
-          ARG[:BANNER] && env('BANNER', notequals: '0')
+          case (val = env('BANNER', ignore: false))
+          when '0', 'false'
+            false
+          else
+            !val.nil? || ARG[:BANNER]
+          end
         end
 
         def pwd?
@@ -6217,7 +6258,12 @@ module Squared
         end
 
         def strict?
-          (ARG[:STRICT] || exception?(Logger::FATAL)) && env('STRICT', notequals: '0')
+          case (val = env('STRICT', ignore: false))
+          when '0', 'false'
+            false
+          else
+            !val.nil? || ARG[:STRICT] || exception?(Logger::FATAL)
+          end
         end
 
         def serve?
@@ -7296,13 +7342,13 @@ module Squared
               op = OptionPartition.new(opts, OPT_GIT[:pull], cmd, project: self, strict: strict?,
                                                                   no: OPT_GIT[:no][:pull])
               opts -= op.extras
-              reg = matchmap op
+              reg, neg = matchmap(op, negate: true)
               session_done op.target
               heads = []
               cur = nil
               foreachref('heads', format: '%(if)%(HEAD)%(then)* %(end)%(refname:short)').each do |line|
                 cur ||= line.delete_prefix!('* ')
-                heads << line if matchany?(reg, line)
+                heads << line if matchany?(reg, line) && !matchany?(neg, line, empty: false)
               end
               raise_error 'head not found', hint: 'for-each-ref' unless cur
               opts << 'ff-only' if opts.empty? && option('ff-only', notequals: '0')
@@ -7482,7 +7528,7 @@ module Squared
               op.clear
               out, banner, from = source(io: true)
               print_item banner
-              list_result(write_lines(out), 'objects', from: from)
+              list_result(write_lines(out), 'objects', banner: banner, from: from)
               return
             end
           else
@@ -7534,7 +7580,7 @@ module Squared
           end
           out, banner, from = source(io: true)
           ret = write_lines(out, banner: banner, sub: sub)
-          list_result(ret, 'files', action: 'modified', from: from)
+          list_result(ret, 'files', action: 'modified', banner: banner, from: from)
         end
 
         def revbuild(flag = nil, opts = [], **kwargs)
@@ -7702,7 +7748,7 @@ module Squared
             out, banner, from = source(io: true)
             print_item banner
             ret = write_lines(out, grep: op.extras)
-            list_result(ret, 'tags', grep: op.extras, from: from)
+            list_result(ret, 'tags', grep: op.extras, banner: banner, from: from)
             return
           end
           if (ret = source) && (remote ||= option('remote'))
@@ -7713,9 +7759,9 @@ module Squared
 
         def log!(flag, opts = [], range: [], index: [], grep: [])
           cmd, opts = git_session('log', opts: opts)
-          op = OptionPartition.new(opts, collect_hash(OPT_GIT[:log]), cmd, project: self, strict: strict?,
-                                                                           no: collect_hash(OPT_GIT[:no][:log]),
-                                                                           first: matchpathspec)
+          op = OptionPartition.new(opts, collect_hash(OPT_GIT[:log]), cmd,
+                                   project: self, strict: strict?, no: collect_hash(OPT_GIT[:no][:log]),
+                                   first: matchpathspec)
           case flag
           when :between, :contain
             op.add_quote(range.join(flag == :between ? '..' : '...'))
@@ -7970,7 +8016,7 @@ module Squared
               opt_style(color(:green), /^(\*\s+)(\S+)(.*)$/, 2),
               opt_style(color(:red), %r{^(\s*)(remotes/\S+)(.*)$}, 2)
             ])
-            list_result(ret, 'branches', from: from)
+            list_result(ret, 'branches', banner: banner, from: from)
             return
           else
             if (head = git_spawn('rev-parse --abbrev-ref HEAD').chomp).empty?
@@ -7979,7 +8025,7 @@ module Squared
               git_spawn 'fetch --all --prune --quiet' if option('sync')
               cmd << '-vv --no-abbrev --list'
               out, banner, from = source(io: true)
-              first = workspace.size > 1
+              first = from_base?('branch')
               grep = first ? [/^\*\s+#{Regexp.escape(head)}\s/] : []
               ret = write_lines(out, grep: grep, banner: banner, first: first) do |line, index|
                 next line if stdin?
@@ -8052,9 +8098,7 @@ module Squared
 
         def restore(flag, opts = [], commit: nil, files: nil)
           cmd, opts = git_session('restore', shell_option(flag, commit, escape: false, force: false), opts: opts)
-          op = OptionPartition.new(opts,
-                                   OPT_GIT[:restore] + OPT_GIT[:log][:diff_context],
-                                   cmd,
+          op = OptionPartition.new(opts, OPT_GIT[:restore] + OPT_GIT[:log][:diff_context], cmd,
                                    project: self, strict: strict?, no: OPT_GIT[:no][:restore], first: matchpathspec)
           append_pathspec(op.extras + (files || []), pass: false)
           source(sync: false, stderr: true)
@@ -8083,8 +8127,7 @@ module Squared
           end
           list = OPT_GIT[:show] + OPT_GIT[:diff][:show] + OPT_GIT[:log][:diff] + OPT_GIT[:log][:diff_context]
           op = OptionPartition.new(opts, list, cmd,
-                                   project: self,
-                                   strict: strict?,
+                                   project: self, strict: strict?,
                                    no: OPT_GIT[:no][:show] + collect_hash(OPT_GIT[:no][:log], pass: [:base]))
           op.append(delim: true)
           source(exception: false, banner: flag != :oneline)
@@ -8109,8 +8152,8 @@ module Squared
               cmd << '--sq-quote'
               args = true
             end
-            OptionPartition.new(opts, OPT_GIT[:rev_parse], cmd,
-                                project: self, strict: strict?, no: OPT_GIT[:no][:rev_parse], args: args)
+            OptionPartition.new(opts, OPT_GIT[:rev_parse], cmd, project: self, strict: strict?, args: args,
+                                                                no: OPT_GIT[:no][:rev_parse])
                            .append(escape: args)
           end
           source(banner: verbose?)
@@ -8138,7 +8181,7 @@ module Squared
           out, banner, from = source(io: true)
           print_item banner
           ret = write_lines(out, grep: op.extras, prefix: "refs/#{flag}/")
-          list_result(ret, flag.to_s, grep: op.extras, from: from)
+          list_result(ret, flag.to_s, grep: op.extras, banner: banner, from: from)
         end
 
         def ls_files(flag, opts = [])
@@ -8148,7 +8191,7 @@ module Squared
           out, banner, from = source(io: true)
           print_item banner
           ret = write_lines(out, grep: op.extras)
-          list_result(ret, 'files', grep: op.extras, from: from)
+          list_result(ret, 'files', grep: op.extras, banner: banner, from: from)
         end
 
         def git(flag, opts = [])
@@ -8317,10 +8360,10 @@ module Squared
           end
         end
 
-        def list_result(size, type, action: 'found', grep: [], from: nil)
+        def list_result(size, type, action: 'found', grep: [], banner: nil, from: nil)
           if size == 0
             puts empty_status("No #{type} were #{action}", 'grep', grep.join(', '))
-          elsif stdout?
+          elsif stdout? && (banner.nil? || (banner.is_a?(String) && !banner.empty?))
             styles = theme.fetch(:banner, []).reject { |val| val.to_s.end_with?('!') }
             styles << :bold if styles.size <= 1
             puts print_footer("#{size} #{size == 1 ? type.sub(/(?:(?<!l)e)?s\z/, '') : type}",
@@ -8389,8 +8432,8 @@ module Squared
           append_submodules(target: target, from: from)
           return if !remote && opts.empty?
 
-          op = OptionPartition.new(opts, remote ? list + ['refspec=v'] : list, target, project: self, strict: strict?,
-                                                                                       no: no)
+          op = OptionPartition.new(opts, remote ? list + ['refspec=v'] : list, target,
+                                   project: self, strict: strict?, no: no)
           refspec = op.each_with_object([]) do |opt, out|
             if opt =~ op.values
               case $1
@@ -8783,8 +8826,6 @@ module Squared
                   [proj, proj.build? && (script || run), doc && proj.doc?, lint && proj.lint?, test && proj.test?]
                 end
                 .select do |proj, run, doc, lint, test|
-                  next unless proj
-
                   proj.doc(sync: true) if doc
                   proj.build(sync: true) if run
                   next if n.anybits?(4)
@@ -9309,7 +9350,7 @@ module Squared
                     when 'package'
                       format_desc(action, flag, 'opts*', before: case flag
                                                                  when :dedupe, :rebuild then nil
-                                                                 when :reinstall then 'force?'
+                                                                 when :reinstall then 'f/orce?'
                                                                  else 'name*'
                                                                  end)
                       task flag do |_, args|
@@ -9635,6 +9676,18 @@ module Squared
                        end
                 print_run cmd, silent?
                 run(cmd, banner: false)
+              end
+              option('allow-scripts', ignore: false) do |val|
+                cmd << case val
+                       when '0'
+                         '--ignore-scripts'
+                       when 'false'
+                         '--strict-allow-scripts'
+                       when '1', 'true'
+                         '--dangerously-allow-all-scripts'
+                       else
+                         quote_option 'allow-scripts', val
+                       end
               end
               cmd << '--workspaces=false' if ws
               cmd << '--force' if option('force')
@@ -10026,6 +10079,7 @@ module Squared
 
         def package(flag, opts = [], packages: [], from: nil)
           workspace.rev_clear(name)
+          force = true if flag == :reinstall && has_value!(opts, 'f')
           yarn = dependtype(:yarn)
           if yarn > 0 && !(yarn == 1 && ((flag == :update && !packages.empty?) || %i[approve deny
                                                                                      rebuild].include?(flag)))
@@ -10039,8 +10093,8 @@ module Squared
                                     end
                                   when :reinstall
                                     if yarn == 1
-                                      remove_modules 'yarn' if opts.include?('force')
-                                    elsif opts.delete('force')
+                                      remove_modules 'yarn' if opts.include?('force') || force
+                                    elsif opts.delete('force') || force
                                       opts << 'check-cache'
                                     end
                                     opts << 'no-lockfile' if lockfile(true)
@@ -10109,7 +10163,7 @@ module Squared
                          spec = 1
                          flag = :install
                        when :reinstall
-                         remove_modules 'npm' if opts.delete('force')
+                         remove_modules 'npm' if opts.delete('force') || force
                          opts.unshift('package-lock=false') if lockfile(true)
                          flag = :install
                        end
@@ -12393,16 +12447,23 @@ module Squared
                         format_desc action, flag, 'f/orce?,l/ocal?,opts*'
                         task flag do |_, args|
                           opts = args.to_a
-                          opts << 'local' if has_value!(opts, 'l')
+                          opts << 'local' if has_value!(opts, 'l', 'local')
                           opts << 'redownload' if has_value!(opts, 'f', 'force')
                           if (lock = basepath!('Gemfile.lock'))
-                            config = basepath '.bundle', 'config'
-                            if config.exist? && config.read.match?(/\bBUNDLE_FROZEN:\s+"true"/)
-                              if opts.include?('redownload')
-                                run(bundle_output('config unset frozen'), banner: false)
-                              else
-                                print_error('Gemfile.lock is frozen', subject: name, hint: flag)
+                            case (val = ENV['BUNDLE_FROZEN'])
+                            when '0', 'false'
+                              nil
+                            else
+                              if val
+                                print_error("BUNDLE_FROZEN: #{val}", loglevel: Logger::INFO, subject: name, hint: flag)
                                 lock = nil
+                              elsif basepath!('.bundle', 'config')&.read&.match?(/\bBUNDLE_FROZEN:\s+"true"/)
+                                if opts.include?('redownload')
+                                  run(bundle_output('config unset frozen'), banner: false)
+                                else
+                                  print_error('Gemfile.lock is frozen', subject: name, hint: flag)
+                                  lock = nil
+                                end
                               end
                             end
                             lock&.delete
@@ -13713,8 +13774,8 @@ module Squared
         private
 
         def run_repl(*args, opts:, banner:, from:, delim: true, **kwargs)
-          op = OptionPartition.new(opts, OPT_RUBY[from], session(*bundle_args(from)), project: self, strict: strict?,
-                                                                                      first: [/\.rb$/])
+          op = OptionPartition.new(opts, OPT_RUBY[from], session(*bundle_args(from)),
+                                   project: self, strict: strict?, first: [/\.rb$/])
           r = []
           r << 'bundler/setup' if !op.arg?('r') && bundle_load
           r.concat(Array(kwargs[:name])) if kwargs[:name]
@@ -14032,7 +14093,7 @@ module Squared
             exec: %w[d|detach i|interactive privileged t|tty detach-keys=q e|env=qq env-file=p u|user=e
                      w|workdir=q].freeze,
             commit: %w[no-pause a|author=q c|change=q m|message=q pause=b?].freeze,
-            inspect: %w[s|size f|format=q type=b].freeze,
+            inspect: %w[s|size f|format=q].freeze,
             start: %w[a|attach i|interactive detach-keys=q].freeze,
             stop: %w[s|signal=b t|timeout=i].freeze,
             restart: %w[s|signal=b t|timeout=i].freeze,
@@ -14040,6 +14101,7 @@ module Squared
             stats: %w[a|all no-stream no-trunc format|q].freeze
           }.freeze,
           image: {
+            inspect: %w[f|format platform=q].freeze,
             ls: %w[a|all digests no-trunc q|quiet tree f|filter=q format=q].freeze,
             pull: %w[a|all-tags platform=q q|quiet].freeze,
             push: %w[a|all-tags platform=q q|quiet].freeze,
@@ -14089,7 +14151,7 @@ module Squared
           'build' => %i[tag context].freeze,
           'compose' => %i[build create publish run exec up down service].freeze,
           'bake' => %i[build compose check].freeze,
-          'image' => %i[ls rm pull push tag save].freeze,
+          'image' => %i[ls rm pull push tag save inspect].freeze,
           'container' => %i[run create exec update commit inspect diff start stop restart pause unpause top stats kill
                             rm].freeze,
           'network' => %i[connect disconnect create].freeze,
@@ -14252,7 +14314,7 @@ module Squared
                           end
                         end
                       else
-                        format_desc action, flag, "opts*,id/name#{flag == :update ? '+' : '*'}"
+                        format_desc action, flag, "opts*,id/name#{flag == :update || flag == :inspect ? '+' : '*'}"
                         task flag do |_, args|
                           container flag, args.to_a
                         end
@@ -14263,7 +14325,7 @@ module Squared
                         next unless @registry
 
                         format_desc action, flag, 'tag?,registry/username?,opts*'
-                        task flag, [:tag] do |_, args|
+                        task flag do |_, args|
                           image flag, args.to_a
                         end
                       when :pull
@@ -14271,6 +14333,11 @@ module Squared
                         task flag, [:tag] do |_, args|
                           id = param_guard(action, flag, args: args, key: :tag)
                           image(flag, args.extras, id: id)
+                        end
+                      when :inspect
+                        format_desc action, flag, 'opts*,id+'
+                        task flag do |_, args|
+                          image flag, args.to_a
                         end
                       else
                         format_desc(action, flag, case flag
@@ -14622,6 +14689,9 @@ module Squared
             sync = false
             exception ||= true
             banner = false
+          when :inspect
+            raise_error ArgumentError, 'missing image', hint: flag if op.empty?
+            op.append(escape: true, strip: /^:/)
           end
           success?(run(sync: sync, exception: exception, banner: banner, from: from), flag == :tag || flag == :save)
         end
