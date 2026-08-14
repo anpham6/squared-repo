@@ -11,7 +11,7 @@ require 'time'
 require 'timeout'
 
 module Squared
-  VERSION = '0.7.9'
+  VERSION = '0.7.10'
 
   module Common
     PATH = {}
@@ -102,6 +102,13 @@ module Squared
       return if VAR.frozen?
 
       VAR[key.is_a?(::String) ? key.to_sym : key] = val
+    end
+
+    def __arg__(key, name = nil, &blk)
+      ret = ARG[key.to_sym]
+      return ret unless name && ret.is_a?(::Hash)
+
+      ret[name = name.downcase] || (block_given? ? ret.fetch(name.to_sym, &blk) : ret[name.to_sym])
     end
 
     def __freeze__
@@ -499,7 +506,7 @@ module Squared
                                                                 end}] "
           end
         end
-        between = ->(s) { s.match?(/^\d+$/) && s.to_i.between?(min, max) }
+        between = ->(s) { s.match?(/^\d+$/) && s.to_i.between?(min, max <= min ? Float::INFINITY : max) }
         Timeout.timeout(timeout) do
           while (ch = Readline.readline(msg))
             ch.strip!
@@ -2451,8 +2458,9 @@ module Squared
         already_invoked? parallel, val
       end
 
-      def exclude?(key, empty = false)
-        @exclude.include?(key) || (empty && (!key?(key) || self[key].empty?))
+      def exclude?(key, fallback = false, empty: nil)
+        fallback = empty unless empty.nil?
+        @exclude.include?(key) || (fallback && (!key?(key) || self[key].empty?))
       end
 
       private
@@ -5073,7 +5081,7 @@ module Squared
         def env(key, default = nil, suffix: nil, strict: false, ignore: nil, **kwargs, &blk)
           name = "#{key}_#{envname_get}"
           ret = if suffix
-                  ENV.fetch("#{name}_#{suffix}", '')
+                  ENV["#{name}_#{suffix}"] || (ignore == false && ENV["#{key}_#{suffix}"]) || ''
                 elsif strict
                   ENV[name].to_s
                 else
@@ -5425,7 +5433,7 @@ module Squared
         end
 
         def append_hash(data, target: @session || [], build: false)
-          if build && (type = env('BUILD', suffix: 'TYPE') || ENV['BUILD_TYPE'])
+          if build && (type = env('BUILD', suffix: 'TYPE', ignore: false))
             if (extra = data[type = "__#{type}__"] || data[type.to_sym]).is_a?(Hash)
               data = data.merge(extra)
             else
@@ -5614,8 +5622,8 @@ module Squared
           args
         end
 
-        def confirm_basic(msg, hint, default = 'Y', style: :inline, target: @session, prefix: nil, **kwargs)
-          return true if prefix ? option('y', prefix: prefix) : target && option('y', target: target)
+        def confirm_basic(msg, hint, default = 'Y', style: :inline, target: @session, prefix: target&.first, **kwargs)
+          return true if option('y', prefix: prefix)
 
           confirm("#{msg} [#{sub_style(hint.to_s, style.is_a?(Symbol) ? theme[style] : style)}]", default, **kwargs)
         end
@@ -6228,6 +6236,10 @@ module Squared
           end
         end
 
+        def dryrun?(*, target: @session, prefix: target&.first)
+          Array(target).include?('--dry-run') || !option('dry-run', target: target, prefix: prefix).nil?
+        end
+
         def pwd?
           path == Pathname.pwd
         end
@@ -6435,7 +6447,6 @@ module Squared
         end
         File.write(@revfile, JSON.pretty_generate(@revdoc))
       rescue => e
-        log&.debug e
         warn log_warn(e, pass: true) if warning
       ensure
         @revlock = false
@@ -8395,7 +8406,7 @@ module Squared
           ret = choice_index('Choose a commit', git_spawn(cmd, stdout: false), column: /^(\S+)/, force: force, **kwargs)
           case ret
           when Array
-            ret.map(&:stripstyle)
+            ret.map { |val| val&.stripstyle }
           when String
             ret.stripstyle
           else
@@ -8571,10 +8582,6 @@ module Squared
                           end
           source(cmd.first.is_a?(Set) ? cmd.first : git_output(*cmd), exception: exception, io: io, sync: sync,
                                                                       stdout: stdout, banner: banner, **kwargs)
-        end
-
-        def dryrun?(*, target: @session, prefix: target&.first)
-          Array(target).include?('--dry-run') || !option('dry-run', target: target, prefix: prefix).nil?
         end
 
         def quiet?(*, target: @session, **)
@@ -8853,8 +8860,7 @@ module Squared
               end
               env('REPO_GROUPS', **envargs) do |val|
                 g = case val
-                    when '0', 'false'
-                      nil
+                    when '0', 'false' then nil
                     else
                       val
                     end
@@ -9043,8 +9049,8 @@ module Squared
           common: %w[dry-run=!? force=!? loglevel=b include-workspace-root=!? workspaces=!? w|workspace=v].freeze,
           common_scripts: %w[dangerously-allow-all-scripts=!? strict-allow-scripts=!? allow-scripts=q].freeze,
           install: %w[package-lock-only=!? prefer-dedupe=!? E|save-exact=!? before=q cpu=b libc=b os=b].freeze,
-          install_a: %w[audit=! bin-links=! foreground-scripts=!? fund=! ignore-scripts=!? install-links=!?
-                        package-lock=! strict-peer-deps=!? include=b install-strategy=b omit=b].freeze,
+          install_a: %w[audit=! bin-links=! engine-strict=!? foreground-scripts=!? fund=! ignore-scripts=!?
+                        install-links=!? package-lock=! strict-peer-deps=!? include=b install-strategy=b omit=b].freeze,
           install_b: %w[no-save B|save-bundle D|save-dev O|save-optional save-peer P|save-prod g|global=!?
                         S|save=!?].freeze,
           install_c: %w[allow-directory=b? allow-file=b? allow-git=b? allow-remote=b?].freeze,
@@ -9662,8 +9668,7 @@ module Squared
               cmd << '--ignore-scripts' if option('ignore-scripts')
               cmd << '--dangerously-allow-all-builds' if option('approve-builds')
             else
-              cmd = session 'npm'
-              cmd << (ci = option('ci') ? 'ci' : 'install')
+              cmd = session('npm', (ci = option('ci', prefix: 'npm')) ? 'ci' : 'install')
               option('approve-scripts') do |val|
                 cmd = npm_output 'approve-scripts'
                 cmd << case val
@@ -9687,6 +9692,14 @@ module Squared
                          '--dangerously-allow-all-scripts'
                        else
                          quote_option 'allow-scripts', val
+                       end
+              end
+              option('engine-strict', ignore: false) do |val|
+                cmd << case val
+                       when '0', 'false'
+                         '--engine-strict=false'
+                       else
+                         '--engine-strict'
                        end
               end
               cmd << '--workspaces=false' if ws
@@ -10498,8 +10511,7 @@ module Squared
                     next if yarntype(exist: true) == 0
                   when /^pnpm/
                     next if pnpmtype(exist: true) == 0
-                  when /^npm/
-                    nil
+                  when /^npm/ then nil
                   else
                     next
                   end
@@ -10553,8 +10565,8 @@ module Squared
         end
 
         def remove_modules(prefix = dependbin)
-          modules = basepath 'node_modules'
-          return false unless modules.directory? && confirm_basic('Remove?', modules, prefix: prefix)
+          modules = basepath!('node_modules', type: 'd')
+          return false unless modules && confirm_basic('Remove?', modules, prefix: prefix)
 
           modules.rmtree
         rescue Timeout::Error => e
@@ -10709,9 +10721,9 @@ module Squared
                       root-user-action=b t|target=p upgrade-strategy=b].freeze,
           install_a: %w[no-index pre prefer-binary all-releases=b extra-index-url=q f|find-links=q i|index-url=q
                         no-binary=q only-binary=q only-final=b].freeze,
-          install_b: %w[build-constraint check-build-dependencies no-build-isolation no-clean no-deps require-hashes
-                        use-pep517 c|constraint=p group=q progress-bar=b r|requirement=p requirements-from-script=p
-                        src=p].freeze,
+          install_b: %w[check-build-dependencies no-build-isolation no-clean no-deps require-hashes use-pep517
+                        build-constraint=p c|constraint=p group=q progress-bar=b r|requirement=p
+                        requirements-from-script=p src=p].freeze,
           install_c: %w[C|config-settings=q e|editable=v].freeze,
           install_d: %w[ignore-requires-python uploaded-prior-to=q].freeze,
           hash: %w[a|algorithm].freeze,
@@ -10854,8 +10866,8 @@ module Squared
                   format_desc action, nil, "script+|#{indexchar}index+|#,pattern*"
                   task action, [:command] do |_, args|
                     found = 0
-                    %w[tool.poetry.scripts tool.pdm.scripts project.scripts].each_with_index do |table, i|
-                      next if (list = read_pyproject(table)).empty?
+                    %w[tool.poetry tool.pdm project].each_with_index do |table, i|
+                      next if (list = read_pyproject("#{table}.scripts")).empty?
 
                       if args.command == '#'
                         format_list(list, "run[#{indexchar}N]", 'scripts', grep: args.extras, from: pyprojectfile)
@@ -10881,7 +10893,7 @@ module Squared
                               log.warn "run script #{n} of #{list.size}".subhint('out of range')
                             end
                           else
-                            case i
+                            case (i > 1 && poetry? ? 0 : i)
                             when 0
                               found |= 1
                               run(session_output('poetry', 'run', val), from: :run)
@@ -10970,7 +10982,7 @@ module Squared
                           install flag, ['upgrade', *args.to_a, 'pip']
                         end
                       when :freeze
-                        format_desc action, flag, "file?=#{DEP_PYTHON[4]},u/uninstall,opts*"
+                        format_desc action, flag, "file?=#{DEP_PYTHON[4]},u/ninstall?,opts*"
                         task flag do |_, args|
                           opts = args.to_a
                           if has_value!(opts, 'u', 'uninstall')
@@ -10985,7 +10997,7 @@ module Squared
                           end
                           file = pip(flag, opts: opts, banner: requirement.nil?, requirement: requirement)
                           puts File.read(file) unless silent?
-                          if requirement && confirm_basic('Uninstall?', file)
+                          if requirement && confirm_basic('Uninstall?', file, prefix: 'pip')
                             pip(:uninstall, opts: ['y', "r=#{shell_quote(file)}"])
                           end
                         end
@@ -11155,7 +11167,7 @@ module Squared
                               :patch
                             end
                    end
-                   '--not-required' if option('not-required', notequals: '0') && !env('PYTHON_DEFAULT')
+                   '--not-required' if option('not-required', notequals: '0')
                  end
           cmd << '--local' if option('l', 'local')
           append_global
@@ -11280,17 +11292,17 @@ module Squared
                                 project: self, strict: strict?, single: singleopt(flag))
           else
             op = append_pip(flag, opts, pipopts(:install), target: pip_session('install'))
-          end
-          case flag
-          when :editable
-            op << quote_option('e', op.pop || editable || '.')
-            op.clear
-          when :user, :upgrade
-            op.concat(packages)
-            raise_error ArgumentError, 'no packages listed', hint: flag if op.empty?
-            op << "--#{flag}"
-            op.append
-            python_session('-m pip', *op.to_a.drop(1)) if workspace.windows?
+            case flag
+            when :editable
+              op << quote_option('e', op.pop || editable || '.')
+              op.clear
+            when :user, :upgrade
+              op.concat(packages)
+              raise_error ArgumentError, 'no packages listed', hint: flag if op.empty?
+              op << "--#{flag}"
+              op.append
+              python_session('-m pip', *op.to_a.drop(1)) if workspace.windows?
+            end
           end
           run(banner: banner, from: :install)
         end
@@ -11471,8 +11483,7 @@ module Squared
             raise_error 'no subcommand', hint: flag if op.empty?
             op << (action = op.shift)
             case action
-            when 'dir', 'info', 'purge'
-              nil
+            when 'dir', 'info', 'purge' then nil
             when 'list', 'remove'
               op.add_first(quote: true)
             else
@@ -11484,8 +11495,7 @@ module Squared
             raise_error 'no subcommand', hint: flag if op.empty?
             op << (action = op.shift)
             case action
-            when 'list', 'edit', 'debug'
-              nil
+            when 'list', 'edit', 'debug' then nil
             when 'get', 'unset', 'set'
               op.add_first
               op.add_first(quote: true, expect: true) if action == 'set'
@@ -11764,8 +11774,7 @@ module Squared
             /\A(?:v+|q+|b+|V+|O+)\z/
           when :pdm, :poetry
             /\Av+\z/
-          when :twine, :meson
-            nil
+          when :twine, :meson then nil
           else
             /\A(?:v+|q+)\z/
           end
@@ -12451,8 +12460,7 @@ module Squared
                           opts << 'redownload' if has_value!(opts, 'f', 'force')
                           if (lock = basepath!('Gemfile.lock'))
                             case (val = ENV['BUNDLE_FROZEN'])
-                            when '0', 'false'
-                              nil
+                            when '0', 'false' then nil
                             else
                               if val
                                 print_error("BUNDLE_FROZEN: #{val}", loglevel: Logger::INFO, subject: name, hint: flag)
@@ -12723,8 +12731,7 @@ module Squared
                 next if val == '0' || val == 'false'
 
                 run(bundle_output('binstubs --all', case val
-                                                    when '1', 'true'
-                                                      nil
+                                                    when '1', 'true' then nil
                                                     else
                                                       if val.start_with?('~')
                                                         val = File.join(Dir.home, val == '~' ? '.bundle' : val[1..-1])
@@ -13015,6 +13022,7 @@ module Squared
             buffer = []
             filter = kwargs.fetch(:filter, {})
             semver = filter[:semver]
+            dryrun = filter[:dryrun] || dryrun?(prefix: 'gem')
             update = if sync && filter[:select]
                        semver ||= 'major'
                        items = []
@@ -13167,7 +13175,7 @@ module Squared
                             'user-install'
                           end
                 end
-                if filter[:dryrun]
+                if dryrun
                   print_run gem_output('update -f', *update.quote!(escape: true)), false
                 else
                   gem(:update, *update, opts: opts)
@@ -13209,8 +13217,8 @@ module Squared
                 .clear(pass: false)
             end
           when :push
-            if op.empty? || (n = op.index(':'))
-              file = basepath(if !n && (spec = gemspec)
+            if op.empty? || ia
+              file = basepath(if !ia && (spec = gemspec)
                                 "#{spec.name}-#{spec.version}.gem"
                               else
                                 choice_index 'Select a file', Dir.glob('*.gem', base: path)
@@ -13863,8 +13871,7 @@ module Squared
               val = case (val = $2)
                     when 'true'
                       true
-                    when '', '[]'
-                      nil
+                    when '', '[]' then nil
                     else
                       if val =~ /\A\[:(.+)\]\z/
                         $1.split(', :').map { |s| (s[/\A"(.+)"\z/, 1] || s).to_sym }
@@ -15386,8 +15393,7 @@ module Squared
           'yaml'
         when 'js'
           'json'
-        when ''
-          nil
+        when '' then nil
         else
           ret
         end
@@ -15557,7 +15563,7 @@ Workspace::Application
     end
     next unless ws.series.some?(:build)
 
-    build = ws.dev?(global: true) && !ws.series.exclude?(:refresh, true) ? 'refresh' : 'build'
+    build = ws.dev?(global: true) && !ws.series.exclude?(:refresh, empty: true) ? 'refresh' : 'build'
 
     task 'default' => build
     next unless ws.series.some?(:depend)
