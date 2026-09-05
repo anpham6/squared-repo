@@ -11,7 +11,7 @@ require 'time'
 require 'timeout'
 
 module Squared
-  VERSION = '0.7.10'
+  VERSION = '0.7.11'
 
   module Common
     PATH = {}
@@ -27,6 +27,7 @@ module Squared
       CHOICE: 25,
       QUOTE: "'",
       SPACE: ' => ',
+      SUCCESS: 'Success',
       GRAPH: %w[| - | \\ -].freeze,
       BORDER: %w[| - - - - - | | - -].freeze,
       VIEW: 'view',
@@ -482,10 +483,11 @@ module Squared
       def choice(msg, list = nil, min: 1, max: 1, multiple: false, index: false, grep: nil, border: nil, auto: true,
                  force: true, attempts: 3, timeout: 0)
         require 'timeout'
+        multiple = Array(multiple) if multiple.is_a?(::Numeric)
         if list
           grep &&= Array(grep).map { |val| Regexp.new(val) }
           items = list.each_with_object([]) do |val, out|
-            next if grep&.none? { |pat| pat.match?(line) }
+            next if grep&.none? { |pat| pat.match?(val) }
 
             out << val.to_s.chomp
             puts '%2d. %s' % [out.size, val]
@@ -502,7 +504,7 @@ module Squared
               puts print_footer(border: border)
             end
             msg = "#{msg + (force ? ':' : '?')} [#{min}-#{max}#{if (n = multiple)
-                                                                  "|,#{n.is_a?(::Numeric) ? "{#{n}}" : '*'}"
+                                                                  "|,#{n.is_a?(::Array) ? "{#{n.join(',')}}" : '*'}"
                                                                 end}] "
           end
         end
@@ -531,7 +533,7 @@ module Squared
                 unless k.include?(nil)
                   k.uniq!
                   k.sort!
-                  unless multiple.is_a?(::Numeric) && multiple != k.size
+                  unless multiple.is_a?(::Array) && !multiple.include?(k.size)
                     return index || !items ? k : k.map { |i| items[i.pred] }
                   end
                 end
@@ -1048,7 +1050,7 @@ module Squared
       end
 
       def env_key(*val)
-        val.join('_').gsub(/\W+/, '_').upcase
+        val.join('_').sub(/\A\d+\W*/, '__').gsub(/\W+/, '_').upcase
       end
 
       def env_bool(key, default = false, index: false, **kwargs)
@@ -2607,8 +2609,25 @@ module Squared
 
             def strip(val)
               val = shell_split val if val.is_a?(String)
-              Array(val).map { |s| s.sub(OPT_SINGLE, '\1=\2').sub(OPT_VALUE, '\1=\2').sub(OPT_NAME, '\2') }
-                        .reject(&:empty?)
+              ret = []
+              pass = -1
+              (args = Array(val)).each_with_index do |s, i|
+                next if s.empty? || pass == i
+
+                if s == '--'
+                  ret << s << args[i.succ..-1].join(' ')
+                  break
+                end
+                next ret << s unless s.start_with?('-')
+
+                if !s.include?('=') && (j = args[i.succ]) && !j.start_with?('-')
+                  ret << "#{s.sub(/^-{1,2}/, '')}=#{j}"
+                  pass = i.succ
+                else
+                  ret << s.sub(OPT_SINGLE, '\1=\2').sub(OPT_VALUE, '\1=\2').sub(OPT_NAME, '\2')
+                end
+              end
+              ret
             end
 
             def select(list, bare: true, no: true, single: false, double: false)
@@ -2672,8 +2691,11 @@ module Squared
             end
 
             def pattern?(val)
+              Regexp.new(val)
               val.start_with?('\A', '^') || val.end_with?('\z', '$') ||
               val.match?(/[.)][*+?]|\(\?[:=!><]|\\[dsw\d]|\[.+\]|\{\d+,?\d*\}/i)
+            rescue RegexpError
+              false
             end
 
             private
@@ -2771,13 +2793,13 @@ module Squared
                       else
                         [flag]
                       end
+                bare.concat(mod) if val.chomp!('?')
+                m.concat(mod) if val.chomp!('m')
                 case val[n.succ]
                 when 'e'
                   e.concat(mod)
                 when 'b'
                   b.concat(mod)
-                when 'm'
-                  m.concat(mod)
                 when 'q'
                   qq.concat(mod) if val[n + 2] == 'q'
                   q.concat(mod)
@@ -2796,11 +2818,7 @@ module Squared
                 when '+'
                   ml.concat(mod)
                   bare.concat(mod)
-                else
-                  next
                 end
-                m.concat(mod) if val[n + 2] == 'm'
-                bare.concat(mod) if val.end_with?('?')
               else
                 bare << val
                 mod = [val]
@@ -2835,7 +2853,7 @@ module Squared
             end
             numtype = [
               [i, /\A\d+\z/],
-              [f, /\A\d*(?:\.\d+)?\z/],
+              [f, /\A(\d+(\.\d*)?|\d*\.\d+)\z/],
               [si, /\A-?\d+\z/]
             ].freeze
             numcheck = ->(k, v) { numtype.any? { |flag, pat| flag.include?(k) && v.match?(pat) } }
@@ -2880,8 +2898,8 @@ module Squared
                   elsif has.call(q)
                     add quote_option(key, val, double: has.call(qq), **kwargs)
                   elsif has.call(p)
-                    if val.match?(/\A(["']).+\1\z/)
-                      add shell_option(key, val, escape: false, **kwargs)
+                    if val =~ /\A(["']).+\1\z/
+                      add shell_option(key, val, double: $1 == '"', escape: false, **kwargs)
                     elsif path
                       add quote_option(key, path + val, **kwargs)
                     else
@@ -5239,7 +5257,7 @@ module Squared
         end
 
         def print_success
-          puts 'Success'
+          puts ARG[:SUCCESS]
         end
 
         def print_error(*args, loglevel: Logger::WARN, **kwargs)
@@ -5657,7 +5675,10 @@ module Squared
           if accept
             hint = Array(ret).map { |val| sub_style(val.to_s, theme[:inline]) }.join(', ')
             accept = Array(accept).map { |val| Array(val) }
-            ret = Array(ret) if accept.any? { |val| val[1] == true }
+            if accept.any? { |val| val[1] == true }
+              ret = [ret]
+              multiple = -1
+            end
             begin
               item = accept.shift
               c = confirm("#{item[0]}#{" [#{hint}]" if hint}", item[2] ? 'Y' : 'N')
@@ -5670,7 +5691,7 @@ module Squared
             end until accept.empty?
           end
           if values
-            ret = Array(ret)
+            ret = [ret] unless accept && multiple == -1
             Array(values).each do |val|
               if val.is_a?(Array)
                 val, force = val
@@ -6475,9 +6496,10 @@ module Squared
           fetch: {
             base: %w[multiple porcelain progress P|prune-tags refetch stdin u|update-head-ok
                      recurse-submodules-default=b?].freeze,
-            pull: %w[4 6 n t a|append atomic dry-run f|force k|keep negotiate-only prefetch p|prune q|quiet set-upstream
-                     unshallow update-shallow v|verbose deepen=i depth=i j|jobs=i negotiation-tip=q recurse-submodules=v
-                     refmap=q o|server-option=q shallow-exclude=b shallow-since=v upload-pack=q].freeze
+            pull: %w[n t 4|ipv4 6|ipv6 a|append atomic dry-run f|force k|keep negotiate-only prefetch p|prune q|quiet
+                     set-upstream unshallow update-shallow v|verbose deepen=i depth=i j|jobs=i negotiation-tip=q
+                     recurse-submodules=v refmap=q o|server-option=q shallow-exclude=b shallow-since=v
+                     upload-pack=q].freeze
           }.freeze,
           git: {
             add: %w[N|intent-to-add].freeze,
@@ -6517,7 +6539,7 @@ module Squared
                      graph ita-invisible-in-index minimal name-only name-status no-color-moved-ws no-prefix no-renames
                      numstat patch-with-raw patch-with-stat patience pickaxe-all pickaxe-regex raw shortstat summary
                      a|text abbrev=i? anchored=q break-rewrites=b? color=b color-moved=b color-moved-ws=b color-words=q?
-                     diff-algorithm=b diff-filter=e? X|dirstat=b? dirstat-by-file=b? dst-prefix=q find-copies=i?
+                     diff-algorithm=b diff-filter=q? X|dirstat=b? dirstat-by-file=b? dst-prefix=q find-copies=i?
                      find-object=b find-renames=b? ignore-matching-lines=q ignore-submodules=b? line-prefix=q
                      max-depth=n output=p output-indicator-context=q output-indicator-new=q output-indicator-old=q
                      relative=p rotate-to=p skip-to=p src-prefix=q stat=b? stat-count=i stat-width=i stat-name-width=i
@@ -6582,7 +6604,7 @@ module Squared
             checkout: %w[overwrite-ignore guess overlay progress recurse-submodules track].freeze,
             fetch: {
               base: %w[auto-gc auto-maintenance write-commit-graph write-fetch-head].freeze,
-              pull: %w[all ipv4 ipv6 recurse-submodules show-forced-updates tags].freeze
+              pull: %w[all recurse-submodules show-forced-updates tags].freeze
             },
             grep: %w[color exclude-standard recursive textconv].freeze,
             log: {
@@ -6615,7 +6637,7 @@ module Squared
           }.freeze,
           rebase: {
             send: %w[continue skip abort quit].freeze,
-            value: %w[true false merges interactive].freeze
+            value: %w[false true merges interactive].freeze
           }.freeze,
           reset: %w[soft mixed hard merge keep recurse-submodules no-recurse-submodules].freeze,
           revbuild: %w[untracked-files ignore-submodules ignored].freeze
@@ -6906,10 +6928,10 @@ module Squared
                           when 'i', 'E', 'F', 'P'
                             opts << last
                           else
-                            if last =~ /^(f(-ormat)?)=(.+)$/
+                            if last =~ /^f(?:-ormat)?=(.+)$/
                               opts.shift
                               opts << "format=#{$1}"
-                            elsif last =~ /^(max(-count)?)=(\d+)$/
+                            elsif last =~ /^max(?:-count)?=(\d+)$/
                               opts << "max-count=#{$1}"
                             else
                               grep << last
@@ -7506,7 +7528,11 @@ module Squared
                                                       first: (matchpathspec if flag == :push))
             case flag
             when :push
-              op.readline('Enter message', option: 'message', quote: true) if op.remove(':')
+              if op.remove(':')
+                op.readline('Enter message', option: 'message', quote: true)
+              else
+                append_message
+              end
               append_pathspec op.extras
             when :pop, :apply, :drop, :branch
               if op.remove(':')
@@ -8191,7 +8217,7 @@ module Squared
           op.add_quote(remote) if remote
           out, banner, from = source(io: true)
           print_item banner
-          ret = write_lines(out, grep: op.extras, prefix: "refs/#{flag}/")
+          ret = write_lines(out, grep: op.extras)
           list_result(ret, flag.to_s, grep: op.extras, banner: banner, from: from)
         end
 
@@ -8491,9 +8517,9 @@ module Squared
           end
         end
 
-        def append_pathspec(files = [], target: @session, expect: false, **kwargs)
+        def append_pathspec(files = [], target: @session, expect: false, strict: strict?, **kwargs)
           if session_arg?('pathspec-from-file', target: target)
-            OptionPartition.clear(target, files, styles: theme[:inline])
+            OptionPartition.clear(target, files, strict: strict, styles: theme[:inline])
             true
           else
             option('pathspec', target: target) { |val| files = split_escape(val) } if files.empty?
@@ -9059,6 +9085,7 @@ module Squared
           pack: %w[ignore-scripts=!? json=!? pack-destination=p].freeze,
           rebuild: %w[bin-links=! foreground-scripts=!? global=!? ignore-scripts=!? install-links=!?].freeze,
           'approve-scripts': %w[a|all allow-scripts-pending allow-scripts-pin=!? no-allow-scripts-pin json].freeze,
+          'deny-scripts': %w[a|all json].freeze,
           no: {
             install: %w[audit bin-links fund package-lock].freeze
           }.freeze
@@ -9326,7 +9353,7 @@ module Squared
 
                   format_desc action, nil, 'version?,args*'
                   task action, [:version] do |_, args|
-                    path = ->(s) { File.join(ENV['NVM_DIR'], s) }
+                    path = ->(s) { shell_quote(File.join(ENV['NVM_DIR'], s)) }
                     unless (version = args.version)
                       cmd = ". #{path.call('nvm.sh')} && nvm list --no-colors --no-alias"
                       version = pwd_set(from: :nvm) do
@@ -9354,13 +9381,41 @@ module Squared
                         outdated flag, args.to_a
                       end
                     when 'package'
-                      format_desc(action, flag, 'opts*', before: case flag
-                                                                 when :dedupe, :rebuild then nil
-                                                                 when :reinstall then 'f/orce?'
-                                                                 else 'name*'
-                                                                 end)
-                      task flag do |_, args|
-                        package flag, args.to_a
+                      case flag
+                      when :approve, :deny
+                        format_desc action, flag, 'name*|:,opts*'
+                        task flag do |_, args|
+                          args = args.to_a
+                          if args.first == ':'
+                            args.shift
+                            pwd_set do
+                              pad = 0
+                              list = IO.popen(npm_output('approve-scripts --allow-scripts-pending').to_s)
+                                       .each_with_object([]) do |line, out|
+                                         next unless line =~ /^\s+([a-z\d@][^@]*)@(\S+)/
+
+                                         pad = [pad, $1.size].max
+                                         out << [$1, $2]
+                                       end
+                                       .map { |name, ver| name.ljust(pad + 4) + ver }
+                              if list.empty?
+                                puts log_message('no packages to review', subject: name, hint: "#{flag}-scripts")
+                                exit 0
+                              end
+                              args.concat(choice_index('Select packages', list, multiple: true, column: /^(\S+)/))
+                            end
+                          end
+                          package flag, args
+                        end
+                      else
+                        format_desc(action, flag, 'opts*', before: case flag
+                                                                   when :dedupe, :rebuild then nil
+                                                                   when :reinstall then 'f/orce?'
+                                                                   else 'name*'
+                                                                   end)
+                        task flag do |_, args|
+                          package flag, args.to_a
+                        end
                       end
                     when 'bump'
                       break unless version
@@ -11411,7 +11466,7 @@ module Squared
             op.clear(pass: false)
           else
             if op.empty?
-              op << "#{dist.call}/*"
+              op.add_path(dist.call, '*')
             else
               op.add_path
             end
@@ -14065,14 +14120,14 @@ module Squared
           }.freeze,
           compose: {
             common: %w[all-resources ansi=b compatibility dry-run env-file=p f|file=p parallel=n profile=b progress=b
-                       project-directory=p p|project-name=e].freeze,
+                       project-directory=p p|project-name=b].freeze,
             build: %w[check no-cache print pull push with-dependencies q|quiet build-arg=qq builder=b m|memory=b
                       provenance=q sbom=q ssh=qq].freeze,
             create: %w[build force-recreate no-build no-recreate quiet-pull remove-orphans y|yes pull=b scale=i].freeze,
-            exec: %w[d|detach privileged e|env=qq index=i T|no-TTY=b? user=e w|workdir=q].freeze,
+            exec: %w[d|detach privileged e|env=qq index=i T|no-tty=!? user=b w|workdir=q].freeze,
             run: %w[build d|detach no-deps q|quiet quiet-build quiet-pull remove-orphans rm P|service-ports use-aliases
                     cap-add=b cap-drop=b entrypoint=q e|env=qq env-from-file=p i|interactive=b? l|label=q name=b
-                    T|no-TTY=b? p|publish=q pull=b u|user=e v|volume=q w|workdir=q].freeze,
+                    T|no-tty=!? p|publish=q pull=b u|user=b v|volume=qq w|workdir=q].freeze,
             up: %w[abort-on-container-exit abort-on-container-failure always-recreate-deps attach-dependencies build
                    d|detach force-recreate menu no-build no-color no-deps no-log-prefix no-recreate no-start quiet-build
                    quiet-pull remove-orphans V|renew-anon-volumes timestamps wait w|watch y|yes attach=b
@@ -14082,9 +14137,9 @@ module Squared
           }.freeze,
           container: {
             create: %w[init i|interactive no-healthcheck oom-kill-disable privileged P|publish-all q|quiet read-only
-                       rm t|tty use-api-socket add-host=q annotation=q a|attach=b blkio-weight=i blkio-weight-device=i
-                       cap-add=b cap-drop=b cgroup-parent=b cgroupns=b cidfile=p device=q device-cgroup-rule=q
-                       device-read-bps=q device-read-iops=q device-write-bps=q device-write-iops=q
+                       rm t|tty=!? use-api-socket add-host=q annotation=q a|attach=b blkio-weight=i
+                       blkio-weight-device=i cap-add=b cap-drop=b cgroup-parent=b cgroupns=b cidfile=p device=q
+                       device-cgroup-rule=q device-read-bps=q device-read-iops=q device-write-bps=q device-write-iops=q
                        dns=q dns-option=q dns-search=q domainname=b entrypoint=q e|env=qq env-file=p expose=q gpus=q
                        group-add=b health-cmd=q health-interval=b health-retries=i health-start-interval=q
                        health-start-period=q health-timeout=q hostname=q io-maxbandwidth=b io-maxiops=b ip=b ip6=q ipc=b
@@ -14092,13 +14147,14 @@ module Squared
                        m|memory=b memory-reservation=b memory-swap=n memory-swappiness=n mount=qq name=b network=b
                        network-alias=b oom-score-adj=b pid=b pids-limit=n platform=q p|publish=q pull=b restart=b
                        runtime=b security-opt=q shm-size=b stop-signal=b stop-timeout=i storage-opt=q sysctl=q tmpfs=q
-                       ulimit=q u|user=b userns=b uts=b v|volume=q volume-driver=b volumes-from=b w|workdir=q].freeze,
+                       ulimit=q u|user=b userns=b uts=b v|volume=qq volume-driver=b volumes-from=b w|workdir=q].freeze,
             run: %w[d|detach detach-keys=q sig-proxy=b?].freeze,
             update: %w[blkio-weight=i cpu-period=i cpu-quota=i cpu-rt-period=i cpu-rt-runtime=i c|cpu-shares=i cpus=f
                        cpuset-cpus=b cpuset-mems=b m|memory=b memory-reservation=b memory-swap=n pids-limit=n
                        restart=q].freeze,
-            exec: %w[d|detach i|interactive privileged t|tty detach-keys=q e|env=qq env-file=p u|user=e
+            exec: %w[d|detach i|interactive privileged t|tty=!? detach-keys=q e|env=qq env-file=p u|user=b
                      w|workdir=q].freeze,
+            rm: %w[f|force l|link v|volumes].freeze,
             commit: %w[no-pause a|author=q c|change=q m|message=q pause=b?].freeze,
             inspect: %w[s|size f|format=q].freeze,
             start: %w[a|attach i|interactive detach-keys=q].freeze,
@@ -14449,15 +14505,15 @@ module Squared
         end
 
         def buildx(flag, opts = [], tag: nil, context: nil, from: nil)
+          bx = OPT_DOCKER[:buildx]
           if flag == :bake && context&.match?(%r{^["']?(https?|git)://}i)
-            shared = data[:shared].dup.push('f|file=q')
+            shared = bx[:shared].dup.push('f|file=q')
             shared.delete('f|file=p')
           end
           cmd, opts = docker_session('buildx', opts: opts)
-          data = OPT_DOCKER[:buildx]
-          op = OptionPartition.new(opts, data[:common], cmd, project: self, strict: strict?)
+          op = OptionPartition.new(opts, bx[:common], cmd, project: self, strict: strict?)
           op.append(flag, quote: false)
-            .parse(data[flag == :bake ? :bake : :build] + (shared || data[:shared]))
+            .parse(bx[flag == :bake ? :bake : :build] + (shared || bx[:shared]))
           case flag
           when :build, :context
             append_tag(tag || option('tag', ignore: false) || self.tag)
@@ -14468,6 +14524,10 @@ module Squared
             end
           when :bake
             append_file(0, index: 3) unless from || op.arg?('f', 'file') || !anypath?(*COMPOSEFILE)
+            if op.first == '-'
+              op.shift
+              op << @output[4] if @output[4]
+            end
             unless op.empty?
               if !context && op.size > 1 && exist?(op.last, type: 'd')
                 pat = /\btarget\s+"#{Regexp.escape(op.last)}"/
@@ -14498,10 +14558,11 @@ module Squared
             docker_session('compose', command, '--', *service)
           else
             cmd, opts = docker_session('compose', opts: opts)
-            op = OptionPartition.new(opts, OPT_DOCKER[:compose][:common], cmd, project: self, strict: strict?)
+            cp = OPT_DOCKER[:compose]
+            op = OptionPartition.new(opts, cp[:common], cmd, project: self, strict: strict?)
             append_file(filetype, force: flag == :publish) unless op.arg?('f', 'file')
             op << flag
-            op.parse(OPT_DOCKER[:compose].fetch(flag, []))
+            op.parse(cp.fetch(flag, []))
             if flag == :publish
               id ||= option('tag', ignore: false) || op.shift || tagmain
               registry ||= option('registry') || op.shift || @oci
@@ -14532,10 +14593,11 @@ module Squared
 
         def container(flag, opts = [], id: nil)
           cmd, opts = docker_session('container', flag, opts: opts)
-          data = OPT_DOCKER[:container]
-          list = data.fetch(flag, [])
-          list += data[:create] if (rc = flag == :run)
-          list += data[:update] if rc ||= flag == :create
+          rc = flag == :run
+          ct = OPT_DOCKER[:container]
+          list = ct.fetch(flag, [])
+          list += ct[:create] if rc
+          list += ct[:update] if rc ||= flag == :create
           op = OptionPartition.new(opts, list, cmd, project: self, strict: strict?, args: rc || flag == :exec)
           from = symjoin 'container', flag
           case flag
@@ -14689,7 +14751,7 @@ module Squared
             raise_error ArgumentError, 'username/registry not specified', hint: flag unless registry
             uri = shell_quote tagjoin(registry, id)
             op << uri
-            img = docker_output 'image', 'tag', id, uri
+            img = docker_output 'image tag', id, uri
             return unless confirm_command(img.to_s, cmd.to_s, target: id, as: registry, title: from)
 
             @session = img
@@ -14780,12 +14842,12 @@ module Squared
           session('docker', *cmd, main: false, options: false, **kwargs)
         end
 
-        def append_command(flag, val, list, target: @session, prompt: ':')
-          list << if list.delete(prompt)
-                    readline('Enter command [args]', force: flag == :exec)
-                  else
-                    env('DOCKER_ARGS')
-                  end
+        def append_command(flag, id, list, target: @session, prompt: ':')
+          if list.delete(prompt)
+            list << readline('Enter command [args]', force: flag == :exec)
+          elsif (val = env('DOCKER_ARGS'))
+            list << val
+          end
           case flag
           when :run
             unless session_arg?('name', target: target)
@@ -14794,8 +14856,22 @@ module Squared
           when :exec
             raise_error ArgumentError, 'nothing to execute', hint: flag if list.empty?
           end
-          target << val << list.shift
-          target << list.join(' && ') unless list.empty?
+          target << id
+          case list.first
+          when '--'
+            target.merge(list.drop(1))
+          when /\A(--|&&)(\s|\z)/
+            target.merge(list)
+          else
+            target << list.shift
+            unless list.empty?
+              if list.first.start_with?('-')
+                target.merge(list)
+              else
+                target << list.join(' && ')
+              end
+            end
+          end
         end
 
         def append_file(type, target: @session, index: 2, force: false)
@@ -14866,7 +14942,7 @@ module Squared
           pwd_set(from: from) do
             index = 1
             all = option('all', prefix: 'docker')
-            y = from == :'image:rm' && option('y', prefix: 'docker')
+            y = from.to_s.end_with?(':rm') && option('y', prefix: 'docker')
             filter = env('DOCKER_FILTER', filter).to_s
             pat = if OptionPartition.pattern?(filter)
                     Regexp.new(filter)
@@ -15007,7 +15083,7 @@ module Squared
           end
           cmd.merge(Array(out).map { |val| val.split(/\s+/, 2).first })
           cmd << args
-          success?(run(cmd), ctx.start_with?('network', 'tag', 'save'))
+          success?(run(cmd, { 'NO_COLOR' => 'true' }), ctx.start_with?('network', 'tag', 'save'))
         end
 
         def filetype(val = dockerfile)
