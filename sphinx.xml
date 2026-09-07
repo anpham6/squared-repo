@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+    <include name="staging.xml" />
+
+    <project path="android-docs"    name="anpham6/android-docs.git"    revision="master" />
+    <project path="chrome-docs"     name="anpham6/chrome-docs.git"     revision="master" />
+</manifest>
