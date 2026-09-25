@@ -11,7 +11,7 @@ require 'time'
 require 'timeout'
 
 module Squared
-  VERSION = '0.7.11'
+  VERSION = '0.7.13'
 
   module Common
     PATH = {}
@@ -513,7 +513,9 @@ module Squared
           while (ch = Readline.readline(msg))
             ch.strip!
             unless ch.empty?
-              if multiple
+              if ch == '-' && !force
+                break
+              elsif multiple
                 k = if ch == '*'
                       (min..max).to_a
                     else
@@ -2886,6 +2888,10 @@ module Squared
                 if opt =~ OPT_VALUE
                   key = $1
                   val = $2
+                  if val =~ /\A(["'])(.+)\1\z/
+                    val = $2
+                    double = $1 == '"'
+                  end
                   has = lambda do |a|
                     return true if a.include?(key)
                     return false unless (k = a.find { |s| s.end_with?(':*') })
@@ -2893,13 +2899,15 @@ module Squared
                     key.start_with?(k.chomp('*')) && !key.end_with?(':')
                   end
                   kwargs = { sep: se[key] || sep, merge: has.call(m), switch: sw[key] }
+                  kwargs[:double] = double unless double.nil?
                   if has.call(e) || (has.call(bl) && %w[true false].include?(val))
                     add shell_option(key, val, **kwargs)
                   elsif has.call(q)
-                    add quote_option(key, val, double: has.call(qq), **kwargs)
+                    kwargs[:double] = true if has.call(qq)
+                    add quote_option(key, val, **kwargs)
                   elsif has.call(p)
-                    if val =~ /\A(["']).+\1\z/
-                      add shell_option(key, val, double: $1 == '"', escape: false, **kwargs)
+                    if !double.nil?
+                      add shell_option(key, val, escape: false, **kwargs)
                     elsif path
                       add quote_option(key, path + val, **kwargs)
                     else
@@ -7855,7 +7863,7 @@ module Squared
             end
             if (n = op.index('>'))
               patch = op.slice!(n, 2)[1]
-            elsif !op.exist?(op.last)
+            elsif !op.last.include?('*') && !op.exist?(op.last)
               patch ||= op.pop
             end
             append_pathspec op.extras
@@ -8148,7 +8156,7 @@ module Squared
             cmd << '--textconv'
             append_value(files.flat_map { |val| Dir[val] }
                               .select { |val| projectpath?(val) }
-                              .map { |val| shell_quote("HEAD:#{val}") })
+                              .map { |val| "HEAD:#{val}" })
             source(banner: false)
             return
           when :oneline
@@ -8162,11 +8170,11 @@ module Squared
           else
             opts << format if format
           end
-          list = OPT_GIT[:show] + OPT_GIT[:diff][:show] + OPT_GIT[:log][:diff] + OPT_GIT[:log][:diff_context]
+          list = OPT_GIT[:show] + OPT_GIT[:diff][:show] + collect_hash(OPT_GIT[:log], pass: [:base])
           op = OptionPartition.new(opts, list, cmd,
                                    project: self, strict: strict?,
                                    no: OPT_GIT[:no][:show] + collect_hash(OPT_GIT[:no][:log], pass: [:base]))
-          op.append(delim: true)
+          op.append
           source(exception: false, banner: flag != :oneline)
         end
 
@@ -8242,8 +8250,7 @@ module Squared
           when :'sparse-checkout'
             cmd << 'set'
           end
-          op = OptionPartition.new(opts, list, cmd, project: self, strict: strict?,
-                                                    no: OPT_GIT[:no][flag], single: /\A\d+\z/,
+          op = OptionPartition.new(opts, list, cmd, project: self, strict: strict?, no: OPT_GIT[:no][flag],
                                                     first: case flag
                                                            when :blame, :revert, :'sparse-checkout' then nil
                                                            else matchpathspec
@@ -8432,7 +8439,7 @@ module Squared
           ret = choice_index('Choose a commit', git_spawn(cmd, stdout: false), column: /^(\S+)/, force: force, **kwargs)
           case ret
           when Array
-            ret.map { |val| val&.stripstyle }
+            ret.map { |val| val.is_a?(Array) ? val.map { |s| s&.stripstyle } : val&.stripstyle }
           when String
             ret.stripstyle
           else
@@ -8982,7 +8989,7 @@ module Squared
         env('REPO_OPTIONS', **kwargs) { |val| cmd << val } if options
         cmd = cmd.join(' ')
         puts log_message(cmd, subject: main, hint: root) if verbose
-        Common::System.shell(cmd, chdir: root, exception: exception)
+        Common::System.shell(cmd, chdir: root, exception: exception || env('REPO_FAIL', equals: %w[1 true]))
       end
 
       def repo_bin
@@ -9926,17 +9933,17 @@ module Squared
               end
               a = a.ljust(col1)
               b = b.ljust(col2)
-              sub_style! b, theme[:current] if theme[:current] && !stdin?
+              b = sub_style b, theme[:current] if theme[:current] && !stdin?
               if cur == -1
                 c = 'SKIP'
               elsif modified == cur
                 c = 'FAIL'
               elsif !stdin?
                 if d == 1
-                  sub_style! a, theme[:major]
-                  sub_style! c, :bold, color(:green)
+                  a = sub_style a, theme[:major]
+                  c = sub_style c, :bold, color(:green)
                 else
-                  sub_style!(c, **opt_style(color(d == 3 ? :green : :yellow), SEM_VER, d))
+                  c = sub_style(c, **opt_style(color(d == 3 ? :green : :yellow), SEM_VER, d))
                 end
                 g = item
               end
@@ -10009,8 +10016,8 @@ module Squared
               b = sub_style b.ljust(col2), color(d ? :red : :yellow)
               c = c.ljust(col3)
               unless d
-                sub_style! a, theme[:active]
-                sub_style! c, color(:green)
+                a = sub_style a, theme[:active]
+                c = sub_style c, color(:green)
                 pending += 1
               end
               puts "#{pad.call(i, avail)}. #{(a + c + b).subhint(d ? 'locked' : 'latest')}"
@@ -14115,11 +14122,11 @@ module Squared
                       cgroup-parent=b iidfile=p label=q network=b no-cache-filter=b o|output=q platform=q
                       q|quiet secret=qq shm-size=b ssh=qq t|tag=b target=b ulimit=q].freeze,
             bake: %w[print list=q set=q].freeze,
-            shared: %w[check load no-cache pull push allow=q call=b? f|file=p metadata-file=p progress=b provenance=q
-                       sbom=q].freeze
+            shared: %w[check load no-cache pull push allow=qq call=b? f|file=p metadata-file=p progress=b provenance=b?
+                       sbom=b?].freeze
           }.freeze,
           compose: {
-            common: %w[all-resources ansi=b compatibility dry-run env-file=p f|file=p parallel=n profile=b progress=b
+            common: %w[1 all-resources compatibility dry-run ansi=b env-file=p f|file=p parallel=n profile=b progress=b
                        project-directory=p p|project-name=b].freeze,
             build: %w[check no-cache print pull push with-dependencies q|quiet build-arg=qq builder=b m|memory=b
                       provenance=q sbom=q ssh=qq].freeze,
@@ -14181,10 +14188,10 @@ module Squared
         VAL_DOCKER = {
           run: {
             common: %w[source src destination dst target readonly ro].freeze,
-            bind: %w[bind-propagation].freeze,
+            bind: %w[bind-create-src bind-propagation].freeze,
             volume: %w[volume-subpath volume-nocopy volume-opt].freeze,
             tmpfs: %w[tmpfs-size tmpfs-mode].freeze,
-            image: %w[image-path].freeze
+            image: %w[image-subpath].freeze
           }.freeze,
           ls: {
             compose: %w[Name Image Command Service RunningFor Status Ports CreatedAt ExitCode Health ID Labels
@@ -14626,21 +14633,33 @@ module Squared
                       end
                     end
                     case k
-                    when 'readonly', 'ro'
-                      out << k
+                    when 'readonly', 'ro', 'volume-nocopy', 'bind-create-src'
+                      out << k if %w[bind volume].include?(type)
                       next
-                    when 'source', 'src', 'destination', 'dst', 'target', 'volume-subpath', 'image-path'
-                      raise_error ArgumentError, "#{k}: no path value", hint: flag unless v
-                      v = basepath v
+                    when 'source', 'src', 'destination', 'dst', 'target', 'volume-subpath', 'image-subpath'
+                      raise_error ArgumentError, "no path value: #{k}", hint: flag unless v
+                      case k
+                      when 'source', 'src'
+                        if type == 'bind'
+                          v = basepath v
+                        elsif type == 'tmpfs'
+                          next
+                        end
+                      when 'destination', 'dst', 'target'
+                        unless v.start_with?('/')
+                          print_error(Logger::ERROR, "path is not absolute: #{v}", subject: from, hint: k)
+                          next
+                        end
+                      end
                       v = shell_quote(v, option: false, force: false) if q == ''
                     end
                     out << "#{k}=#{q}#{v}#{q}"
                   elsif !silent?
-                    log_message('unrecognized option', subject: from, hint: k)
+                    puts log_message('unrecognized option', subject: from, hint: k)
                   end
                 end
                 raise_error TypeError, 'none specified', hint: flag unless type
-                cmd << "--mount type=#{type},#{args.join(',')}"
+                op << "--mount type=#{type},#{args.join(',')}"
               end
             end
             append_command(flag, id || tagmain, op.extras)
@@ -14649,7 +14668,7 @@ module Squared
             op.append(escape: true, strip: /^:/)
           when :commit
             latest = op.shift || tagmain
-            cmd << id << latest
+            op << id << latest
             raise_error ArgumentError, "unrecognized args: #{op.join(', ')}", hint: flag unless op.empty?
             return unless confirm_command(cmd.to_s, title: from, target: id, as: latest)
 
@@ -14670,7 +14689,7 @@ module Squared
           else
             if op.empty?
               ps, status, no = filter_ps flag, from
-              cmd << '--no-stream' if flag == :stats
+              op << '--no-stream' if flag == :stats
               list_image(flag, ps, no: no, hint: status, from: from) { |img| run(cmd.temp(img), from: from) }
               return
             end
@@ -14743,7 +14762,7 @@ module Squared
               registry = op.shift
               registry ||= option('registry') || @registry unless id.include?('/')
             end
-            cmd << shell_quote(tagjoin(registry, id))
+            op << shell_quote(tagjoin(registry, id))
           when :push
             id ||= option('tag', ignore: false) || op.shift || tagmain
             registry ||= option('registry') || op.shift || @registry
@@ -15514,7 +15533,7 @@ Common::ARG.update({ PIPE: 'PIPE_STD', OUT: 'PIPE_OUT', FAIL: 'PIPE_FAIL', HOME:
 Workspace::Application
   .new(main: 'squared')
   .repo(
-    'https://github.com/anpham6/squared-repo', Project::Node.prod? ? 'prod' : 'nightly',
+    'https://github.com/anpham6/squared-repo', Project::Node.prod? ? 'prod' : 'nightly', install: ENV['REPO_BIN'],
     doc: !ENV['DOCS'].to_s.empty?, script: %w[build:dev prod], dev: /^(build:)?dev(:|$)/, ref: %i[base node python]
   )
   .with(:node, :python) { clean ['build/'] }
