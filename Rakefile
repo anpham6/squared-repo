@@ -11,7 +11,7 @@ require 'time'
 require 'timeout'
 
 module Squared
-  VERSION = '0.7.13'
+  VERSION = '0.7.14'
 
   module Common
     PATH = {}
@@ -4728,10 +4728,20 @@ module Squared
           ret = basepath(*args)
           return ret unless ascend && !ret.exist?
 
+          case ascend
+          when String, Pathname
+            root = Pathname.new(ascend).cleanpath
+            root = nil unless root.absolute? && root.directory?
+          end
           path.parent.ascend.each do |dir|
             target = dir.join(*args)
             return target if target.exist?
-            break if (ascend.is_a?(String) && dir.join(ascend).exist?) || workspace.root == dir || parent&.path == dir
+
+            if root
+              break if dir == root
+            elsif workspace.root == dir || parent&.path == dir || (ascend.is_a?(String) && dir.join(ascend).exist?)
+              break
+            end
           end
           ret
         end
@@ -5434,7 +5444,7 @@ module Squared
                     out << ''
                   end
                   if from
-                    out << from
+                    out << (from = from.to_s)
                     /\A(#{Regexp.escape(from)})(.*)\z/
                   end
                 else
@@ -9783,7 +9793,7 @@ module Squared
                   append_platform
                 end
               end
-              cmd << '--package-lock=false' << 'save=false' if nolockfile?('npm')
+              cmd << '--package-lock=false' << '--save=false' if nolockfile?('npm')
               cmd << '--ignore-scripts' if option('ignore-scripts')
             end
             if add
@@ -10826,12 +10836,12 @@ module Squared
         OPT_MESON = {
           build: %w[D=q clearcache debug errorlogs fatal-meson-warnings pkgconfig.relocatable prefer-static
                     python.allow-limited-api reconfigure stdsplit strip vsenv werror wipe auto-features=b backend=b
-                    bindir=p build.cmake-prefix-path=p build.pkg-config-path=p buildtype=b cmake-prefix-path=p
-                    cross-file=p datadir=p default-library=b default-both-libraries=b force-fallback-for=q genvslite=b
-                    includedir=p infodir=p install-umask=b layout=b libdir=p libexecdir=p licensedir=p localedir=p
-                    localstatedir=p mandir=p native-file=p optimization=b pkg-config-path=p prefix=p
-                    python.bytecompile=i python.platlibdir=p python.purelibdir=p python.install-env=b sbindir=p
-                    sharedstatedir=p sysconfdir=p unity=b unity-size=i warnlevel=b wrap-mode=b].freeze,
+                    bindir=q build.cmake-prefix-path=p build.pkg-config-path=p buildtype=b cmake-prefix-path=p
+                    cross-file=p datadir=q default-library=b default-both-libraries=b force-fallback-for=q genvslite=b
+                    includedir=q infodir=q install-umask=b layout=b libdir=q libexecdir=q licensedir=q localedir=q
+                    localstatedir=q mandir=q native-file=p optimization=b pkg-config-path=p prefix=p
+                    python.bytecompile=b python.platlibdir=p python.purelibdir=p python.install-env=b sbindir=q
+                    sharedstatedir=q sysconfdir=q unity=b unity-size=i warnlevel=b wrap-mode=b].freeze,
           compile: %w[clean v|verbose j|jobs=i l|load-average=b ninja-args=q vs-args=q xcode-args=q].freeze
         }.freeze
         PASS_PYTHON = {
@@ -11023,7 +11033,7 @@ module Squared
                             args = args.to_a
                             if args.empty?
                               args = readline('Enter command', force: true).split(' ', 2)
-                            elsif args.size == 1 && option('interactive', notequals: '0', prefix: ref)
+                            elsif args.size == 1 && option('interactive', notequals: '0', prefix: 'python')
                               args << readline('Enter arguments', force: false) unless args.first.include?(' ')
                             end
                             venv_init
@@ -11093,18 +11103,18 @@ module Squared
                       case flag
                       when :upgrade
                         task flag, [:strategy] do |_, args|
-                          install flag, (case args.strategy
-                                         when 'eager'
-                                           'eager'
-                                         when /^only-if|needed$/
-                                           'only-if-needed'
-                                         end.yield_self do |val|
-                                           if val
-                                             args.extras << "upgrade-strategy=#{val}"
-                                           else
-                                             args.to_a
-                                           end
-                                         end)
+                          val = case args.strategy
+                                when 'eager'
+                                  'eager'
+                                when /^only-if/, /needed$/
+                                  'only-if-needed'
+                                end
+                          args = if val
+                                   args.extras << "upgrade-strategy=#{val}"
+                                 else
+                                   args.to_a
+                                 end
+                          install flag, args
                         end
                       when :requirement, :target
                         task flag, [:path] do |_, args|
@@ -11485,7 +11495,7 @@ module Squared
           op = OptionPartition.new(session_opts(with, args: args, kwargs: kwargs, pass: pass), OPT_PYTHON[:common],
                                    session('python', path: !venv?),
                                    project: self, strict: strict?, multiple: [/^-c/], single: singleopt(:python),
-                                   args: true, stdin: true)
+                                   sep: ' ', args: true, stdin: true)
           op.concat(args)
           if op.include?('-')
             op.exist?(add: true)
@@ -11684,7 +11694,8 @@ module Squared
           pre = preopts(quiet: quiet)
           return session(name, *pre, *cmd, path: !venv?) unless opts
 
-          op = OptionPartition.new(opts, common, project: self, strict: strict?, single: singleopt(name.to_sym))
+          op = OptionPartition.new(opts, common, project: self, strict: strict?, sep: name == 'python' ? ' ' : '=',
+                                                 single: singleopt(name.to_sym))
           [session(name, *pre, *op.to_a, *cmd, path: !venv?), op.extras]
         end
 
@@ -12238,9 +12249,10 @@ module Squared
           serve_set kwargs[:serve]
           gemfile_set kwargs[:gemspec]
           self.autodetect = autodetect
-          @bundle = { exec: exec.is_a?(String) ? basepath!(exec) : false }
+          @bundle = { exec: exec }
           @steepfile = basepath! steep if steep
-          @rubocopfile = Pathname.new(rubocop).realpath rescue basepath!(Dir.home, '.rubocop.yml') if rubocop
+          rubocop = rootpath('.rubocop.yml', ascend: Dir.home) if rubocop == true
+          @rubocopfile = basepath! rubocop if rubocop
           @rubygems = kwargs.fetch(:rubygems, 0)
           return unless rakefile && @output[0].nil? && @copy.nil? && !version && !self.autodetect
 
@@ -13575,7 +13587,7 @@ module Squared
 
         def rdbg(*args, banner: verbose?, with: nil, pass: PASS_RUBY[:rdbg], **kwargs)
           opts = session_opts(with, args: args, kwargs: kwargs, pass: pass)
-          cmd = session 'rdbg'
+          cmd = session(*bundle_args('rdbg'))
           args.each_with_index do |val, index|
             break if val == '--'
             next unless exist?(val, type: 'f')
@@ -13858,7 +13870,7 @@ module Squared
         end
 
         def ruby_session(*cmd, **kwargs)
-          session('ruby', *preopts, *cmd, **kwargs)
+          session(*bundle_args('ruby'), *preopts, *cmd, **kwargs)
         end
 
         def gem_session(*cmd, **kwargs)
@@ -13876,11 +13888,10 @@ module Squared
         end
 
         def rbs_session(*cmd, opts: nil)
-          args = bundle_args 'rbs'
-          return session(*args, *cmd) unless opts
+          return session(*bundle_args('rbs'), *cmd) unless opts
 
           op = OptionPartition.new(opts, OPT_RUBY[:rbs], project: self, strict: strict?)
-          [session(*args, *op.to_a, *cmd), op.extras]
+          [session(*bundle_args('rbs'), *op.to_a, *cmd), op.extras]
         end
 
         def gem_output(*cmd, **kwargs)
@@ -13888,7 +13899,7 @@ module Squared
         end
 
         def ruby_output(*cmd, **kwargs)
-          session_output('ruby', *cmd, **kwargs)
+          session_output(*bundle_args('ruby'), *cmd, **kwargs)
         end
 
         def bundle_output(*cmd, **kwargs)
@@ -13901,7 +13912,20 @@ module Squared
 
         def bundle_args(*args)
           if (val = @bundle[:exec])
-            args.unshift(quote_option('gemfile', val)) unless val == true
+            app = args.first
+            if val.is_a?(Hash)
+              env = val[app.to_s] || val[app.to_sym]
+              return args unless env
+
+              val = env.is_a?(String) ? basepath!(env) : true
+            elsif app == 'ruby'
+              return args
+            end
+            if val.is_a?(String)
+              return args unless (val = basepath!(val))
+
+              args.unshift("--gemfile=#{shell_escape(val.relative_path_from(path), quote: true)}")
+            end
             args.unshift('bundle', 'exec')
           end
           args
