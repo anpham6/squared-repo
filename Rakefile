@@ -11,7 +11,7 @@ require 'time'
 require 'timeout'
 
 module Squared
-  VERSION = '0.7.14'
+  VERSION = '0.7.15'
 
   module Common
     PATH = {}
@@ -25,6 +25,7 @@ module Squared
       STRICT: false,
       BANNER: true,
       CHOICE: 25,
+      TAB: 4,
       QUOTE: "'",
       SPACE: ' => ',
       SUCCESS: 'Success',
@@ -114,6 +115,7 @@ module Squared
 
     def __freeze__
       PATH.freeze
+      ARG.each_value { |val| val.freeze if val.is_a?(::Hash) || val.is_a?(::Array) }
       ARG.freeze
       VAR.each_value(&:freeze)
       VAR[:theme].each_value { |val| val.freeze.each_value(&:freeze) }
@@ -408,7 +410,7 @@ module Squared
         if footer
           unless sub.empty? && !right
             footer.map! do |s|
-              s = s.rjust(n + 4) if right
+              s = s.rjust(n + ARG[:TAB]) if right
               sub.each { |h| sub_style!(s, **h) }
               s
             end
@@ -6679,7 +6681,7 @@ module Squared
         subtasks({
           'branch' => %i[create track delete move copy list all current].freeze,
           'checkout' => %i[commit branch track detach path].freeze,
-          'commit' => %i[add all amend amend-orig fixup].freeze,
+          'commit' => %i[add all pathspec amend amend-orig fixup].freeze,
           'diff' => %i[head branch files view between contain].freeze,
           'range-diff' => %i[view between contain].freeze,
           'fetch' => %i[origin remote all].freeze,
@@ -6800,7 +6802,7 @@ module Squared
                           if flag == :add
                             opts = param_guard(action, flag, args: args.to_a)
                           elsif (refs = args.to_a).empty?
-                            refs = readline('Enter file patterns', force: true).shellsplit
+                            refs = readline('Enter glob patterns', force: true).shellsplit
                           end
                         end
                         commit(flag, opts, refs: refs, ref: ref, squash: squash, pick: pick)
@@ -7893,7 +7895,7 @@ module Squared
           fixup = flag == :fixup
           amend = flag.match?(/^amend/) && !fixup
           unless flag == :add || pick == 'reword'
-            pathspec = if flag == :all || ((fixup || amend) && refs.size == 1 && refs.first == '*')
+            pathspec = if flag == :all || ((flag == :pathspec || fixup || amend) && refs.size == 1 && refs.first == '*')
                          '--all'
                        elsif (refs = projectmap(refs)).empty?
                          raise 'no qualified pathspec'
@@ -9095,7 +9097,7 @@ module Squared
           install_a: %w[audit=! bin-links=! engine-strict=!? foreground-scripts=!? fund=! ignore-scripts=!?
                         install-links=!? package-lock=! strict-peer-deps=!? include=b install-strategy=b omit=b].freeze,
           install_b: %w[no-save B|save-bundle D|save-dev O|save-optional save-peer P|save-prod g|global=!?
-                        S|save=!?].freeze,
+                        min-release-age=i min-release-age-exclude=q S|save=!?].freeze,
           install_c: %w[allow-directory=b? allow-file=b? allow-git=b? allow-remote=b?].freeze,
           run: %w[foreground-scripts=!? if-present=!? ignore-scripts=!? script-shell=p].freeze,
           exec: %w[c|call=q package=b].freeze,
@@ -9400,27 +9402,40 @@ module Squared
                     when 'package'
                       case flag
                       when :approve, :deny
-                        format_desc action, flag, 'name*|:,opts*'
+                        format_desc(action, flag, 'opts*', before: flag == :approve ? 'name*|:' : 'name*|:|::')
                         task flag do |_, args|
                           args = args.to_a
-                          if args.first == ':'
+                          if args.first == ':' || (all = args.first == '::')
                             args.shift
+                            list = []
+                            pad = 0
+                            size = ->(s) { pad = [pad, s.size].max }
                             pwd_set do
-                              pad = 0
-                              list = IO.popen(npm_output('approve-scripts --allow-scripts-pending').to_s)
-                                       .each_with_object([]) do |line, out|
-                                         next unless line =~ /^\s+([a-z\d@][^@]*)@(\S+)/
+                              json = JSON.parse(`#{npm_output('install-scripts ls --json')}`)
+                              json&.fetch('allowScripts', [])&.each do |data|
+                                line = data['changes']&.find { |item| item['change'] == 'pending' }
+                                next unless line && line['key'] =~ /^(.+)@([^@]+)$/
 
-                                         pad = [pad, $1.size].max
-                                         out << [$1, $2]
-                                       end
-                                       .map { |name, ver| name.ljust(pad + 4) + ver }
-                              if list.empty?
-                                puts log_message('no packages to review', subject: name, hint: "#{flag}-scripts")
-                                exit 0
+                                size.call($1)
+                                list << [$1, $2]
                               end
-                              args.concat(choice_index('Select packages', list, multiple: true, column: /^(\S+)/))
+                              if all
+                                current = read_package 'allowScripts'
+                                current&.each_pair do |key, val|
+                                  next unless val
+
+                                  md = key.match(/^(.+?)(?:@([^@]+))?$/)
+                                  size.call(md[1])
+                                  list << [md[1], sub_style(md[2] || 'any', theme[:inline])]
+                                end
+                              end
                             end
+                            if list.empty?
+                              puts log_message('no packages to review', subject: name, hint: "#{flag}-scripts")
+                              exit 0
+                            end
+                            list.map! { |name, ver| name.ljust(pad + ARG[:TAB]) + ver }
+                            args.concat(choice_index('Select packages', list, multiple: true, column: /^(\S+)/))
                           end
                           package flag, args
                         end
@@ -9919,9 +9934,9 @@ module Squared
           end
           print_item banner unless sync
           if !found.empty?
-            col1 = width.call(found, 0) + 4
-            col2 = width.call(found, 1) + 4
-            col3 = pad.call(found.size, found).size + 2 + col1 + col2 + width.call(found, 2)
+            col1 = width.call(found, 0) + ARG[:TAB]
+            col2 = width.call(found, 1) + ARG[:TAB]
+            col3 = pad.call(found.size, found).size + (ARG[:TAB] / 2) + col1 + col2 + width.call(found, 2)
             packages = []
             pat = ->(a) { /("#{Regexp.escape(a[0])}"\s*:\s*)"([~^])#{'?' if a[4]}#{Regexp.escape(a[1])}"/ }
             edit = lambda do |a, pkg, mod|
@@ -10017,9 +10032,9 @@ module Squared
               end
             end
           elsif !avail.empty?
-            col1 = width.call(avail, 0) + 4
+            col1 = width.call(avail, 0) + ARG[:TAB]
             col2 = width.call(avail, 1)
-            col3 = width.call(avail, 2) + 4
+            col3 = width.call(avail, 2) + ARG[:TAB]
             avail.each_with_index do |item, i|
               a, b, c, d = item
               a = a.ljust(col1)
@@ -12969,7 +12984,7 @@ module Squared
                 end
                 s = '%2d. %s' % [start, line]
                 if ia
-                  unless confirm_semver(s.ljust(col + 4 + line.size - n), type)
+                  unless confirm_semver(s.ljust(col + ARG[:TAB] + line.size - n), type)
                     start += 1
                     next
                   end
@@ -13911,24 +13926,20 @@ module Squared
         end
 
         def bundle_args(*args)
-          if (val = @bundle[:exec])
-            app = args.first
-            if val.is_a?(Hash)
-              env = val[app.to_s] || val[app.to_sym]
-              return args unless env
+          return args unless (val = @bundle[:exec])
 
-              val = env.is_a?(String) ? basepath!(env) : true
-            elsif app == 'ruby'
-              return args
-            end
-            if val.is_a?(String)
-              return args unless (val = basepath!(val))
-
-              args.unshift("--gemfile=#{shell_escape(val.relative_path_from(path), quote: true)}")
-            end
-            args.unshift('bundle', 'exec')
+          app = args.first
+          if val.is_a?(Hash)
+            val = val[app.to_s] || val[app.to_sym]
+          elsif app == 'ruby'
+            return args
           end
-          args
+          case val
+          when String, Pathname
+            val = basepath!(val, type: 'f')
+            args.unshift("--gemfile=#{shell_escape(val.relative_path_from(path), quote: true)}") if val
+          end
+          val ? args.unshift('bundle', 'exec') : args
         end
 
         def bundle_load
@@ -15032,7 +15043,7 @@ module Squared
 
                   puts "#{g + f} #{key}: #{Array(data[key]).join(', ')}" unless data[key].to_s.empty?
                 end
-                w = 9 + flag.to_s.size + 4 + ee.size
+                w = 9 + flag.to_s.size + ARG[:TAB] + ee.size
                 puts g + sub_style(ARG[:BORDER][6] + (ARG[:BORDER][1] * w), theme[:inline])
                 index += 1
                 next unless confirm("#{h + b}?", no ? 'N' : 'Y')
